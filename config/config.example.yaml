@@ -1,0 +1,44 @@
+# B站财经博主聚合服务配置
+
+# 敏感信息从 .env 读取：SESSDATA, XIAOMI_API_KEY, DB_USER, DB_PASSWORD, FIN_AGG_API_KEY
+
+bloggers:
+  - mid: 2137589551
+    name: "李大霄"
+    tags: ["价值投资", "A股"]
+    enabled: true
+
+scheduler:
+  daily_cron: "30 21 * * *"
+  timezone: "Asia/Shanghai"
+
+asr:
+  api_url: "https://api.xiaomimimo.com/v1/chat/completions"
+  model: "mimo-v2.5-asr"
+  chunk_seconds: 180
+
+llm:
+  provider: "xiaomi"
+  model: "mimo-v2.5-pro"
+  api_url: "https://api.xiaomimimo.com/v1/chat/completions"
+
+database:
+  host: "mysql"
+  port: 3306
+  name: "fin_agg"
+  charset: "utf8mb4"
+
+server:
+  host: "0.0.0.0"
+  port: 8091
+
+data:
+  backfill_since: "2026-07-01"
+  backfill_cap: 20
+  first_run_cap: 20
+
+limits:
+  comment_fetch_count: 20
+  danmaku_sample_size: 2000
+  video_interval_seconds: 5
+  backoff_base_seconds: 10

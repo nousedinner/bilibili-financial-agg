@@ -1,0 +1,24 @@
+# Environment variables (SENSITIVE - never commit)
+.env
+!.env.example
+config/.env
+
+# Config with real values
+config/config.yaml
+
+# Audio cache
+audio/
+transcripts/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Data
+data/*.db
+
+# OS
+.DS_Store
+Thumbs.db

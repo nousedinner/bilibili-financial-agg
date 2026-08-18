@@ -24,7 +24,7 @@
 ### 0. 首次启动 — 密码配置
 APP首次打开时显示：
 
-- 输入框：API地址（默认已填好 `https://***REMOVED***`）
+- 输入框：API地址（默认已填好 `https://***REMOVED***/fin-api/`）
 - 输入框：密码（即X-API-Key的值）
 - 保存按钮
 - 如无密码，可点"创建用户"调bootstrap获取

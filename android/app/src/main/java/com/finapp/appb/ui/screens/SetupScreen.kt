@@ -39,7 +39,7 @@ fun SetupScreen(onSetupComplete: () -> Unit) {
     val scope = rememberCoroutineScope()
     val focusManager = LocalFocusManager.current
 
-    var apiUrl by remember { mutableStateOf("https://***REMOVED***") }
+    var apiUrl by remember { mutableStateOf("https://your-server.com/fin-api/") }
     var apiKey by remember { mutableStateOf("") }
     var username by remember { mutableStateOf("") }
     var showPassword by remember { mutableStateOf(false) }

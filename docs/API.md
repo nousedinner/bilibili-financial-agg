@@ -2,7 +2,7 @@
 
 ## Base URL
 ```
-https://***REMOVED***
+https://***REMOVED***/fin-api/
 ```
 
 ## 鉴权

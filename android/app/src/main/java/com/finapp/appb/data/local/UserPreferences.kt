@@ -20,7 +20,7 @@ class UserPreferences(private val context: Context) {
     }
 
     val baseUrl: Flow<String> = context.dataStore.data.map { prefs ->
-        prefs[API_BASE_URL] ?: "https://***REMOVED***"
+        prefs[API_BASE_URL] ?: "https://your-server.com/fin-api/"
     }
 
     val apiKey: Flow<String> = context.dataStore.data.map { prefs ->

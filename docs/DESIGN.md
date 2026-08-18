@@ -14,7 +14,7 @@
 |------|------|
 | 语言+框架 | Python + FastAPI |
 | 数据库 | MySQL（加入现有mysql-net网络，新建专属用户） |
-| 部署 | Docker，***REMOVED***/fin-api/ |
+| 部署 | Docker，home.cancanneed.top/fin-api/ |
 | AI模型 | MiMo（配置文件可换） |
 | ASR | MiMo ASR，切片≤3min |
 | 初始博主 | 李大霄 (mid: 2137589551) |

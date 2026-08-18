@@ -2,7 +2,7 @@
 
 ## Base URL
 ```
-https://***REMOVED***/fin-api/
+https://home.cancanneed.top/fin-api/
 ```
 
 ## 鉴权

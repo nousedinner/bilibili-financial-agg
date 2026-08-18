@@ -12,6 +12,9 @@ import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.focusTarget
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -20,6 +23,7 @@ import com.finapp.appb.ui.components.VideoCard
 import com.finapp.appb.ui.friendlyErrorMessage
 import com.finapp.appb.viewmodel.FeedViewModel
 import kotlinx.coroutines.launch
+import androidx.compose.runtime.DisposableEffect
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -35,6 +39,26 @@ fun FeedScreen(
     val bloggerNames by viewModel.bloggerNames.collectAsState()
     val authError by viewModel.authError.collectAsState()
     val listState = rememberLazyListState()
+    val focusRequester = remember { FocusRequester() }
+
+    // 从详情页返回时恢复滚动位置
+    LaunchedEffect(Unit) {
+        listState.scrollToItem(viewModel.savedScrollIndex, viewModel.savedScrollOffset)
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            viewModel.savedScrollIndex = listState.firstVisibleItemIndex
+            viewModel.savedScrollOffset = listState.firstVisibleItemScrollOffset
+        }
+    }
+
+    // 从详情页返回时主动请求焦点，确保 LazyColumn 可以响应触摸事件
+    LaunchedEffect(Unit) {
+        try {
+            focusRequester.requestFocus()
+        } catch (_: Exception) { }
+    }
 
     // Load more when scrolling to bottom
     val shouldLoadMore by remember {
@@ -123,7 +147,10 @@ fun FeedScreen(
                 }
                 else -> LazyColumn(
                     state = listState,
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .focusRequester(focusRequester)
+                        .focusTarget(),
                     contentPadding = PaddingValues(vertical = 8.dp)
                 ) {
                     items(

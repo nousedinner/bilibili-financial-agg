@@ -1,6 +1,6 @@
 # 财经聚合API接口文档
 
-> Base URL: `https://***REMOVED***/fin-api/api`
+> Base URL: `https://home.cancanneed.top/fin-api/api`
 > 响应格式: JSON，`{"code": 0, "data": {...}}` 表示成功
 
 ---

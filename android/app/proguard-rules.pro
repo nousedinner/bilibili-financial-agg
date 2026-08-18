@@ -1,0 +1,2 @@
+-dontwarn javax.annotation.**
+-keep class com.finapp.appb.data.api.** { *; }

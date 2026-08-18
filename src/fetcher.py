@@ -2,7 +2,7 @@
 
 import asyncio
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from typing import Optional
 
 from sqlalchemy import select, update
@@ -18,6 +18,11 @@ from src.models import (
 )
 from src.db import async_session
 from src.config import get_config, get_env
+
+
+def _utcnow() -> datetime:
+    """返回当前时间（naive，MySQL CST时区）。"""
+    return datetime.now().replace(tzinfo=None)
 
 
 def _bili_client() -> BiliClient:
@@ -130,7 +135,7 @@ async def run_backfill(mid: int, since: str, cap: int = 20) -> dict:
 
 async def _fetch_blogger(client: BiliClient, mid: int, name: str) -> dict:
     """抓取单个博主的新内容。"""
-    result = {"name": name, "new_count": 0, "failed_count": 0, "videos": [], "dynamics": []}
+    result = {"name": name, "new_count": 0, "skipped_count": 0, "failed_count": 0, "videos": [], "dynamics": []}
 
     # Get watermark
     async with async_session() as session:
@@ -149,7 +154,8 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str) -> dict:
     backfill_since = cfg.get("data", {}).get("backfill_since", "2026-07-01")
     since_dt = datetime.strptime(backfill_since, "%Y-%m-%d") if backfill_since else None
 
-    # Batch check: which bvids already have fetch_status='ok' in DB
+    # Batch check: which bvids already exist with fetch_status='ok' OR have a Summary
+    # (Summary existence is a more reliable dedup signal than fetch_status alone)
     bvids_in_list = [v.get("bvid", "") for v in videos if v.get("bvid")]
     already_done = set()
     if bvids_in_list:
@@ -160,11 +166,18 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str) -> dict:
             )
             already_done = set((await session.execute(stmt)).scalars().all())
 
+            # Also check summaries — if a summary exists, the video was fully processed
+            # even if fetch_status wasn't updated (e.g., previous container crashed)
+            sum_stmt = select(Summary.bvid).where(Summary.bvid.in_(bvids_in_list))
+            sum_done = set((await session.execute(sum_stmt)).scalars().all())
+            already_done |= sum_done
+
     for v in videos:
         bvid = v.get("bvid", "")
         if bvid == last_bvid:
             break  # Reached watermark
         if bvid in already_done:
+            result["skipped_count"] += 1
             continue  # Already processed — skip
         # 日期过滤：只处理 backfill_since 之后的视频
         pub_ts = v.get("created", 0)
@@ -174,32 +187,38 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str) -> dict:
         if not last_bvid and len(new_videos) >= first_run_cap:
             break  # First run: limit
 
+    if result["skipped_count"] > 0:
+        print(f"[fetcher] {name}: 跳过{result['skipped_count']}条已有视频，待处理{len(new_videos)}条")
+
     for v in new_videos:
         try:
             await _process_video(client, mid, v)
             result["new_count"] += 1
             result["videos"].append(v.get("bvid", ""))
         except Exception as e:
-            print(f"[fetcher] video {v.get('bvid')} failed: {e}")
+            print(f"[fetcher] ❌ {v.get('bvid')} failed: {e}")
             result["failed_count"] += 1
         await asyncio.sleep(video_interval)
 
-    # Update watermark
-    if new_videos:
+    # Update watermark — always update to the newest video in the list
+    # (even if we didn't process it, to avoid re-checking old videos next run)
+    if videos:
         async with async_session() as session:
-            new_bvid = new_videos[0].get("bvid") if new_videos else (wm.last_bvid if wm else None)
-            new_pub_ts = new_videos[0].get("created") if new_videos else None
+            newest_bvid = videos[0].get("bvid")
+            newest_pub_ts = videos[0].get("created")
 
+            # Re-fetch watermark in this session (previous wm is detached)
+            wm = await session.get(FetchWatermark, mid)
             if wm:
-                wm.last_bvid = new_bvid
-                if new_pub_ts:
-                    wm.last_publish_time = datetime.fromtimestamp(new_pub_ts)
-                wm.updated_at = datetime.utcnow()
+                wm.last_bvid = newest_bvid
+                if newest_pub_ts:
+                    wm.last_publish_time = datetime.fromtimestamp(newest_pub_ts)
+                wm.updated_at = _utcnow()
             else:
                 session.add(FetchWatermark(
                     mid=mid,
-                    last_bvid=new_bvid,
-                    last_publish_time=datetime.fromtimestamp(new_pub_ts) if new_pub_ts else None,
+                    last_bvid=newest_bvid,
+                    last_publish_time=datetime.fromtimestamp(newest_pub_ts) if newest_pub_ts else None,
                 ))
             await session.commit()
 
@@ -222,7 +241,7 @@ async def _process_video(client: BiliClient, mid: int, vinfo: dict):
     elif isinstance(duration, int):
         dur_sec = duration
 
-    pub_dt = datetime.fromtimestamp(pub_ts) if pub_ts else datetime.utcnow()
+    pub_dt = datetime.fromtimestamp(pub_ts) if pub_ts else _utcnow().replace(tzinfo=None)
 
     # Get video info for CID
     vid_info = await client.get_video_info(bvid)
@@ -259,76 +278,80 @@ async def _process_video(client: BiliClient, mid: int, vinfo: dict):
     analysis = await analyze_video(title, transcript_text, comments, danmakus, dur_sec)
 
     # Step 4: Save everything to DB
-    async with async_session() as session:
-        # Transcript
-        if transcript_text:
-            existing_tr = await session.get(Transcript, bvid)
-            if existing_tr:
-                existing_tr.source = transcript_result["source"]
-                existing_tr.full_text = transcript_text
-                existing_tr.segment_count = transcript_result["segments"]
+    try:
+        async with async_session() as session:
+            # Transcript
+            if transcript_text:
+                existing_tr = await session.get(Transcript, bvid)
+                if existing_tr:
+                    existing_tr.source = transcript_result["source"]
+                    existing_tr.full_text = transcript_text
+                    existing_tr.segment_count = transcript_result["segments"]
+                else:
+                    session.add(Transcript(
+                        bvid=bvid,
+                        source=transcript_result["source"],
+                        full_text=transcript_text,
+                        segment_count=transcript_result["segments"],
+                    ))
+
+            # Summary
+            existing_sum = await session.get(Summary, bvid)
+            if existing_sum:
+                existing_sum.summary = analysis["summary"]
+                existing_sum.key_points = analysis["key_points"]
+                existing_sum.sentiment = analysis["sentiment"]
+                existing_sum.sentiment_score = analysis["sentiment_score"]
+                existing_sum.risk_warnings = analysis["risk_warnings"]
+                existing_sum.data_citations = analysis["data_citations"]
+                existing_sum.tags = analysis["tags"]
             else:
-                session.add(Transcript(
+                session.add(Summary(
                     bvid=bvid,
-                    source=transcript_result["source"],
-                    full_text=transcript_text,
-                    segment_count=transcript_result["segments"],
+                    summary=analysis["summary"],
+                    key_points=analysis["key_points"],
+                    sentiment=analysis["sentiment"],
+                    sentiment_score=analysis["sentiment_score"],
+                    risk_warnings=analysis["risk_warnings"],
+                    data_citations=analysis["data_citations"],
+                    tags=analysis["tags"],
                 ))
 
-        # Summary
-        existing_sum = await session.get(Summary, bvid)
-        if existing_sum:
-            existing_sum.summary = analysis["summary"]
-            existing_sum.key_points = analysis["key_points"]
-            existing_sum.sentiment = analysis["sentiment"]
-            existing_sum.sentiment_score = analysis["sentiment_score"]
-            existing_sum.risk_warnings = analysis["risk_warnings"]
-            existing_sum.data_citations = analysis["data_citations"]
-            existing_sum.tags = analysis["tags"]
-        else:
-            session.add(Summary(
-                bvid=bvid,
-                summary=analysis["summary"],
-                key_points=analysis["key_points"],
-                sentiment=analysis["sentiment"],
-                sentiment_score=analysis["sentiment_score"],
-                risk_warnings=analysis["risk_warnings"],
-                data_citations=analysis["data_citations"],
-                tags=analysis["tags"],
+            # Comment analysis
+            cs = analysis.get("comment_sentiment", {})
+            await session.merge(CommentAnalysis(
+                ref_id=bvid,
+                ref_type="video",
+                total_count=len(comments),
+                fetched_count=len(comments),
+                sentiment_bullish=cs.get("bullish", 0),
+                sentiment_bearish=cs.get("bearish", 0),
+                sentiment_neutral=cs.get("neutral", 0),
+                hot_comments=[c.get("content", {}).get("message", "") for c in comments[:5]],
+                keywords=analysis.get("comment_keywords", []),
             ))
 
-        # Comment analysis
-        cs = analysis.get("comment_sentiment", {})
-        await session.merge(CommentAnalysis(
-            ref_id=bvid,
-            ref_type="video",
-            total_count=len(comments),
-            fetched_count=len(comments),
-            sentiment_bullish=cs.get("bullish", 0),
-            sentiment_bearish=cs.get("bearish", 0),
-            sentiment_neutral=cs.get("neutral", 0),
-            hot_comments=[c.get("content", {}).get("message", "") for c in comments[:5]],
-            keywords=analysis.get("comment_keywords", []),
-        ))
+            # Danmaku analysis
+            ds = analysis.get("danmaku_sentiment", {})
+            await session.merge(DanmakuAnalysis(
+                bvid=bvid,
+                total_count=len(danmakus),
+                sampled_count=len(danmakus),
+                sentiment_bullish=ds.get("bullish", 0),
+                sentiment_bearish=ds.get("bearish", 0),
+                sentiment_neutral=ds.get("neutral", 0),
+                keywords=analysis.get("danmaku_keywords", []),
+            ))
 
-        # Danmaku analysis
-        ds = analysis.get("danmaku_sentiment", {})
-        await session.merge(DanmakuAnalysis(
-            bvid=bvid,
-            total_count=len(danmakus),
-            sampled_count=len(danmakus),
-            sentiment_bullish=ds.get("bullish", 0),
-            sentiment_bearish=ds.get("bearish", 0),
-            sentiment_neutral=ds.get("neutral", 0),
-            keywords=analysis.get("danmaku_keywords", []),
-        ))
+            # Mark video as ok
+            video = await session.get(Video, bvid)
+            if video:
+                video.fetch_status = "ok"
 
-        # Mark video as ok
-        video = await session.get(Video, bvid)
-        if video:
-            video.fetch_status = "ok"
-
-        await session.commit()
+            await session.commit()
+    except Exception as e:
+        print(f"[fetcher] ❌ {bvid} DB写入失败: {e}")
+        raise
 
     print(f"[fetcher] ✅ {bvid} ({title[:30]}) — {analysis['sentiment']}")
 
@@ -387,7 +410,7 @@ async def _process_dynamic(client: BiliClient, mid: int, dyn_data: dict):
     author_mod = modules.get("module_author", {})
     if isinstance(author_mod, dict):
         pub_ts = author_mod.get("pub_ts", 0)
-    pub_dt = datetime.fromtimestamp(pub_ts) if pub_ts else datetime.utcnow()
+    pub_dt = datetime.fromtimestamp(pub_ts) if pub_ts else _utcnow().replace(tzinfo=None)
 
     # LLM Analysis
     analysis = await analyze_dynamic(content_text)
@@ -418,7 +441,8 @@ async def _process_dynamic(client: BiliClient, mid: int, dyn_data: dict):
 async def _generate_digest(bloggers: list, results: dict):
     """生成当日汇总并存入DB。"""
     from zoneinfo import ZoneInfo
-    today = date.today()  # TZ=Asia/Shanghai set in container
+    tz_shanghai = ZoneInfo("Asia/Shanghai")
+    today = datetime.now(tz_shanghai).date()
     blogger_analyses = []
 
     async with async_session() as session:
@@ -428,12 +452,13 @@ async def _generate_digest(bloggers: list, results: dict):
             mid = b["mid"]
             name = b.get("name", str(mid))
 
-            # Get today's videos
+            # Get today's videos — use publish_time compared to today start in Shanghai TZ
+            today_start = datetime.combine(today, datetime.min.time()).replace(tzinfo=tz_shanghai)
             stmt = (
                 select(Video, Summary)
                 .outerjoin(Summary, Video.bvid == Summary.bvid)
                 .where(Video.mid == mid)
-                .where(Video.publish_time >= datetime.combine(today, datetime.min.time()))
+                .where(Video.publish_time >= today_start)
                 .order_by(Video.publish_time.desc())
             )
             rows = (await session.execute(stmt)).all()
@@ -452,7 +477,7 @@ async def _generate_digest(bloggers: list, results: dict):
             dyn_stmt = (
                 select(Dynamic)
                 .where(Dynamic.mid == mid)
-                .where(Dynamic.publish_time >= datetime.combine(today, datetime.min.time()))
+                .where(Dynamic.publish_time >= today_start)
             )
             dyns = (await session.execute(dyn_stmt)).scalars().all()
 
@@ -466,6 +491,10 @@ async def _generate_digest(bloggers: list, results: dict):
                     "mid": mid, "name": name,
                     "videos": videos, "dynamics": dynamics,
                 })
+
+    print(f"[fetcher] digest: 找到{len(blogger_analyses)}个博主的今日内容")
+    for ba in blogger_analyses:
+        print(f"  {ba['name']}: {len(ba['videos'])}个视频, {len(ba['dynamics'])}条动态")
 
     if blogger_analyses:
         digest = await generate_daily_digest(blogger_analyses)
@@ -491,8 +520,12 @@ async def _generate_digest(bloggers: list, results: dict):
             existing = await session.get(DailyDigest, today)
             if existing:
                 existing.content = digest
+                print(f"[fetcher] digest: 更新已有记录 {today}")
             else:
                 session.add(DailyDigest(digest_date=today, content=digest))
+                print(f"[fetcher] digest: 创建新记录 {today}")
             await session.commit()
+    else:
+        print(f"[fetcher] digest: 今日无内容，跳过生成")
 
-        print(f"[fetcher] ✅ 每日汇总生成: {today}")
+    print(f"[fetcher] ✅ 每日汇总生成: {today}")

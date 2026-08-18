@@ -8,6 +8,11 @@ from sqlalchemy.orm import DeclarativeBase
 from datetime import datetime
 
 
+def _localnow():
+    """返回当前时间（naive，匹配MySQL CST时区）。"""
+    return datetime.now().replace(tzinfo=None)
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -19,7 +24,7 @@ class Blogger(Base):
     name = Column(String(100), nullable=False)
     tags = Column(JSON)
     enabled = Column(Boolean, default=True)
-    added_at = Column(DateTime, default=datetime.utcnow)
+    added_at = Column(DateTime, default=_localnow)
 
 
 class Video(Base):
@@ -35,7 +40,7 @@ class Video(Base):
     dyn_id = Column(String(50))
     fetch_status = Column(Enum("pending", "ok", "failed", name="fetch_status"), default="pending")
     error_message = Column(Text)
-    fetched_at = Column(DateTime, default=datetime.utcnow)
+    fetched_at = Column(DateTime, default=_localnow)
 
 
 class Transcript(Base):
@@ -45,7 +50,7 @@ class Transcript(Base):
     source = Column(Enum("cc_subtitle", "ai_subtitle", "asr", name="transcript_source"), nullable=False)
     full_text = Column(Text)
     segment_count = Column(Integer)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_localnow)
 
 
 class Summary(Base):
@@ -59,7 +64,7 @@ class Summary(Base):
     risk_warnings = Column(JSON)
     data_citations = Column(JSON)
     tags = Column(JSON)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_localnow)
 
 
 class CommentAnalysis(Base):
@@ -74,7 +79,7 @@ class CommentAnalysis(Base):
     sentiment_neutral = Column(Float)
     hot_comments = Column(JSON)
     keywords = Column(JSON)
-    fetched_at = Column(DateTime, default=datetime.utcnow)
+    fetched_at = Column(DateTime, default=_localnow)
 
 
 class DanmakuAnalysis(Base):
@@ -87,7 +92,7 @@ class DanmakuAnalysis(Base):
     sentiment_bearish = Column(Float)
     sentiment_neutral = Column(Float)
     keywords = Column(JSON)
-    fetched_at = Column(DateTime, default=datetime.utcnow)
+    fetched_at = Column(DateTime, default=_localnow)
 
 
 class Dynamic(Base):
@@ -100,7 +105,7 @@ class Dynamic(Base):
     summary = Column(Text)
     sentiment = Column(Enum("bullish", "bearish", "neutral", name="dynamic_sentiment"))
     tags = Column(JSON)
-    fetched_at = Column(DateTime, default=datetime.utcnow)
+    fetched_at = Column(DateTime, default=_localnow)
 
 
 class FetchWatermark(Base):
@@ -110,7 +115,7 @@ class FetchWatermark(Base):
     last_bvid = Column(String(20))
     last_publish_time = Column(DateTime)
     last_dyn_id = Column(String(50))
-    updated_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=_localnow)
 
 
 class ApiUser(Base):
@@ -121,7 +126,7 @@ class ApiUser(Base):
     username = Column(String(50), unique=True, nullable=False)
     api_key = Column(String(128), unique=True, nullable=False)
     enabled = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_localnow)
 
 
 class DailyDigest(Base):
@@ -129,4 +134,4 @@ class DailyDigest(Base):
 
     digest_date = Column(Date, primary_key=True)
     content = Column(JSON)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_localnow)

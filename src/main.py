@@ -602,7 +602,7 @@ async def trigger_fetch():
 
 async def _run_fetch_task():
     try:
-        result = await run_daily_fetch()
+        result = await run_fetch_only()
         print(f"[trigger] 抓取完成: {result}")
     except Exception as e:
         print(f"[trigger] 抓取失败: {e}")

@@ -29,13 +29,17 @@ def _bili_client() -> BiliClient:
     return BiliClient(sessdata=get_env("SESSDATA"))
 
 
-async def run_daily_fetch() -> dict:
-    """每晚定时任务：抓取所有启用博主的新内容，生成当日汇总。"""
-    # 从数据库读取博主列表（不是config文件）
+async def _get_enabled_bloggers() -> list:
+    """从数据库读取启用的博主列表。"""
     async with async_session() as db_session:
         stmt = select(Blogger).where(Blogger.enabled == True)
         db_bloggers = (await db_session.execute(stmt)).scalars().all()
-        bloggers = [{"mid": b.mid, "name": b.name, "tags": b.tags, "enabled": True} for b in db_bloggers]
+        return [{"mid": b.mid, "name": b.name, "tags": b.tags, "enabled": True} for b in db_bloggers]
+
+
+async def run_fetch_only() -> dict:
+    """只抓取，不生成汇总。用于12:00和21:00的定时任务。"""
+    bloggers = await _get_enabled_bloggers()
 
     if not bloggers:
         print("[fetcher] 没有启用的博主，跳过抓取")
@@ -66,9 +70,14 @@ async def run_daily_fetch() -> dict:
                 print(f"[fetcher] 博主 {name} 抓取失败: {e}")
                 results["bloggers"][mid] = {"error": str(e)}
 
-        # Generate daily digest
-        await _generate_digest(bloggers, results)
+    return results
 
+
+async def run_daily_fetch() -> dict:
+    """兼容旧接口：抓取 + 汇总。"""
+    results = await run_fetch_only()
+    bloggers = await _get_enabled_bloggers()
+    await _generate_digest(bloggers, results)
     return results
 
 
@@ -134,8 +143,38 @@ async def run_backfill(mid: int, since: str, cap: int = 20) -> dict:
 
 
 async def _fetch_blogger(client: BiliClient, mid: int, name: str) -> dict:
-    """抓取单个博主的新内容。"""
-    result = {"name": name, "new_count": 0, "skipped_count": 0, "failed_count": 0, "videos": [], "dynamics": []}
+    """抓取单个博主的新内容。优先重试失败的视频。"""
+    result = {"name": name, "new_count": 0, "skipped_count": 0, "failed_count": 0, "retried_count": 0, "videos": [], "dynamics": []}
+
+    # Step 1: 优先重试失败的视频（retry_count < 3）
+    max_retries = get_config().get("retry", {}).get("max_retries", 3)
+    async with async_session() as session:
+        stmt = select(Video).where(
+            Video.mid == mid,
+            Video.fetch_status == "failed",
+            Video.retry_count < max_retries,
+        ).order_by(Video.retry_count.asc())
+        failed_videos = (await session.execute(stmt)).scalars().all()
+
+    if failed_videos:
+        print(f"[fetcher] {name}: 找到{len(failed_videos)}个失败视频，优先重试")
+        for video in failed_videos:
+            try:
+                # 构造vinfo字典用于_process_video
+                vinfo = {
+                    "bvid": video.bvid,
+                    "title": video.title,
+                    "created": int(video.publish_time.timestamp()) if video.publish_time else 0,
+                    "play": video.view_count or 0,
+                    "length": video.duration or 0,
+                }
+                await _process_video(client, mid, vinfo, is_retry=True)
+                result["retried_count"] += 1
+                result["videos"].append(video.bvid)
+            except Exception as e:
+                print(f"[fetcher] ❌ 重试 {video.bvid} 失败: {e}")
+                result["failed_count"] += 1
+            await asyncio.sleep(3)
 
     # Get watermark
     async with async_session() as session:
@@ -225,7 +264,7 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str) -> dict:
     return result
 
 
-async def _process_video(client: BiliClient, mid: int, vinfo: dict):
+async def _process_video(client: BiliClient, mid: int, vinfo: dict, is_retry: bool = False):
     """处理单个视频：字幕→评论→弹幕→LLM分析→入库。"""
     bvid = vinfo.get("bvid", "")
     title = vinfo.get("title", "")
@@ -258,12 +297,15 @@ async def _process_video(client: BiliClient, mid: int, vinfo: dict):
                 bvid=bvid, mid=mid, title=title, duration=dur_sec,
                 publish_time=pub_dt, view_count=view_count,
                 fetch_status="pending",
+                retry_count=0,
             )
             session.add(video)
         else:
             video.title = title
             video.duration = dur_sec
             video.view_count = view_count
+            if is_retry:
+                video.fetch_status = "pending"  # 重试时重置状态
         await session.commit()
 
     # Step 1: Transcript
@@ -347,10 +389,19 @@ async def _process_video(client: BiliClient, mid: int, vinfo: dict):
             video = await session.get(Video, bvid)
             if video:
                 video.fetch_status = "ok"
+                video.retry_count = 0  # 成功后重置重试计数
 
             await session.commit()
     except Exception as e:
+        # 失败时更新retry_count
         print(f"[fetcher] ❌ {bvid} DB写入失败: {e}")
+        async with async_session() as session:
+            video = await session.get(Video, bvid)
+            if video:
+                video.fetch_status = "failed"
+                video.error_message = str(e)[:500]
+                video.retry_count = (video.retry_count or 0) + 1
+                await session.commit()
         raise
 
     print(f"[fetcher] ✅ {bvid} ({title[:30]}) — {analysis['sentiment']}")
@@ -439,11 +490,17 @@ async def _process_dynamic(client: BiliClient, mid: int, dyn_data: dict):
 
 
 async def _generate_digest(bloggers: list, results: dict):
-    """生成当日汇总并存入DB。"""
+    """生成当日汇总并存入DB。时间范围：昨日22:00 → 今日22:00。"""
     from zoneinfo import ZoneInfo
+    from datetime import time, timedelta
     tz_shanghai = ZoneInfo("Asia/Shanghai")
-    today = datetime.now(tz_shanghai).date()
+    now = datetime.now(tz_shanghai)
+    today = now.date()
     blogger_analyses = []
+
+    # 时间范围：昨日22:00 → 今日22:00
+    yesterday_22 = datetime.combine(today, time(22, 0)).replace(tzinfo=tz_shanghai) - timedelta(days=1)
+    today_22 = datetime.combine(today, time(22, 0)).replace(tzinfo=tz_shanghai)
 
     async with async_session() as session:
         for b in bloggers:
@@ -452,13 +509,13 @@ async def _generate_digest(bloggers: list, results: dict):
             mid = b["mid"]
             name = b.get("name", str(mid))
 
-            # Get today's videos — use publish_time compared to today start in Shanghai TZ
-            today_start = datetime.combine(today, datetime.min.time()).replace(tzinfo=tz_shanghai)
+            # 查询时间范围内的视频
             stmt = (
                 select(Video, Summary)
                 .outerjoin(Summary, Video.bvid == Summary.bvid)
                 .where(Video.mid == mid)
-                .where(Video.publish_time >= today_start)
+                .where(Video.publish_time >= yesterday_22)
+                .where(Video.publish_time < today_22)
                 .order_by(Video.publish_time.desc())
             )
             rows = (await session.execute(stmt)).all()
@@ -473,11 +530,12 @@ async def _generate_digest(bloggers: list, results: dict):
                     "key_points": s.key_points if s else [],
                 })
 
-            # Get today's dynamics
+            # Get dynamics in time range
             dyn_stmt = (
                 select(Dynamic)
                 .where(Dynamic.mid == mid)
-                .where(Dynamic.publish_time >= today_start)
+                .where(Dynamic.publish_time >= yesterday_22)
+                .where(Dynamic.publish_time < today_22)
             )
             dyns = (await session.execute(dyn_stmt)).scalars().all()
 

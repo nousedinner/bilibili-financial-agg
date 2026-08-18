@@ -18,7 +18,7 @@ from src.models import (
     CommentAnalysis, DanmakuAnalysis, Dynamic,
     FetchWatermark, DailyDigest, ApiUser,
 )
-from src.fetcher import run_daily_fetch, run_backfill
+from src.fetcher import run_daily_fetch, run_fetch_only, run_backfill, _get_enabled_bloggers, _generate_digest
 
 
 # ------------------------------------------------------------------
@@ -33,33 +33,58 @@ async def lifespan(app: FastAPI):
 
 
 def _start_scheduler():
-    """启动APScheduler定时任务。"""
+    """启动APScheduler定时任务：12:00/21:00抓取 + 22:00汇总。"""
     cfg = get_config()
-    cron_expr = cfg.get("scheduler", {}).get("daily_cron", "30 21 * * *")
+    scheduler_cfg = cfg.get("scheduler", {})
 
     try:
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
         from apscheduler.triggers.cron import CronTrigger
 
         scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
-        # Parse "30 21 * * *" → minute=30, hour=21
-        parts = cron_expr.split()
-        trigger = CronTrigger(minute=parts[0], hour=parts[1])
-        scheduler.add_job(_scheduled_fetch, trigger)
+
+        # 12:00 抓取
+        fetch_cron_1 = scheduler_cfg.get("fetch_cron_1", "0 12 * * *")
+        parts = fetch_cron_1.split()
+        scheduler.add_job(_scheduled_fetch, CronTrigger(minute=parts[0], hour=parts[1]))
+        print(f"[scheduler] 抓取任务1: {fetch_cron_1}")
+
+        # 21:00 抓取
+        fetch_cron_2 = scheduler_cfg.get("fetch_cron_2", "0 21 * * *")
+        parts = fetch_cron_2.split()
+        scheduler.add_job(_scheduled_fetch, CronTrigger(minute=parts[0], hour=parts[1]))
+        print(f"[scheduler] 抓取任务2: {fetch_cron_2}")
+
+        # 22:00 汇总锁定
+        digest_cron = scheduler_cfg.get("digest_cron", "0 22 * * *")
+        parts = digest_cron.split()
+        scheduler.add_job(_scheduled_digest, CronTrigger(minute=parts[0], hour=parts[1]))
+        print(f"[scheduler] 汇总任务: {digest_cron}")
+
         scheduler.start()
-        print(f"[scheduler] 每日抓取: {cron_expr}")
     except Exception as e:
         print(f"[scheduler] 启动失败: {e}")
 
 
 async def _scheduled_fetch():
-    """定时任务入口。"""
-    print(f"[scheduler] 开始每日抓取: {datetime.now()}")
+    """定时任务入口：只抓取，不生成汇总。"""
+    print(f"[scheduler] 开始抓取: {datetime.now()}")
     try:
-        result = await run_daily_fetch()
+        result = await run_fetch_only()
         print(f"[scheduler] 抓取完成: {result.get('total_new', 0)} 新内容")
     except Exception as e:
         print(f"[scheduler] 抓取失败: {e}")
+
+
+async def _scheduled_digest():
+    """定时任务入口：只生成汇总，不抓取。"""
+    print(f"[scheduler] 开始生成汇总: {datetime.now()}")
+    try:
+        bloggers = await _get_enabled_bloggers()
+        await _generate_digest(bloggers, {})
+        print(f"[scheduler] 汇总生成完成")
+    except Exception as e:
+        print(f"[scheduler] 汇总生成失败: {e}")
 
 
 app = FastAPI(

@@ -40,6 +40,7 @@ class Video(Base):
     dyn_id = Column(String(50))
     fetch_status = Column(Enum("pending", "ok", "failed", name="fetch_status"), default="pending")
     error_message = Column(Text)
+    retry_count = Column(Integer, default=0)
     fetched_at = Column(DateTime, default=_localnow)
 
 

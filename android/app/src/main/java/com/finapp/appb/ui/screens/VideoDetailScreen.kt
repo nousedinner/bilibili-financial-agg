@@ -226,6 +226,19 @@ fun VideoDetailScreen(
                         }
                     }
 
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Button(
+                        onClick = {
+                            val url = "https://www.bilibili.com/video/$bvid"
+                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                        },
+                        modifier = Modifier.fillMaxWidth().height(48.dp),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text("在 B站 观看完整视频", fontSize = 15.sp)
+                    }
+
                     Spacer(modifier = Modifier.height(32.dp))
                 }
             }

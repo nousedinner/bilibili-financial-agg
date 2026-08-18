@@ -37,8 +37,6 @@ class FeedViewModel(application: Application) : AndroidViewModel(application) {
     private var hasMore = true
     private val pageSize = 50
     private var lastRefreshTime = 0L
-    var savedScrollIndex = 0
-    var savedScrollOffset = 0
 
     init {
         Log.d("FeedVM", "init called")

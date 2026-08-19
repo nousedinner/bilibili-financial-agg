@@ -140,7 +140,8 @@ async def generate_daily_digest(blogger_analyses: list) -> dict:
 
     Returns:
         {
-            "overall_sentiment": str,
+            "overall_sentiment": "bullish"|"bearish"|"neutral",
+            "overall_sentiment_desc": str,
             "consensus": [str],
             "differences": [str],
             "key_topics": [str],
@@ -166,7 +167,8 @@ async def generate_daily_digest(blogger_analyses: list) -> dict:
 
 请输出JSON：
 {{
-    "overall_sentiment": "今日整体情绪: bullish/bearish/neutral + 中文描述",
+    "overall_sentiment": "bullish或bearish或neutral（三选一，只输出英文单词）",
+    "overall_sentiment_desc": "今日整体情绪的中文描述，一句话概括",
     "consensus": ["多位博主共识观点1", "..."],
     "differences": ["博主间分歧1", "..."],
     "key_topics": ["今日核心话题1", "..."],
@@ -176,13 +178,15 @@ async def generate_daily_digest(blogger_analyses: list) -> dict:
     result = await _call_llm(prompt)
     if result:
         try:
-            return json.loads(result)
+            digest = json.loads(result)
+            return _validate_digest(digest)
         except json.JSONDecodeError:
             start = result.find("{")
             end = result.rfind("}") + 1
             if start >= 0 and end > start:
                 try:
-                    return json.loads(result[start:end])
+                    digest = json.loads(result[start:end])
+                    return _validate_digest(digest)
                 except json.JSONDecodeError:
                     pass
     return _empty_digest()
@@ -250,8 +254,32 @@ def _empty_analysis() -> dict:
 def _empty_digest() -> dict:
     return {
         "overall_sentiment": "neutral",
+        "overall_sentiment_desc": "",
         "consensus": [],
         "differences": [],
         "key_topics": [],
         "summary": "",
     }
+
+
+_VALID_SENTIMENTS = {"bullish", "bearish", "neutral"}
+
+
+def _validate_digest(digest: dict) -> dict:
+    """校验 daily digest，确保 overall_sentiment 是合法枚举值。"""
+    # 兼容旧格式：如果 overall_sentiment 包含中文描述，提取关键词
+    raw = str(digest.get("overall_sentiment", "")).strip().lower()
+    if raw not in _VALID_SENTIMENTS:
+        # 尝试从脏数据中提取
+        for kw in _VALID_SENTIMENTS:
+            if kw in raw:
+                digest["overall_sentiment"] = kw
+                # 如果没有独立的 desc 字段，用原始值作为描述
+                if not digest.get("overall_sentiment_desc"):
+                    digest["overall_sentiment_desc"] = raw
+                break
+        else:
+            digest["overall_sentiment"] = "neutral"
+            if not digest.get("overall_sentiment_desc"):
+                digest["overall_sentiment_desc"] = raw
+    return digest

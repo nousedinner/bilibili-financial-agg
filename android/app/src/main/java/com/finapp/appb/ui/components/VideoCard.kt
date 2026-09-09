@@ -34,10 +34,7 @@ fun VideoCard(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 16.dp, vertical = 6.dp)
-            .then(
-                if (isVideo) Modifier.clickable(onClick = onClick)
-                else Modifier
-            ),
+            .clickable(onClick = onClick),
         shape = RoundedCornerShape(12.dp),
         colors = CardDefaults.cardColors(
             containerColor = if (isDynamic) SurfaceVariant else CardBackground

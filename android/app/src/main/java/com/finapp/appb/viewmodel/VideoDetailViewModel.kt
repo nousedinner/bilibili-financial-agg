@@ -5,9 +5,11 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.finapp.appb.FinApp
 import com.finapp.appb.data.api.VideoDetail
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class VideoDetailViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application as FinApp
@@ -26,9 +28,18 @@ class VideoDetailViewModel(application: Application) : AndroidViewModel(applicat
         viewModelScope.launch {
             _isLoading.value = true
             _error.value = null
-            val result = repo.getVideoDetail(bvid)
+            // 1. Show cache immediately
+            val cached = try { repo.getCachedVideoDetail(bvid) } catch (_: Exception) { null }
+            if (cached != null) {
+                _detail.value = cached
+                _isLoading.value = false
+            }
+            // 2. Fetch from network
+            val result = withContext(Dispatchers.IO) { repo.refreshVideoDetail(bvid) }
             result.onSuccess { _detail.value = it }
-                .onFailure { _error.value = it.message ?: "加载失败" }
+                .onFailure {
+                    if (cached == null) _error.value = it.message ?: "加载失败"
+                }
             _isLoading.value = false
         }
     }

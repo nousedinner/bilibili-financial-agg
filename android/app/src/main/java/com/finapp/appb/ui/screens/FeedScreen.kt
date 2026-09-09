@@ -16,6 +16,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.finapp.appb.data.repository.stableId
+import com.finapp.appb.ui.BiliLink
 import com.finapp.appb.ui.components.SkeletonCard
 import com.finapp.appb.ui.components.VideoCard
 import com.finapp.appb.ui.friendlyErrorMessage
@@ -139,12 +140,17 @@ fun FeedScreen(
                         items = items,
                         key = { it.stableId() ?: "unknown:${it.publishTime}" }
                     ) { item ->
+                        val context = androidx.compose.ui.platform.LocalContext.current
                         VideoCard(
                             item = item,
                             bloggerNames = bloggerNames,
                             sentimentScore = item.sentimentScore ?: 0.0,
                             onClick = {
-                                item.bvid?.let { bvid -> onVideoClick(bvid) }
+                                if (item.type == "video" && item.bvid != null) {
+                                    onVideoClick(item.bvid)
+                                } else if (item.mid != null) {
+                                    BiliLink.openSpace(context, item.mid)
+                                }
                             }
                         )
                     }

@@ -244,7 +244,19 @@ class FinRepository(private val prefs: ConnectionStore, private val cache: Conte
 
     // ── Daily: Cache-First + Detail pre-loading ──
 
-    suspend fun getDailyDates(): Result<List<String>> = request({ it.getDailyDates() }).map { it.dates }
+    /** Get dates from Room cache (derived from cached daily details). */
+    suspend fun getCachedDailyDates(): List<String> = dailyDao.getAll().map { it.date }.sortedDescending()
+
+    /** Get daily dates: try network first, fall back to Room cache. */
+    suspend fun getDailyDates(): Result<List<String>> {
+        val result = request({ it.getDailyDates() }).map { it.dates }
+        if (result.isSuccess) return result
+        // Network failed, try Room cache
+        return try {
+            val cached = getCachedDailyDates()
+            if (cached.isNotEmpty()) Result.success(cached) else result
+        } catch (_: Exception) { result }
+    }
 
     /** Read daily detail from Room cache. */
     suspend fun getCachedDailyDetail(date: String): DailyContent? = try {
@@ -293,13 +305,26 @@ class FinRepository(private val prefs: ConnectionStore, private val cache: Conte
     suspend fun getStatus() = request({ it.status() })
     suspend fun triggerFetch(): Result<String> = request({ it.triggerFetch() }).map { it.message }
 
-    suspend fun getVideoDetail(bvid: String): Result<VideoDetail> = request({ it.getVideoDetail(bvid) }, save = {
-        detailDao.insert(VideoDetailCacheEntity(bvid, gson.toJson(it)))
-        detailDao.deleteOlderThan(System.currentTimeMillis() - maxAge)
-        detailDao.trim()
-    }, fallback = {
+    // ── Video Detail: Cache-First ──
+
+    /** Read video detail from Room cache. */
+    suspend fun getCachedVideoDetail(bvid: String): VideoDetail? = try {
         detailDao.getByBvid(bvid)?.takeIf { it.cachedAt >= System.currentTimeMillis() - maxAge }?.let {
             gson.fromJson(it.json, VideoDetail::class.java).copy(fromCache = true)
         }
-    })
+    } catch (_: Exception) { null }
+
+    /** Fetch video detail from network and update Room cache. */
+    suspend fun refreshVideoDetail(bvid: String): Result<VideoDetail> =
+        request({ it.getVideoDetail(bvid) }, save = {
+            detailDao.insert(VideoDetailCacheEntity(bvid, gson.toJson(it)))
+            detailDao.deleteOlderThan(System.currentTimeMillis() - maxAge)
+            detailDao.trim()
+        })
+
+    suspend fun getVideoDetail(bvid: String): Result<VideoDetail> {
+        val cached = try { getCachedVideoDetail(bvid) } catch (_: Exception) { null }
+        if (cached != null) return Result.success(cached)
+        return refreshVideoDetail(bvid)
+    }
 }

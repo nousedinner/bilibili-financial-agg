@@ -5,9 +5,11 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.finapp.appb.FinApp
 import com.finapp.appb.data.api.DailyContent
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class DailyViewModel(application: Application) : AndroidViewModel(application) {
     private val repo = (application as FinApp).repository
@@ -29,44 +31,47 @@ class DailyViewModel(application: Application) : AndroidViewModel(application) {
             _isLoading.value = true
             _error.value = null
 
-            // 1. Fetch date list from network
-            val datesResult = repo.getDailyDates()
-            datesResult.onSuccess { dates ->
-                if (dates.isEmpty()) {
-                    _summaries.value = emptyList()
-                    _isLoading.value = false
-                    return@launch
+            try {
+                // 1. Load cached details immediately
+                val cachedDates = try { repo.getCachedDailyDates() } catch (_: Exception) { emptyList() }
+                if (cachedDates.isNotEmpty()) {
+                    val cachedItems = cachedDates.mapNotNull { date ->
+                        try { repo.getCachedDailyDetail(date) } catch (_: Exception) { null }
+                    }
+                    if (cachedItems.isNotEmpty()) {
+                        _summaries.value = cachedItems
+                        _isLoading.value = false
+                    }
                 }
 
-                // 2. Load cached details immediately
-                val cachedDetails = dates.map { date ->
-                    try { repo.getCachedDailyDetail(date) } catch (_: Exception) { null }
-                }
-                val cachedItems = cachedDetails.filterNotNull().sortedByDescending { it.date }
-                if (cachedItems.isNotEmpty()) {
-                    _summaries.value = cachedItems
-                    _isLoading.value = false
-                }
+                // 2. Fetch date list from network
+                val datesResult = repo.getDailyDates()
+                datesResult.onSuccess { dates ->
+                    if (dates.isEmpty()) {
+                        if (_summaries.value.isEmpty()) _summaries.value = emptyList()
+                        _isLoading.value = false
+                        return@launch
+                    }
 
-                // 3. Pre-load missing details from network
-                repo.preloadDailyDetails(dates)
+                    // 3. Pre-load missing details from network (safe, isolated)
+                    withContext(Dispatchers.IO) {
+                        try { repo.preloadDailyDetails(dates) } catch (_: Exception) {}
+                    }
 
-                // 4. Reload all from cache (now complete)
-                val allDetails = dates.mapNotNull { date ->
-                    try { repo.getCachedDailyDetail(date) } catch (_: Exception) { null }
-                }.sortedByDescending { it.date }
-                _summaries.value = allDetails
-            }.onFailure {
-                // Try loading from cache even if network fails
-                try {
-                    val cachedAll = repo.getAllCachedDailyDetails()
-                    if (cachedAll.isNotEmpty()) {
-                        _summaries.value = cachedAll
-                    } else {
+                    // 4. Reload all from cache (now complete)
+                    val allDetails = dates.mapNotNull { date ->
+                        try { repo.getCachedDailyDetail(date) } catch (_: Exception) { null }
+                    }.sortedByDescending { it.date }
+                    if (allDetails.isNotEmpty()) _summaries.value = allDetails
+                }.onFailure {
+                    // Network failed but we already showed cache above
+                    if (_summaries.value.isEmpty()) {
                         _error.value = it.message ?: "加载失败"
                     }
-                } catch (_: Exception) {
-                    _error.value = it.message ?: "加载失败"
+                }
+            } catch (e: Exception) {
+                if (_summaries.value.isEmpty()) {
+                    _error.value = e.message ?: "加载失败"
                 }
             }
 

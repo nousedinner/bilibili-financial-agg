@@ -38,8 +38,6 @@ class FeedViewModel(application: Application) : AndroidViewModel(application) {
     fun refresh() {
         val token = ++generation
         job?.cancel()
-        _isLoading.value = true
-        _isRefreshing.value = _items.value.isNotEmpty()
         _error.value = null
         _authError.value = false
         pageFailed = false
@@ -47,12 +45,14 @@ class FeedViewModel(application: Application) : AndroidViewModel(application) {
         cursor = null
         job = viewModelScope.launch {
             try {
-                // 1. Show cache immediately
+                // 1. Show cache immediately (no spinner)
                 val cached = try { repo.getCachedFeed() } catch (_: Exception) { emptyList() }
                 if (cached.isNotEmpty()) {
                     _items.value = cached
-                    _isLoading.value = false
-                    _isRefreshing.value = true
+                    // Silent refresh — no spinner, no pull-to-refresh indicator
+                } else {
+                    // No cache at all, show loading skeleton
+                    _isLoading.value = true
                 }
                 // 2. Fetch from network
                 val result = repo.refreshFeed()

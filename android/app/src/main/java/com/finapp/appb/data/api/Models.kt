@@ -171,8 +171,17 @@ data class BatchAddItem(
 
 // ── Daily ──
 data class DailyDatesResponse(
-    val dates: List<String>
-)
+    val dates: List<Any>  // 兼容 List<String> 和 List<Object> 两种后端格式
+) {
+    /** 提取日期字符串列表，兼容字符串数组和对象数组 */
+    fun dateStrings(): List<String> = dates.mapNotNull { element ->
+        when (element) {
+            is String -> element
+            is Map<*, *> -> element["date"] as? String
+            else -> null
+        }
+    }
+}
 
 data class DailyContent(
     val date: String? = null,

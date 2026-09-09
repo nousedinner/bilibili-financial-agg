@@ -28,10 +28,11 @@ class VideoDetailViewModel(application: Application) : AndroidViewModel(applicat
         viewModelScope.launch {
             _isLoading.value = true
             _error.value = null
-            // 1. Show cache immediately
+            // 1. Show cache immediately (no "离线" banner)
             val cached = try { repo.getCachedVideoDetail(bvid) } catch (_: Exception) { null }
             if (cached != null) {
-                _detail.value = cached
+                // Show cache WITHOUT fromCache flag — network will refresh shortly
+                _detail.value = cached.copy(fromCache = false)
                 _isLoading.value = false
             }
             // 2. Fetch from network
@@ -39,6 +40,7 @@ class VideoDetailViewModel(application: Application) : AndroidViewModel(applicat
             result.onSuccess { _detail.value = it }
                 .onFailure {
                     if (cached == null) _error.value = it.message ?: "加载失败"
+                    // If we had cache, keep showing it (no error banner)
                 }
             _isLoading.value = false
         }

@@ -249,7 +249,7 @@ class FinRepository(private val prefs: ConnectionStore, private val cache: Conte
 
     /** Get daily dates: try network first, fall back to Room cache. */
     suspend fun getDailyDates(): Result<List<String>> {
-        val result = request({ it.getDailyDates() }).map { it.dates }
+        val result = request({ it.getDailyDates() }).map { it.dateStrings() }
         if (result.isSuccess) return result
         // Network failed, try Room cache
         return try {

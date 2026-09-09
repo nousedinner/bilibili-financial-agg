@@ -321,11 +321,7 @@ private fun BloggerCard(blogger: Blogger, onDelete: () -> Unit) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Column(modifier = Modifier.weight(1f)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(blogger.name, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Primary)
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("→", fontSize = 14.sp, color = Primary)
-                }
+                Text(blogger.name, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Primary)
                 Text("ID: ${blogger.mid}", fontSize = 12.sp, color = TextSecondary)
                 if (!blogger.tags.isNullOrEmpty()) {
                     Spacer(modifier = Modifier.height(4.dp))

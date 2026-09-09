@@ -45,17 +45,21 @@ class FeedViewModel(application: Application) : AndroidViewModel(application) {
         cursor = null
         job = viewModelScope.launch {
             try {
-                // 1. Show cache immediately (no spinner)
+                // 0. Load blogger names from cache FIRST (fixes "博主#123" flash)
+                val cachedNames = try {
+                    repo.getCachedBloggers().associate { it.mid to it.name }
+                } catch (_: Exception) { emptyMap() }
+                if (cachedNames.isNotEmpty()) _bloggerNames.value = cachedNames
+
+                // 1. Show feed cache immediately (no spinner)
                 val cached = try { repo.getCachedFeed() } catch (_: Exception) { emptyList() }
                 if (cached.isNotEmpty()) {
                     _items.value = cached
-                    // Silent refresh — no spinner, no pull-to-refresh indicator
                 } else {
-                    // No cache at all, show loading skeleton
                     _isLoading.value = true
                 }
-                // 2. Fetch from network
-                val result = repo.refreshFeed()
+                // 2. Fetch from network (non-blocking — cache already shown)
+                val result = try { repo.refreshFeed() } catch (e: Exception) { Result.failure(e) }
                 ensureActive()
                 if (token != generation) return@launch
                 result.onSuccess { data ->
@@ -63,7 +67,7 @@ class FeedViewModel(application: Application) : AndroidViewModel(application) {
                     cursor = data.nextCursor
                     hasMore = data.hasMore && cursor?.before != null && cursor?.beforeId != null
                 }.onFailure { failed(it) }
-                // 3. Load blogger names
+                // 3. Refresh blogger names from network
                 repo.getBloggers().onSuccess { _bloggerNames.value = it.associate { b -> b.mid to b.name } }
             } finally {
                 if (token == generation) { _isLoading.value = false; _isRefreshing.value = false }

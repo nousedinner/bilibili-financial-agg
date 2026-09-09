@@ -65,8 +65,12 @@ fun BloggerScreen(viewModel: BloggerViewModel) {
                     IconButton(onClick = { showAddDialog = true }) {
                         Icon(Icons.Default.Add, "添加博主")
                     }
-                    IconButton(onClick = { viewModel.syncBloggers() }) {
-                        Icon(Icons.Default.Refresh, "同步关注")
+                    IconButton(onClick = { viewModel.syncBloggers() }, enabled = !syncLoading) {
+                        if (syncLoading) {
+                            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                        } else {
+                            Icon(Icons.Default.Refresh, "同步关注")
+                        }
                     }
                 }
             )

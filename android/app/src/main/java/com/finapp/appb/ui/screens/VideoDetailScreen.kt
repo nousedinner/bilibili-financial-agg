@@ -14,6 +14,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.OpenInBrowser
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -22,6 +23,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.finapp.appb.ui.FormatUtils
 import com.finapp.appb.ui.components.SentimentBadge
 import com.finapp.appb.ui.components.SkeletonDetail
 import com.finapp.appb.ui.friendlyErrorMessage
@@ -53,6 +55,9 @@ fun VideoDetailScreen(
                     }
                 },
                 actions = {
+                    IconButton(onClick = { viewModel.loadDetail(bvid) }) {
+                        Icon(Icons.Default.Refresh, "刷新")
+                    }
                     IconButton(onClick = {
                         try {
                             // 优先用B站APP打开
@@ -107,7 +112,7 @@ fun VideoDetailScreen(
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("👁 ${d.viewCount ?: 0}", fontSize = 13.sp, color = TextSecondary)
                         Text("⏱ ${formatDuration(d.duration ?: 0)}", fontSize = 13.sp, color = TextSecondary)
-                        Text(formatTime(d.publishTime ?: ""), fontSize = 13.sp, color = TextSecondary)
+                        Text(FormatUtils.formatTime(d.publishTime ?: ""), fontSize = 13.sp, color = TextSecondary)
                     }
 
                     // AI Analysis
@@ -275,13 +280,4 @@ private fun formatDuration(seconds: Int): String {
     val m = seconds / 60
     val s = seconds % 60
     return "${m}:${String.format("%02d", s)}"
-}
-
-private fun formatTime(iso: String): String {
-    if (iso.isBlank()) return ""
-    return try {
-        iso.replace("T", " ").take(16)
-    } catch (_: Exception) {
-        iso.take(16)
-    }
 }

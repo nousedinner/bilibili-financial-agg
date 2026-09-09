@@ -12,6 +12,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.finapp.appb.data.api.FeedItem
+import com.finapp.appb.ui.FormatUtils
 import com.finapp.appb.ui.theme.*
 
 @Composable
@@ -67,7 +68,7 @@ fun VideoCard(
                         )
                     }
                     Text(
-                        text = formatTime(publishTime),
+                        text = FormatUtils.formatTime(publishTime),
                         fontSize = 12.sp,
                         color = TextSecondary
                     )
@@ -113,18 +114,5 @@ fun VideoCard(
                 )
             }
         }
-    }
-}
-
-private fun formatTime(iso: String): String {
-    if (iso.isBlank()) return ""
-    return try {
-        val parts = iso.split("T")
-        if (parts.size >= 2) {
-            val time = parts[1].take(5)
-            "${parts[0].takeLast(5)} $time"
-        } else iso.take(16)
-    } catch (_: Exception) {
-        iso.take(16)
     }
 }

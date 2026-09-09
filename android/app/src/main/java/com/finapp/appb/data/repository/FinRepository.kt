@@ -1,413 +1,216 @@
 package com.finapp.appb.data.repository
 
 import com.finapp.appb.data.api.*
-import com.finapp.appb.data.local.AppDatabase
-import com.finapp.appb.data.local.FeedCacheEntity
-import com.finapp.appb.data.local.UserPreferences
-import com.finapp.appb.data.local.VideoDetailCacheEntity
+import com.finapp.appb.data.local.*
 import com.google.gson.Gson
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.OkHttpClient
-import okhttp3.logging.HttpLoggingInterceptor
+import retrofit2.Response
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
+import java.io.IOException
+import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
-class FinRepository(
-    private val prefs: UserPreferences,
-    private val database: AppDatabase
-) {
-    private var currentBaseUrl: String = ""
-    private var currentApiKey: String = ""
-    private var api: FinApiService? = null
-    private val feedCacheDao = database.feedCacheDao()
-    private val videoDetailCacheDao = database.videoDetailCacheDao()
-    private val gson = Gson()
+class ApiException(val status: Int, message: String) : IOException(message)
+fun Throwable.isAuthError() = this is ApiException && status in listOf(401, 403)
+fun Throwable.canUseCache() = this is IOException && (this !is ApiException || status >= 500)
+fun FeedItem.stableId(): String? = when (type) {
+    "video" -> bvid?.takeIf { it.isNotBlank() }?.let { "video:$it" }
+    "dynamic" -> dynId?.takeIf { it.isNotBlank() }?.let { "dynamic:$it" }
+    else -> null
+}
+fun mergeFeedItems(old: List<FeedItem>, next: List<FeedItem>): List<FeedItem> =
+    (next + old).filter { it.stableId() != null }.distinctBy { it.stableId() }
+        .sortedWith(compareByDescending<FeedItem> { it.publishTime }.thenByDescending { it.stableId() })
 
-    // In-memory cache
+class FinRepository(private val prefs: ConnectionStore, private val cache: ContentCache) {
+    constructor(prefs: UserPreferences, database: AppDatabase) : this(prefs, RoomContentCache(database))
+    private data class Session(val scope: String, val client: OkHttpClient, val api: FinApiService)
+    private val mutex = Mutex()
+    private var current: Session? = null
     private var cachedBloggers: List<Blogger>? = null
-    private var lastBloggersFetch: Long = 0
-    private var cachedFeedItems: List<FeedItem>? = null
+    private var bloggersAt = 0L
+    private val feedDao = cache.feed
+    private val detailDao = cache.details
+    private val gson = Gson()
+    private val maxAge = TimeUnit.DAYS.toMillis(7)
 
-    suspend fun ensureInitialized(): Boolean {
-        val url = prefs.baseUrl.first()
-        val key = prefs.apiKey.first()
-        if (url.isBlank() || key.isBlank()) return false
-        if (api == null || url != currentBaseUrl || key != currentApiKey) {
-            rebuildApi(url, key)
-        }
-        return true
-    }
+    private fun fingerprint(url: String, key: String): String = MessageDigest.getInstance("SHA-256")
+        .digest((url.trim().trimEnd('/') + "/\n" + key).toByteArray()).joinToString("") { "%02x".format(it) }
 
-    private fun rebuildApi(baseUrl: String, apiKey: String) {
-        currentBaseUrl = baseUrl
-        currentApiKey = apiKey
-
-        val logging = HttpLoggingInterceptor().apply {
-            level = HttpLoggingInterceptor.Level.BASIC
-        }
-
-        val client = OkHttpClient.Builder()
-            .addInterceptor { chain ->
-                val req = chain.request().newBuilder()
-                    .addHeader("X-API-Key", apiKey)
-                    .build()
-                chain.proceed(req)
-            }
-            .addInterceptor(logging)
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
+    private fun build(url: String, key: String): Session {
+        val normalized = url.trim().trimEnd('/') + "/"
+        val scope = fingerprint(normalized, key)
+        val client = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS).callTimeout(40, TimeUnit.SECONDS)
+            .followRedirects(false).followSslRedirects(false)
+            .addInterceptor { chain -> chain.proceed(chain.request().newBuilder().header("X-API-Key", key).build()) }
             .build()
-
-        val fixedUrl = if (baseUrl.endsWith("/")) baseUrl else "$baseUrl/"
-
-        api = Retrofit.Builder()
-            .baseUrl(fixedUrl)
-            .client(client)
-            .addConverterFactory(GsonConverterFactory.create())
-            .build()
-            .create(FinApiService::class.java)
+        val api = Retrofit.Builder().baseUrl(normalized).client(client)
+            .addConverterFactory(GsonConverterFactory.create()).build().create(FinApiService::class.java)
+        return Session(scope, client, api)
     }
 
-    private fun requireApi(): FinApiService {
-        return api ?: throw IllegalStateException("API not initialized")
-    }
-
-    fun reset() {
-        api = null
-        currentBaseUrl = ""
-        currentApiKey = ""
+    private suspend fun clearCache() {
         cachedBloggers = null
-        cachedFeedItems = null
+        bloggersAt = 0
+        cache.transaction { feedDao.clear(); detailDao.clear() }
     }
 
-    // ── Health (no auth) ──
-    suspend fun healthCheck(baseUrl: String): Boolean {
-        return try {
-            val logging = HttpLoggingInterceptor().apply {
-                level = HttpLoggingInterceptor.Level.BASIC
-            }
-            val client = OkHttpClient.Builder()
-                .addInterceptor(logging)
-                .connectTimeout(10, TimeUnit.SECONDS)
-                .build()
-            val fixedUrl = if (baseUrl.endsWith("/")) baseUrl else "$baseUrl/"
-            val tempApi = Retrofit.Builder()
-                .baseUrl(fixedUrl)
-                .client(client)
-                .addConverterFactory(GsonConverterFactory.create())
-                .build()
-                .create(FinApiService::class.java)
-            tempApi.health().isSuccessful
-        } catch (e: Exception) {
-            false
+    private suspend fun initialized(): Session? {
+        val config = prefs.config.first()
+        if (config.url.isBlank() || config.key.isBlank()) {
+            current?.client?.dispatcher?.cancelAll()
+            current = null
+            clearCache()
+            return null
         }
+        if (current?.scope == fingerprint(config.url, config.key)) return current
+        val candidate = build(config.url, config.key)
+        current?.client?.dispatcher?.cancelAll()
+        current = null
+        if (prefs.cacheScope.first() != candidate.scope) {
+            clearCache()
+            prefs.setCacheScope(candidate.scope)
+        }
+        current = candidate
+        feedDao.deleteOlderThan(System.currentTimeMillis() - maxAge)
+        detailDao.deleteOlderThan(System.currentTimeMillis() - maxAge)
+        return candidate
     }
 
-    // ── Bootstrap ──
-    suspend fun bootstrap(baseUrl: String, username: String): Result<UserResponse> {
-        return try {
-            val logging = HttpLoggingInterceptor().apply {
-                level = HttpLoggingInterceptor.Level.BASIC
-            }
-            val client = OkHttpClient.Builder()
-                .addInterceptor(logging)
-                .connectTimeout(15, TimeUnit.SECONDS)
-                .build()
-            val fixedUrl = if (baseUrl.endsWith("/")) baseUrl else "$baseUrl/"
-            val tempApi = Retrofit.Builder()
-                .baseUrl(fixedUrl)
-                .client(client)
-                .addConverterFactory(GsonConverterFactory.create())
-                .build()
-                .create(FinApiService::class.java)
-            val resp = tempApi.bootstrap(BootstrapRequest(username))
-            if (resp.isSuccessful && resp.body()?.code == 0) {
-                Result.success(resp.body()!!.data)
-            } else {
-                Result.failure(Exception(resp.errorBody()?.string() ?: "创建失败"))
-            }
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
+    suspend fun ensureInitialized(): Boolean = try {
+        mutex.withLock { initialized() != null }
+    } catch (e: CancellationException) { throw e } catch (_: Exception) { false }
 
-    // ── Feed with Cache ──
-    suspend fun getFeedPage(before: Double? = null, limit: Int = 50): Result<FeedPageData> {
-        return try {
-            val resp = requireApi().getFeedPage(before, limit)
-            if (resp.isSuccessful) {
-                Result.success(resp.body()!!.data)
-            } else if (resp.code() == 401) {
-                // 401 不回退缓存，直接返回错误让上层检测 authError
-                Result.failure(Exception("401"))
-            } else {
-                // API 失败，回退到 Room 缓存
-                val cached = getFeedFromCache()
-                if (cached.isNotEmpty()) {
-                    Result.success(FeedPageData(items = cached, total = cached.size, hasMore = false))
-                } else {
-                    Result.failure(Exception("加载失败: ${resp.code()}"))
-                }
-            }
-        } catch (e: Exception) {
-            // 网络异常，回退到 Room 缓存
-            val cached = getFeedFromCache()
-            if (cached.isNotEmpty()) {
-                Result.success(FeedPageData(items = cached, total = cached.size, hasMore = false))
-            } else {
-                Result.failure(e)
-            }
-        }
-    }
-
-    suspend fun getFeed(limit: Int = 100, blogger: Long? = null): Result<List<FeedItem>> {
-        if (cachedFeedItems != null && blogger == null) {
-            return Result.success(cachedFeedItems!!)
-        }
-
-        return try {
-            val resp = requireApi().getFeed(limit, blogger)
-            if (resp.isSuccessful) {
-                val items = resp.body()!!.data.items
-                if (blogger == null) {
-                    cachedFeedItems = items
-                }
-                cacheFeedItems(items)
-                Result.success(items)
-            } else if (resp.code() == 401) {
-                // 401 不回退缓存，直接返回错误
-                Result.failure(Exception("401"))
-            } else {
-                Result.failure(Exception("加载失败: ${resp.code()}"))
-            }
-        } catch (e: Exception) {
-            val cached = getFeedFromCache()
-            if (cached.isNotEmpty()) {
-                Result.success(cached)
-            } else {
-                Result.failure(e)
-            }
-        }
-    }
-
-    suspend fun getFeedFromCache(): List<FeedItem> {
-        return try {
-            feedCacheDao.getAll().map { entity ->
-                FeedItem(
-                    type = entity.type,
-                    bvid = entity.bvid.takeIf { it.isNotEmpty() && it != "null" },
-                    dynId = null,
-                    title = entity.title,
-                    sentiment = entity.sentiment,
-                    summary = entity.summary,
-                    publishTime = entity.publishTime,
-                    mid = entity.mid,
-                    viewCount = entity.viewCount,
-                    duration = entity.duration,
-                    sentimentScore = entity.sentimentScore
-                )
-            }
-        } catch (e: Exception) {
-            emptyList()
-        }
-    }
-
-    suspend fun cacheFeedItems(items: List<FeedItem>) {
-        try {
-            val entities = items.map { item ->
-                FeedCacheEntity(
-                    bvid = item.bvid ?: item.dynId ?: "unknown_${System.currentTimeMillis()}",
-                    type = item.type,
-                    title = item.title,
-                    summary = item.summary,
-                    sentiment = item.sentiment,
-                    sentimentScore = item.sentimentScore,
-                    publishTime = item.publishTime,
-                    mid = item.mid,
-                    viewCount = item.viewCount,
-                    duration = item.duration
-                )
-            }
-            feedCacheDao.insertAll(entities)
-        } catch (e: Exception) {
-            // Ignore cache errors
-        }
-    }
-
-    suspend fun checkForUpdates(): Boolean {
-        return try {
-            val resp = requireApi().status()
-            if (resp.isSuccessful) {
-                true
-            } else {
-                false
-            }
-        } catch (e: Exception) {
-            false
-        }
-    }
-
-    // ── Bloggers with Memory Cache ──
-    suspend fun getBloggers(forceRefresh: Boolean = false): Result<List<Blogger>> {
-        // Return cached if available and not forcing refresh
-        if (!forceRefresh && cachedBloggers != null) {
-            return Result.success(cachedBloggers!!)
-        }
-
-        return try {
-            val resp = requireApi().getBloggers()
-            if (resp.isSuccessful) {
-                val bloggers = resp.body()!!.data
+    suspend fun connect(url: String, key: String, username: String): Result<Unit> = try {
+        require(key.isNotBlank()) { "请输入 API Key" }
+        val candidate = build(url, key.trim())
+        val bloggers = payload(candidate.api.getBloggers())
+        withContext(NonCancellable) {
+            mutex.withLock {
+                current?.client?.dispatcher?.cancelAll()
+                current = null
+                clearCache()
+                prefs.saveConfig(url.trim().trimEnd('/') + "/", key.trim(), username.trim())
+                prefs.setCacheScope(candidate.scope)
+                current = candidate
                 cachedBloggers = bloggers
-                lastBloggersFetch = System.currentTimeMillis()
-                Result.success(bloggers)
-            } else {
-                Result.failure(Exception("加载失败: ${resp.code()}"))
-            }
-        } catch (e: Exception) {
-            // Return cached if available on error
-            if (cachedBloggers != null) {
-                Result.success(cachedBloggers!!)
-            } else {
-                Result.failure(e)
+                bloggersAt = System.currentTimeMillis()
             }
         }
+        Result.success(Unit)
+    } catch (e: CancellationException) { throw e } catch (e: Exception) { Result.failure(e) }
+
+    suspend fun logout() = withContext(NonCancellable) {
+        mutex.withLock {
+            current?.client?.dispatcher?.cancelAll()
+            current = null
+            prefs.clearConfig()
+            clearCache()
+        }
     }
 
-    suspend fun preloadBloggers() {
-        getBloggers()
+    private fun checkSession(session: Session) {
+        if (current !== session) throw CancellationException("Connection changed")
     }
 
-    suspend fun addBloggerByName(name: String): Result<AddBloggerResponse> {
+    private fun <T> payload(response: Response<ApiResponse<T>>): T {
+        if (!response.isSuccessful) throw ApiException(response.code(), when (response.code()) {
+            401, 403 -> "认证已失效，请重新配置"
+            409 -> "已有任务正在运行，请稍后查看状态"
+            else -> "请求失败 (${response.code()})"
+        })
+        val body = response.body() ?: throw IOException("服务器返回空响应")
+        if (body.code != 0) throw ApiException(400, "服务器未接受请求 (${body.code})")
+        return body.data ?: throw IOException("服务器返回缺少数据")
+    }
+
+    private suspend fun <T> request(
+        call: suspend (FinApiService) -> Response<ApiResponse<T>>,
+        save: suspend (T) -> Unit = {},
+        fallback: (suspend () -> T?)? = null
+    ): Result<T> {
+        var session: Session? = null
         return try {
-            val resp = requireApi().addBloggerByName(name)
-            if (resp.isSuccessful) {
-                // Invalidate cache
-                cachedBloggers = null
-                Result.success(resp.body()!!.data)
-            } else {
-                Result.failure(Exception("添加失败: ${resp.code()}"))
+            val active = mutex.withLock { initialized() ?: throw ApiException(401, "请先配置连接") }
+            session = active
+            val data = payload(call(active.api))
+            mutex.withLock { checkSession(active); save(data) }
+            Result.success(data)
+        } catch (e: CancellationException) { throw e } catch (e: Exception) {
+            mutex.withLock {
+                session?.let { checkSession(it) }
+                if (e.isAuthError()) {
+                    current?.client?.dispatcher?.cancelAll()
+                    current = null
+                    clearCache()
+                }
+                val cached = if (session != null && e.canUseCache()) fallback?.invoke() else null
+                if (cached != null) Result.success(cached) else Result.failure(e)
             }
-        } catch (e: Exception) {
-            Result.failure(e)
         }
     }
 
-    suspend fun deleteBlogger(mid: Long): Result<Any> {
-        return try {
-            val resp = requireApi().deleteBlogger(mid)
-            if (resp.isSuccessful) {
-                // Invalidate cache
-                cachedBloggers = null
-                Result.success(Any())
-            } else {
-                Result.failure(Exception("删除失败: ${resp.code()}"))
+    suspend fun getFeedPage(before: Double? = null, limit: Int = 50, beforeId: String? = null): Result<FeedPageData> =
+        request(call = { it.getFeedPage(before, limit, beforeId) }, save = { data ->
+            cache.transaction {
+                if (before == null) feedDao.clear()
+                feedDao.insertAll(data.items.mapNotNull { item -> item.stableId()?.let { id ->
+                    FeedCacheEntity(id, item.type, item.title, item.summary, item.sentiment, item.sentimentScore,
+                        item.publishTime, item.mid, item.viewCount, item.duration)
+                } })
+                feedDao.deleteOlderThan(System.currentTimeMillis() - maxAge)
+                feedDao.trim()
             }
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
-
-    // ── Video Detail ──
-    suspend fun getVideoDetail(bvid: String): Result<VideoDetail> {
-        return try {
-            val resp = requireApi().getVideoDetail(bvid)
-            if (resp.isSuccessful) {
-                val detail = resp.body()!!.data
-                // 成功时写入缓存
-                try {
-                    val json = gson.toJson(detail)
-                    videoDetailCacheDao.insert(VideoDetailCacheEntity(bvid = bvid, json = json))
-                } catch (_: Exception) { }
-                Result.success(detail)
-            } else if (resp.code() == 401) {
-                // 401 不回退缓存，直接返回错误
-                Result.failure(Exception("401"))
-            } else {
-                // API 失败，回退到缓存
-                val cached = getVideoDetailFromCache(bvid)
-                if (cached != null) Result.success(cached)
-                else Result.failure(Exception("加载失败: ${resp.code()}"))
+        }, fallback = if (before == null) ({
+            val items = feedDao.getAll().filter { it.cachedAt >= System.currentTimeMillis() - maxAge }.map { e ->
+                val id = e.bvid.substringAfter(':')
+                FeedItem(e.type, id.takeIf { e.type == "video" }, id.takeIf { e.type == "dynamic" }, e.title,
+                    e.sentiment, e.summary, e.publishTime, e.mid, e.viewCount, e.duration, e.sentimentScore)
             }
-        } catch (e: Exception) {
-            // 网络异常，回退到缓存
-            val cached = getVideoDetailFromCache(bvid)
-            if (cached != null) Result.success(cached)
-            else Result.failure(e)
-        }
+            if (items.isEmpty()) null else FeedPageData(items, items.size, false, fromCache = true)
+        }) else null)
+
+    suspend fun getBloggers(forceRefresh: Boolean = false): Result<List<Blogger>> {
+        try {
+            mutex.withLock {
+                initialized()
+                if (!forceRefresh && cachedBloggers != null && System.currentTimeMillis() - bloggersAt < 60_000)
+                    return Result.success(cachedBloggers!!)
+            }
+        } catch (e: CancellationException) { throw e } catch (e: Exception) { return Result.failure(e) }
+        return request({ it.getBloggers() }, save = { cachedBloggers = it; bloggersAt = System.currentTimeMillis() })
     }
 
-    private suspend fun getVideoDetailFromCache(bvid: String): VideoDetail? {
-        return try {
-            val entity = videoDetailCacheDao.getByBvid(bvid) ?: return null
-            gson.fromJson(entity.json, VideoDetail::class.java)
-        } catch (_: Exception) {
-            null
-        }
+    private suspend fun invalidateContent() {
+        // Reject reads started before a blogger was disabled or added.
+        current?.client?.dispatcher?.cancelAll()
+        current = current?.copy()
+        clearCache()
     }
 
-    // ── Daily ──
-    suspend fun getDailyDates(): Result<List<String>> {
-        return try {
-            val resp = requireApi().getDailyDates()
-            if (resp.isSuccessful) Result.success(resp.body()!!.data.dates)
-            else Result.failure(Exception("加载失败: ${resp.code()}"))
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
+    suspend fun preloadBloggers() { getBloggers() }
+    suspend fun addBloggerByName(name: String) = request({ it.addBloggerByName(name) }, save = { invalidateContent() })
+    suspend fun deleteBlogger(mid: Long) = request({ it.deleteBlogger(mid) }, save = { invalidateContent() })
+    suspend fun batchAddBloggers(bloggers: List<BloggerInput>) = request({ it.batchAddBloggers(bloggers) }, save = { invalidateContent() })
+    suspend fun syncBloggers() = request({ it.syncBloggers() })
+    suspend fun getDailyDates(): Result<List<String>> = request({ it.getDailyDates() }).map { it.dates }
+    suspend fun getDailyDetail(date: String) = request({ it.getDailyDetail(date) })
+    suspend fun getStatus() = request({ it.status() })
+    suspend fun triggerFetch(): Result<String> = request({ it.triggerFetch() }).map { it.message }
 
-    suspend fun getDailyDetail(date: String): Result<DailyContent> {
-        return try {
-            val resp = requireApi().getDailyDetail(date)
-            if (resp.isSuccessful) Result.success(resp.body()!!.data)
-            else Result.failure(Exception("加载失败: ${resp.code()}"))
-        } catch (e: Exception) {
-            Result.failure(e)
+    suspend fun getVideoDetail(bvid: String): Result<VideoDetail> = request({ it.getVideoDetail(bvid) }, save = {
+        detailDao.insert(VideoDetailCacheEntity(bvid, gson.toJson(it)))
+        detailDao.deleteOlderThan(System.currentTimeMillis() - maxAge)
+        detailDao.trim()
+    }, fallback = {
+        detailDao.getByBvid(bvid)?.takeIf { it.cachedAt >= System.currentTimeMillis() - maxAge }?.let {
+            gson.fromJson(it.json, VideoDetail::class.java).copy(fromCache = true)
         }
-    }
-
-    // ── Status ──
-    suspend fun getStatus(): Result<SystemStatus> {
-        return try {
-            val resp = requireApi().status()
-            if (resp.isSuccessful) Result.success(resp.body()!!.data)
-            else Result.failure(Exception("加载失败: ${resp.code()}"))
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
-
-    // ── Operations ──
-    suspend fun triggerFetch(): Result<String> {
-        return try {
-            val resp = requireApi().triggerFetch()
-            if (resp.isSuccessful) Result.success("已触发")
-            else Result.failure(Exception("触发失败: ${resp.code()}"))
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
-
-    // ── Sync Bloggers ──
-    suspend fun syncBloggers(): Result<SyncResponse> {
-        return try {
-            val resp = requireApi().syncBloggers()
-            if (resp.isSuccessful) Result.success(resp.body()!!.data)
-            else Result.failure(Exception("同步失败: ${resp.code()}"))
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
-
-    suspend fun batchAddBloggers(mids: String, names: String): Result<BatchAddResponse> {
-        return try {
-            val resp = requireApi().batchAddBloggers(mids, names)
-            if (resp.isSuccessful) Result.success(resp.body()!!.data)
-            else Result.failure(Exception("添加失败: ${resp.code()}"))
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
+    })
 }

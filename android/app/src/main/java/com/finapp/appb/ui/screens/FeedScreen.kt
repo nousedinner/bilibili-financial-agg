@@ -15,6 +15,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.finapp.appb.data.repository.stableId
 import com.finapp.appb.ui.components.SkeletonCard
 import com.finapp.appb.ui.components.VideoCard
 import com.finapp.appb.ui.friendlyErrorMessage
@@ -52,16 +53,16 @@ fun FeedScreen(
 
     if (authError) {
         AlertDialog(
-            onDismissRequest = { },
+            onDismissRequest = { viewModel.dismissAuthError() },
             title = { Text("认证失败") },
             text = { Text("密码已失效，请重新配置 API 密码") },
             confirmButton = {
-                TextButton(onClick = { onSettingsClick() }) {
+                TextButton(onClick = { viewModel.dismissAuthError(); onSettingsClick() }) {
                     Text("去设置")
                 }
             },
             dismissButton = {
-                TextButton(onClick = { }) {
+                TextButton(onClick = { viewModel.dismissAuthError() }) {
                     Text("取消")
                 }
             }
@@ -126,9 +127,17 @@ fun FeedScreen(
                     modifier = Modifier.fillMaxSize(),
                     contentPadding = PaddingValues(vertical = 8.dp)
                 ) {
+                    if (error != null) {
+                        item(key = "feed-error") {
+                            Column(Modifier.padding(16.dp)) {
+                                Text(error!!, color = MaterialTheme.colorScheme.error)
+                                TextButton(onClick = { viewModel.retry() }, enabled = !isLoading) { Text("重试") }
+                            }
+                        }
+                    }
                     items(
                         items = items,
-                        key = { it.bvid ?: it.dynId ?: it.title ?: "item_${items.indexOf(it)}" }
+                        key = { it.stableId()!! }
                     ) { item ->
                         VideoCard(
                             item = item,

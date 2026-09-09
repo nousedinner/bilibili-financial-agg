@@ -1,6 +1,6 @@
 # B站财经博主聚合服务配置
 
-# 敏感信息从 .env 读取：SESSDATA, XIAOMI_API_KEY, DB_USER, DB_PASSWORD, FIN_AGG_API_KEY
+# 敏感信息从 .env 读取：SESSDATA, XIAOMI_API_KEY, DB_USER, DB_PASSWORD（API 用户通过管理命令创建）
 
 bloggers:
   - mid: 2137589551
@@ -9,7 +9,10 @@ bloggers:
     enabled: true
 
 scheduler:
-  daily_cron: "30 21 * * *"
+  fetch_cron_1: "0 12 * * *"
+  fetch_cron_2: "0 21 * * *"
+  digest_cron: "10 22 * * *"
+  digest_cutoff_hour: 22
   timezone: "Asia/Shanghai"
 
 asr:

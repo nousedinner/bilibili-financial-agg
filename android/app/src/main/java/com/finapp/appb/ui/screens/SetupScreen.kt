@@ -27,6 +27,7 @@ import com.finapp.appb.FinApp
 import com.finapp.appb.data.local.UserPreferences
 import com.finapp.appb.data.repository.FinRepository
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.first
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -45,15 +46,11 @@ fun SetupScreen(onSetupComplete: () -> Unit) {
     var isLoading by remember { mutableStateOf(false) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
 
-    // Load saved config
     LaunchedEffect(Unit) {
-        prefs.baseUrl.collect { if (it.isNotBlank()) apiUrl = it }
-    }
-    LaunchedEffect(Unit) {
-        prefs.apiKey.collect { if (it.isNotBlank()) apiKey = it }
-    }
-    LaunchedEffect(Unit) {
-        prefs.username.collect { if (it.isNotBlank()) username = it }
+        val config = prefs.config.first()
+        if (config.url.isNotBlank()) apiUrl = config.url
+        apiKey = config.key
+        username = config.username
     }
 
     Column(
@@ -76,6 +73,7 @@ fun SetupScreen(onSetupComplete: () -> Unit) {
             label = { Text("API 地址") },
             modifier = Modifier.fillMaxWidth(),
             singleLine = true,
+            enabled = !isLoading,
             shape = RoundedCornerShape(12.dp)
         )
         Spacer(modifier = Modifier.height(16.dp))
@@ -87,6 +85,7 @@ fun SetupScreen(onSetupComplete: () -> Unit) {
             label = { Text("用户名") },
             modifier = Modifier.fillMaxWidth(),
             singleLine = true,
+            enabled = !isLoading,
             shape = RoundedCornerShape(12.dp),
             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next)
         )
@@ -99,6 +98,7 @@ fun SetupScreen(onSetupComplete: () -> Unit) {
             label = { Text("密码 (API Key)") },
             modifier = Modifier.fillMaxWidth(),
             singleLine = true,
+            enabled = !isLoading,
             shape = RoundedCornerShape(12.dp),
             visualTransformation = if (showPassword) VisualTransformation.None else PasswordVisualTransformation(),
             keyboardOptions = KeyboardOptions(
@@ -129,21 +129,15 @@ fun SetupScreen(onSetupComplete: () -> Unit) {
                 focusManager.clearFocus()
                 isLoading = true
                 errorMsg = null
+                val urlSnapshot = apiUrl
+                val keySnapshot = apiKey
+                val userSnapshot = username
                 scope.launch {
-                    val ok = repo.healthCheck(apiUrl)
-                    if (!ok) {
-                        errorMsg = "无法连接到服务器"
-                        isLoading = false
-                        return@launch
-                    }
-                    if (apiKey.isBlank()) {
-                        errorMsg = "请输入密码"
-                        isLoading = false
-                        return@launch
-                    }
-                    prefs.saveConfig(apiUrl, apiKey, username)
-                    isLoading = false
-                    onSetupComplete()
+                    try {
+                        repo.connect(urlSnapshot, keySnapshot, userSnapshot)
+                            .onSuccess { onSetupComplete() }
+                            .onFailure { errorMsg = it.message ?: "连接失败，请检查地址和 API Key" }
+                    } finally { isLoading = false }
                 }
             },
             modifier = Modifier.fillMaxWidth().height(52.dp),

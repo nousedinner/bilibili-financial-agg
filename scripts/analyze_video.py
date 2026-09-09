@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 
 # 添加项目路径
-sys.path.insert(0, os.path.expanduser('~/bilibili-financial-agg'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.bilibili import BiliClient
 from src.config import get_env
@@ -167,8 +167,9 @@ async def analyze_video(url_or_bvid: str, output_file: str = None) -> dict:
         comments = []
         if aid:
             try:
-                comments = await client.get_comments(aid, count=10)
-            except:
+                comments_response = await client.get_comments(aid, count=10)
+                comments = comments_response["replies"]
+            except Exception:
                 pass
     
     # 5. 构建输出

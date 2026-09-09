@@ -34,8 +34,7 @@ interface FinApiService {
 
     @POST("api/bloggers/sync/add")
     suspend fun batchAddBloggers(
-        @Query("mids") mids: String,
-        @Query("names") names: String
+        @Body bloggers: List<BloggerInput>
     ): Response<ApiResponse<BatchAddResponse>>
 
     @DELETE("api/bloggers/{mid}")
@@ -63,7 +62,8 @@ interface FinApiService {
     @GET("api/feed")
     suspend fun getFeedPage(
         @Query("before") before: Double? = null,
-        @Query("limit") limit: Int = 50
+        @Query("limit") limit: Int = 50,
+        @Query("before_id") beforeId: String? = null
     ): Response<ApiResponse<FeedPageData>>
 
     // ── Daily ──

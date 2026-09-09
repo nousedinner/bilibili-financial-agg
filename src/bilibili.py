@@ -28,45 +28,38 @@ class BiliAPIError(Exception):
 # curl 统一请求（含超时回收）
 # ------------------------------------------------------------------
 
-async def _run_curl(
-    args: list[str],
-    timeout: float = 20,
-    sep_body_status: bool = False,
-) -> tuple[bytes, int]:
-    """执行 curl 子进程并返回 (stdout_bytes, http_status_code)。
-
-    - timeout 超时后会 terminate 进程并等待回收，防止僵尸进程。
-    - sep_body_status=True 时，用 -w '\\n%{http_code}' 分离 body 和状态码。
-    """
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+async def _run_curl(args: list[str], timeout: float = 20, sep_body_status: bool = False) -> tuple[bytes, int]:
+    # Every caller receives the same body/status contract, including subtitle requests.
+    args = list(args)
+    if "-w" not in args and "--write-out" not in args:
+        args[1:1] = ["-w", "\n%{http_code}"]
+    proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     try:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
         await proc.wait()
-        raise TimeoutError(f"curl timed out after {timeout}s: {' '.join(args[:3])}")
-
-    status = 0
-    body = stdout
-    if sep_body_status and stdout:
-        text = stdout.decode("utf-8", errors="replace")
-        lines = text.rsplit("\n", 1)
-        if len(lines) >= 2:
-            body = lines[0].encode()
-            try:
-                status = int(lines[1].strip())
-            except ValueError:
-                status = 0
+        raise
+    if proc.returncode != 0:
+        raise BiliAPIError(-1, f"curl exited with code {proc.returncode}")
+    try:
+        body, raw_status = stdout.rsplit(b"\n", 1)
+        status = int(raw_status.strip())
+    except (ValueError, TypeError):
+        raise BiliAPIError(-1, "curl returned no HTTP status") from None
+    if not 200 <= status < 300:
+        raise BiliAPIError(status, f"HTTP {status}")
     return body, status
 
 
 def _bili_curl_args(url: str, sessdata: str = "", cookie_extra: str = "", sep: bool = False) -> list[str]:
     """构建 B站 API curl 命令行参数。"""
-    cmd = ["curl", "-s"]
+    cmd = ["curl", "-sS", "--compressed", "--connect-timeout", "10", "--max-time", "20"]
+    for key, value in _HEADERS.items():
+        cmd += ["-H", f"{key}: {value}"]
     if sep:
         cmd += ["-w", "\n%{http_code}"]
     parts = []
@@ -146,6 +139,8 @@ class BiliClient:
 
     def _get_mixin_key(self, raw: str) -> str:
         """Apply the mixin key enc table to produce the 32-char signing key."""
+        if len(raw) != 64:
+            raise BiliAPIError(-1, "WBI signing keys unavailable")
         return "".join(raw[i] for i in _MIXIN_KEY_ENC_TAB)[:32]
 
     async def sign_params(self, params: dict) -> dict:
@@ -163,94 +158,38 @@ class BiliClient:
         query = urllib.parse.urlencode(filtered)
         w_rid = hashlib.md5((query + wbi_key).encode()).hexdigest()
 
-        params["w_rid"] = w_rid
-        return params
+        filtered["w_rid"] = w_rid
+        return filtered
 
     # ------------------------------------------------------------------
     # 通用请求（带退避）
     # ------------------------------------------------------------------
 
     async def _get(self, url: str, params: dict = None, signed: bool = True) -> dict:
-        """GET with optional WBI signing and exponential backoff on -412/-352.
-
-        使用 subprocess curl 替代 httpx，绕过容器内 httpx 的 TLS 指纹被 B站 412 拦截。
-        """
         if signed and params is not None:
-            params = await self.sign_params(params)
-
-        # 构建完整 URL
+            params = await self.sign_params(dict(params))
         if params:
-            separator = "&" if "?" in url else "?"
-            url = url + separator + urllib.parse.urlencode(params)
-
-        cfg = get_config().get("limits", {})
-        backoff_base = cfg.get("backoff_base_seconds", 10)
-
+            url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
+        backoff = get_config().get("limits", {}).get("backoff_base_seconds", 10)
         for attempt in range(4):
             try:
-                body, status_code = await _run_curl(
-                    _bili_curl_args(url, self._sessdata, sep=True), timeout=20,
-                )
-                text = body.decode("utf-8", errors="replace")
-            except TimeoutError as e:
-                print(f"[bili] curl error: {e}")
-                if attempt < 3:
-                    wait = backoff_base * (2 ** attempt)
-                    await asyncio.sleep(wait)
-                    continue
-                return {"code": -1, "message": str(e)}
-            except Exception as e:
-                print(f"[bili] curl error: {e}")
-                if attempt < 3:
-                    wait = backoff_base * (2 ** attempt)
-                    await asyncio.sleep(wait)
-                    continue
-                return {"code": -1, "message": f"curl error: {e}"}
-
-            # status_code 已由 _run_curl 分离
-            if status_code and status_code != 200:
-                print(f"[bili] HTTP {status_code}")
-                if attempt < 3:
-                    wait = backoff_base * (2 ** attempt)
-                    await asyncio.sleep(wait)
-                    continue
-                return {"code": -1, "message": f"HTTP {status_code}"}
-
-            if not text.strip():
-                if attempt < 3:
-                    wait = backoff_base * (2 ** attempt)
-                    await asyncio.sleep(wait)
-                    continue
-                return {"code": -1, "message": "curl: empty response"}
-
-            try:
-                result = _json.loads(text)
-            except _json.JSONDecodeError:
-                print(f"[bili] non-JSON response ({status_code})")
-                if attempt < 3:
-                    wait = backoff_base * (2 ** attempt)
-                    print(f"[bili] backoff {wait}s (attempt {attempt+1})")
-                    await asyncio.sleep(wait)
-                    continue
-                return {"code": -1, "message": f"non-JSON response {status_code}"}
-
-            code = result.get("code", 0)
-
-            if code == 0:
-                return result
-
-            # Rate limited
-            if code in (-412, -352):
-                wait = backoff_base * (2 ** attempt)
-                print(f"[bili] rate limited (code={code}), backoff {wait}s (attempt {attempt+1})")
-                await asyncio.sleep(wait)
-                continue
-
-            # Other errors — raise instead of silently returning
-            print(f"[bili] API error: code={code} msg={result.get('message', '')}")
-            raise BiliAPIError(code, result.get("message", ""), result)
-
-        return {"code": -1, "message": "max retries exceeded"}
+                body, _ = await _run_curl(_bili_curl_args(url, self._sessdata,
+                    cookie_extra=f"buvid3={self._buvid3}" if self._buvid3 else ""), timeout=25)
+                result = _json.loads(body)
+                if not isinstance(result, dict) or "code" not in result:
+                    raise BiliAPIError(-1, "Malformed API response")
+                code = result["code"]
+                if code == 0:
+                    return result
+                raise BiliAPIError(code, str(result.get("message", "API failure")))
+            except BiliAPIError as exc:
+                if exc.code not in (-1, -412, -352, 412, 429, 500, 502, 503, 504) or attempt == 3:
+                    raise
+            except (TimeoutError, OSError, ValueError) as exc:
+                if attempt == 3:
+                    raise BiliAPIError(-1, f"Request failed: {type(exc).__name__}") from exc
+            await asyncio.sleep(backoff * 2 ** attempt)
+        raise BiliAPIError(-1, "Request retries exhausted")
 
     # ------------------------------------------------------------------
     # 视频列表
@@ -274,43 +213,25 @@ class BiliClient:
             params=params,
             signed=True,
         )
-        return result.get("data", {})
+        data = result.get("data")
+        if not isinstance(data, dict):
+            raise BiliAPIError(-1, "Missing API data")
+        if not isinstance(data.get("list"), dict) or not isinstance(data["list"].get("vlist"), list):
+            raise BiliAPIError(-1, "Malformed video list")
+        return data
 
     # ------------------------------------------------------------------
     # 动态列表
     # ------------------------------------------------------------------
 
     async def get_dynamics(self, mid: int, offset: str = "") -> dict:
-        """获取用户动态列表。使用桌面端endpoint + buvid3防412。使用 curl 获取。
-
-        Returns: {"items": [...], "has_more": bool, "offset": str}
-        """
-        # Ensure buvid3 cookie
         await self._ensure_buvid3()
-
-        params = {
-            "host_mid": mid,
-            "offset": offset,
-            "timezone_offset": "-480",
-        }
-        query = urllib.parse.urlencode(params)
-        url = f"https://api.bilibili.com/x/polymer/web-dynamic/desktop/v1/feed/space?{query}"
-
-        cmd = _bili_curl_args(
-            url, self._sessdata,
-            cookie_extra=f"buvid3={self._buvid3}" if self._buvid3 else "",
-            sep=True,
-        )
-        try:
-            body, status_code = await _run_curl(cmd, timeout=15)
-            if status_code != 200:
-                print(f"[bili] dynamics {status_code}")
-                return {}
-            result = _json.loads(body)
-        except (TimeoutError, Exception) as e:
-            print(f"[bili] dynamics curl error: {e}")
-            return {}
-        return result.get("data", {})
+        result = await self._get("https://api.bilibili.com/x/polymer/web-dynamic/desktop/v1/feed/space",
+            {"host_mid": mid, "offset": offset, "timezone_offset": "-480"}, signed=False)
+        data = result.get("data")
+        if not isinstance(data, dict):
+            raise BiliAPIError(-1, "Missing dynamic feed data")
+        return data
 
     async def _ensure_buvid3(self):
         """获取buvid3设备标识cookie。使用 curl 获取。"""
@@ -341,7 +262,7 @@ class BiliClient:
         # 需要WBI签名
         params = {"bvid": bvid, "cid": cid}
         signed_params = await self.sign_params(params)
-        query = "&".join([f"{k}={v}" for k, v in signed_params.items()])
+        query = urllib.parse.urlencode(signed_params)
         url = f"https://api.bilibili.com/x/player/wbi/v2?{query}"
         
         try:
@@ -357,10 +278,10 @@ class BiliClient:
         # Prefer ai-zh, then any Chinese
         for sub in subtitles:
             if sub.get("lan") == "ai-zh":
-                return "https:" + sub["subtitle_url"]
+                return urllib.parse.urljoin("https://www.bilibili.com", sub["subtitle_url"])
         for sub in subtitles:
             if sub.get("lan", "").startswith("zh"):
-                return "https:" + sub["subtitle_url"]
+                return urllib.parse.urljoin("https://www.bilibili.com", sub["subtitle_url"])
         return None
 
     async def get_cc_subtitle(self, bvid: str, cid: int) -> Optional[str]:
@@ -379,7 +300,7 @@ class BiliClient:
 
         for sub in subtitles:
             if sub.get("lan", "").startswith("zh"):
-                return "https:" + sub["subtitle_url"]
+                return urllib.parse.urljoin("https://www.bilibili.com", sub["subtitle_url"])
         return None
 
     # ------------------------------------------------------------------
@@ -394,7 +315,10 @@ class BiliClient:
             params=params,
             signed=False,
         )
-        return result.get("data", {})
+        data = result.get("data")
+        if not isinstance(data, dict):
+            raise BiliAPIError(-1, "Missing API data")
+        return data
 
     # ------------------------------------------------------------------
     # 音频下载（ASR用）
@@ -415,10 +339,15 @@ class BiliClient:
         return None
 
     async def download_audio(self, url: str) -> bytes:
-        """下载音频二进制。"""
-        headers = {**_HEADERS}
-        resp = await self._client.get(url, headers=headers)
-        return resp.content
+        limit = int(get_config().get("asr", {}).get("max_audio_bytes", 256 * 1024 * 1024))
+        data = bytearray()
+        async with self._client.stream("GET", url, headers=_HEADERS, timeout=120) as resp:
+            resp.raise_for_status()
+            async for chunk in resp.aiter_bytes():
+                data.extend(chunk)
+                if len(data) > limit:
+                    raise ValueError("Audio exceeds configured download limit")
+        return bytes(data)
 
     # ------------------------------------------------------------------
     # 评论
@@ -451,21 +380,14 @@ class BiliClient:
     # 弹幕
     # ------------------------------------------------------------------
 
-    async def get_danmaku(self, cid: int, max_count: int = 2000) -> list:
-        """获取弹幕列表（protobuf接口，返回文本列表）。使用 curl 获取。"""
-        import re
-        url = f"https://api.bilibili.com/x/v1/dm/list.so?oid={cid}"
-        try:
-            body, _ = await _run_curl(_bili_curl_args(url), timeout=15)
-            text = body.decode("utf-8", errors="ignore")
-        except Exception as e:
-            print(f"[bili] danmaku curl error: {e}")
-            return []
-        danmakus = re.findall(r'<d [^>]*>(.*?)</d>', text)
-        if len(danmakus) > max_count:
-            import random
-            danmakus = random.sample(danmakus, max_count)
-        return danmakus
+    async def get_danmaku(self, cid: int, max_count: int = 2000) -> dict:
+        import random
+        import xml.etree.ElementTree as ET
+        body, _ = await _run_curl(_bili_curl_args(f"https://api.bilibili.com/x/v1/dm/list.so?oid={cid}"), timeout=25)
+        entries = [node.text or "" for node in ET.fromstring(body).findall("d")]
+        total = len(entries)
+        sample = random.sample(entries, max_count) if total > max_count else entries
+        return {"items": sample, "total": total}
 
     # ------------------------------------------------------------------
     # Cookie验证
@@ -543,45 +465,26 @@ class BiliClient:
                     }
         return None
 
-    async def get_followings(self, vmid: int, pn: int = 1, ps: int = 50) -> dict:
-        """获取用户所有关注（需要SESSDATA）。自动翻页获取全部。
-
-        Returns: {"total": int, "list": [{"mid": int, "name": str, "sign": str}, ...]}
-        """
-        all_followings = []
-        total = 0
-        page = pn
-
-        while True:
-            url = f"https://api.bilibili.com/x/relation/followings?vmid={vmid}&pn={page}&ps={ps}&order=desc"
-            try:
-                body, _ = await _run_curl(
-                    _bili_curl_args(url, self._sessdata), timeout=10,
-                )
-                data = _json.loads(body)
-            except Exception as e:
-                print(f"[bili] get_followings curl error: {e}")
-                return {"total": total, "list": all_followings}
-
-            if data.get("code") != 0:
-                print(f"[bili] get_followings failed: code={data.get('code')}, msg={data.get('message')}")
-                return {"total": total, "list": all_followings}
-
-            page_data = data.get("data", {})
-            total = page_data.get("total", 0)
-            page_list = page_data.get("list", [])
-
-            for f in page_list:
-                all_followings.append({
-                    "mid": f.get("mid"),
-                    "name": f.get("uname", ""),
-                    "sign": f.get("sign", ""),
-                })
-
-            # B站关注接口上限500页（ps=50时最多25000条），防止无限循环
-            if len(page_list) < ps or page >= 500:
-                break
-            page += 1
-            await asyncio.sleep(0.5)
-
-        return {"total": total, "list": all_followings}
+    async def get_followings(self, mid: int, ps: int = 50) -> list:
+        ps = max(1, min(ps, 50))
+        items, seen = [], set()
+        for page in range(1, 501):
+            result = await self._get("https://api.bilibili.com/x/relation/followings",
+                {"vmid": mid, "pn": page, "ps": ps, "order": "desc"}, signed=False)
+            data = result.get("data")
+            if not isinstance(data, dict) or not isinstance(data.get("list"), list):
+                raise BiliAPIError(-1, "Incomplete followings response")
+            batch = data["list"]
+            fresh = [item for item in batch if item.get("mid") not in seen]
+            if batch and not fresh:
+                raise BiliAPIError(-1, "Followings pagination repeated")
+            items.extend(fresh)
+            seen.update(item["mid"] for item in fresh)
+            total = data.get("total")
+            if total is not None and len(items) >= total:
+                return items
+            if len(batch) < ps:
+                if total is not None and len(items) < total:
+                    raise BiliAPIError(-1, "Followings response was truncated")
+                return items
+        raise BiliAPIError(-1, "Followings pagination limit exceeded")

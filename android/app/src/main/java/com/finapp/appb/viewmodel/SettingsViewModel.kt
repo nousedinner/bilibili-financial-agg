@@ -30,7 +30,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     fun loadStatus() {
         viewModelScope.launch {
             val result = repo.getStatus()
-            result.onSuccess { _status.value = it }
+            result.onSuccess { _status.value = it }.onFailure { _toast.value = it.message ?: "状态读取失败" }
         }
     }
 
@@ -38,15 +38,18 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             _isTriggering.value = true
             val result = repo.triggerFetch()
-            result.onSuccess { _toast.value = "已触发抓取" }
+            result.onSuccess { _toast.value = it; loadStatus() }
                 .onFailure { _toast.value = "触发失败: ${it.message}" }
             _isTriggering.value = false
         }
     }
 
-    fun logout() {
-        repo.reset()
-        viewModelScope.launch { prefs.clearConfig() }
+    fun logout(onComplete: () -> Unit) {
+        viewModelScope.launch {
+            try { repo.logout(); onComplete() }
+            catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: Exception) { _toast.value = "退出失败: ${e.message}" }
+        }
     }
 
     fun clearToast() { _toast.value = null }

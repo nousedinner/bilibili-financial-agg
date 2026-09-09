@@ -26,14 +26,15 @@ data class SystemStatus(
     val failed: Int,
     @SerializedName("last_fetch") val lastFetch: String?,
     @SerializedName("cookie_valid") val cookieValid: Boolean,
-    @SerializedName("cookie_expire") val cookieExpire: String
+    @SerializedName("cookie_expire") val cookieExpire: String,
+    @SerializedName("last_job") val lastJob: TaskStatus? = null
 )
 
 // ── Blogger ──
 data class Blogger(
     val mid: Long,
     val name: String,
-    val tags: List<String>,
+    val tags: List<String>?,
     @SerializedName("added_at") val addedAt: String
 )
 
@@ -46,11 +47,13 @@ data class FeedPageData(
     val items: List<FeedItem>,
     val total: Int?,
     @SerializedName("has_more") val hasMore: Boolean,
-    @SerializedName("next_cursor") val nextCursor: FeedCursor? = null
+    @SerializedName("next_cursor") val nextCursor: FeedCursor? = null,
+    @Transient val fromCache: Boolean = false
 )
 
 data class FeedCursor(
-    val before: Double? = null
+    val before: Double? = null,
+    @SerializedName("before_id") val beforeId: String? = null
 )
 
 data class FeedItem(
@@ -98,7 +101,8 @@ data class VideoDetail(
     val summary: VideoSummary?,
     val transcript: Transcript?,
     val comments: CommentsAnalysis?,
-    val danmaku: DanmakuAnalysis?
+    val danmaku: DanmakuAnalysis?,
+    @Transient val fromCache: Boolean = false
 )
 
 data class VideoSummary(
@@ -174,12 +178,17 @@ data class DailyDatesResponse(
 )
 
 data class DailyContent(
-    val date: String?,
-    val summary: String?,
-    val bloggers: List<String>?,
-    val consensus: List<String>?,
-    @SerializedName("key_topics") val keyTopics: List<String>?,
-    val differences: List<String>?,
-    @SerializedName("overall_sentiment") val overallSentiment: String?,
-    @SerializedName("sentiment_score") val sentimentScore: Double?
+    val date: String? = null,
+    val summary: String? = null,
+    val bloggers: List<String>? = null,
+    val consensus: List<String>? = null,
+    @SerializedName("key_topics") val keyTopics: List<String>? = null,
+    val differences: List<String>? = null,
+    @SerializedName("overall_sentiment") val overallSentiment: String? = null,
+    @SerializedName("sentiment_score") val sentimentScore: Double? = null
 )
+
+
+data class BloggerInput(val mid: Long, val name: String)
+
+data class TaskStatus(val id: String, val kind: String, val status: String, val error: String?)

@@ -26,6 +26,8 @@ fun DailyScreen(viewModel: DailyViewModel) {
     val summaries by viewModel.summaries.collectAsState()
     val isLoading by viewModel.isLoading.collectAsState()
     val error by viewModel.error.collectAsState()
+    val detailLoading by viewModel.detailLoading.collectAsState()
+    val detailError by viewModel.detailError.collectAsState()
     val expandedDate by viewModel.expandedDate.collectAsState()
 
     // 返回键拦截：有展开的卡片时先收起，否则放行
@@ -37,6 +39,7 @@ fun DailyScreen(viewModel: DailyViewModel) {
         topBar = {
             TopAppBar(
                 title = { Text("每日汇总", fontWeight = FontWeight.Bold) },
+                actions = { TextButton(onClick = { viewModel.loadAll() }, enabled = !isLoading) { Text("刷新") } },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background)
             )
         }
@@ -81,10 +84,14 @@ fun DailyScreen(viewModel: DailyViewModel) {
                 contentPadding = PaddingValues(16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
+                if (error != null) item { Text(error!!, color = MaterialTheme.colorScheme.error) }
                 items(summaries, key = { it.date ?: "" }) { item ->
                     DailyCard(
                         item = item,
                         isExpanded = expandedDate == item.date,
+                        isLoading = detailLoading == item.date,
+                        error = detailError.takeIf { expandedDate == item.date },
+                        onRetry = { viewModel.retryDetail() },
                         onClick = { viewModel.toggleExpand(item.date ?: "") }
                     )
                 }
@@ -97,6 +104,9 @@ fun DailyScreen(viewModel: DailyViewModel) {
 private fun DailyCard(
     item: DailyContent,
     isExpanded: Boolean,
+    isLoading: Boolean,
+    error: String?,
+    onRetry: () -> Unit,
     onClick: () -> Unit
 ) {
     val sentiment = com.finapp.appb.ui.components.Sentiment.fromString(item.overallSentiment ?: "neutral")
@@ -123,7 +133,7 @@ private fun DailyCard(
                     fontSize = 18.sp,
                     fontWeight = FontWeight.Bold
                 )
-                Surface(
+                if (item.summary != null) Surface(
                     shape = RoundedCornerShape(6.dp),
                     color = sentiment.color.copy(alpha = 0.15f)
                 ) {
@@ -147,8 +157,14 @@ private fun DailyCard(
             //     )
             // }
 
-            // 分数
-            Text(
+            if (item.summary == null && !isExpanded) Text("点击加载详情", color = TextSecondary)
+            if (isExpanded && isLoading) LinearProgressIndicator(Modifier.fillMaxWidth().padding(top = 8.dp))
+            if (isExpanded && error != null) {
+                Text(error, color = MaterialTheme.colorScheme.error)
+                TextButton(onClick = onRetry) { Text("重试详情") }
+            }
+            // Only loaded data has a sentiment score.
+            if (item.sentimentScore != null) Text(
                 text = "情绪分数: ${String.format("%.2f", score)}",
                 fontSize = 12.sp,
                 color = TextSecondary,

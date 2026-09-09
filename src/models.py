@@ -10,7 +10,8 @@ from datetime import datetime
 
 def _localnow():
     """返回当前时间（naive，匹配MySQL CST时区）。"""
-    return datetime.now().replace(tzinfo=None)
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
 
 
 class Base(DeclarativeBase):
@@ -136,3 +137,29 @@ class DailyDigest(Base):
     digest_date = Column(Date, primary_key=True)
     content = Column(JSON)
     created_at = Column(DateTime, default=_localnow)
+
+
+class PendingDynamic(Base):
+    __tablename__ = "pending_dynamics"
+    dyn_id = Column(String(50), primary_key=True)
+    mid = Column(BigInteger, nullable=False, index=True)
+    payload = Column(JSON, nullable=False)
+    retry_count = Column(Integer, default=0, nullable=False)
+    error_message = Column(Text)
+
+
+class DirtyDigest(Base):
+    __tablename__ = "dirty_digests"
+    digest_date = Column(Date, primary_key=True)
+    error_message = Column(Text)
+
+
+class FetchJob(Base):
+    __tablename__ = "fetch_jobs"
+    id = Column(String(36), primary_key=True)
+    kind = Column(String(30), nullable=False)
+    status = Column(String(20), nullable=False)
+    started_at = Column(DateTime, default=_localnow)
+    finished_at = Column(DateTime)
+    result = Column(JSON)
+    error_message = Column(Text)

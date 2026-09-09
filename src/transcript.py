@@ -31,7 +31,7 @@ async def fetch_transcript(client: BiliClient, bvid: str, cid: int, duration: in
         cc_url = await client.get_cc_subtitle(bvid, cid)
         if cc_url:
             text = await _download_subtitle(cc_url)
-            if text and len(text) > 50:
+            if text and text.strip():
                 print(f"[transcript] {bvid}: CC字幕命中 ({len(text)} chars)")
                 return {"source": "cc_subtitle", "text": text, "segments": 1}
     except Exception as e:
@@ -42,7 +42,7 @@ async def fetch_transcript(client: BiliClient, bvid: str, cid: int, duration: in
         ai_url = await client.get_subtitle_url(bvid, cid)
         if ai_url:
             text = await _download_subtitle(ai_url)
-            if text and len(text) > 50:
+            if text and text.strip():
                 print(f"[transcript] {bvid}: ai-zh字幕命中 ({len(text)} chars)")
                 return {"source": "ai_subtitle", "text": text, "segments": 1}
     except Exception as e:
@@ -76,56 +76,25 @@ async def _download_subtitle(url: str) -> str:
 
 
 async def _asr_transcribe(client: BiliClient, bvid: str, cid: int, duration: int) -> Optional[dict]:
-    """MiMo ASR转写，自动切片≤3分钟。"""
-    cfg = get_config()
-    asr_cfg = cfg.get("asr", {})
-    chunk_sec = asr_cfg.get("chunk_seconds", 180)
-    api_url = asr_cfg.get("api_url", "https://api.xiaomimimo.com/v1/chat/completions")
-    api_key = get_env("XIAOMI_API_KEY")
-
-    if not api_key:
-        print(f"[transcript] {bvid}: XIAOMI_API_KEY not set, skip ASR")
+    cfg = get_config().get("asr", {})
+    key = get_env("XIAOMI_API_KEY")
+    if not key:
         return None
-
-    # 获取音频URL
-    audio_url = await client.get_audio_url(bvid, cid)
-    if not audio_url:
-        print(f"[transcript] {bvid}: no audio stream available")
+    url = await client.get_audio_url(bvid, cid)
+    if not url:
         return None
-
-    # 下载音频
-    audio_data = await client.download_audio(audio_url)
-    if not audio_data:
+    audio = await client.download_audio(url)
+    if not audio:
         return None
-
-    # 切片逻辑
-    if duration <= chunk_sec:
-        # 单片直接转写
-        text = await _call_asr(api_url, api_key, audio_data, asr_cfg.get("model", "mimo-v2.5-asr"))
-        if text:
-            return {"source": "asr", "text": text, "segments": 1}
-    else:
-        # 多片转写再拼接
-        num_chunks = (duration + chunk_sec - 1) // chunk_sec
-        chunk_size = len(audio_data) // num_chunks
-        texts = []
-        model = asr_cfg.get("model", "mimo-v2.5-asr")
-
-        for i in range(num_chunks):
-            start = i * chunk_size
-            end = (i + 1) * chunk_size if i < num_chunks - 1 else len(audio_data)
-            chunk_data = audio_data[start:end]
-
-            print(f"[transcript] {bvid}: ASR chunk {i+1}/{num_chunks}")
-            chunk_text = await _call_asr(api_url, api_key, chunk_data, model)
-            if chunk_text:
-                texts.append(chunk_text)
-
-        if texts:
-            full_text = " ".join(texts)
-            return {"source": "asr", "text": full_text, "segments": num_chunks}
-
-    return None
+    chunks = await _split_audio(audio, int(cfg.get("chunk_seconds", 180)))
+    texts = []
+    for index, chunk in enumerate(chunks):
+        text = await _call_asr(cfg.get("api_url", "https://api.xiaomimimo.com/v1/chat/completions"),
+            key, chunk, cfg.get("model", "mimo-v2.5-asr"))
+        if not text or not text.strip():
+            raise ValueError(f"ASR segment {index + 1}/{len(chunks)} failed; transcript is incomplete")
+        texts.append(text.strip())
+    return {"source": "asr", "text": " ".join(texts), "segments": len(chunks)}
 
 
 async def _call_asr(api_url: str, api_key: str, audio_data: bytes, model: str) -> Optional[str]:
@@ -163,6 +132,7 @@ async def _call_asr(api_url: str, api_key: str, audio_data: bytes, model: str) -
     async with httpx.AsyncClient(timeout=120) as http:
         try:
             resp = await http.post(api_url, json=payload, headers=headers)
+            resp.raise_for_status()
             result = resp.json()
             choices = result.get("choices", [])
             if choices:
@@ -171,3 +141,49 @@ async def _call_asr(api_url: str, api_key: str, audio_data: bytes, model: str) -
         except Exception as e:
             print(f"[asr] API error: {e}")
     return None
+
+
+async def _split_audio(audio: bytes, seconds: int) -> list[bytes]:
+    """Decode to fixed-rate PCM first, then independently encode each time slice.
+
+    Splitting one MP3 encoder's stream carries encoder-delay/bit-reservoir state
+    across boundaries and can produce a final empty segment. PCM has no such state.
+    """
+    if not 1 <= seconds <= 180:
+        raise ValueError("ASR chunk_seconds must be between 1 and 180")
+    max_pcm = int(get_config().get("asr", {}).get("max_pcm_bytes", 512 * 1024 * 1024))
+    with tempfile.TemporaryDirectory(prefix="fin-asr-") as directory:
+        root = Path(directory)
+        source, pcm = root / "input.audio", root / "decoded.pcm"
+        source.write_bytes(audio)
+        await _ffmpeg("-i", str(source), "-vn", "-ac", "1", "-ar", "16000", "-f", "s16le",
+            "-fs", str(max_pcm + 1), str(pcm))
+        if not pcm.stat().st_size or pcm.stat().st_size > max_pcm:
+            raise ValueError("Decoded audio is empty or exceeds configured size limit")
+        chunks = []
+        with pcm.open("rb") as stream:
+            while data := stream.read(seconds * 16000 * 2):
+                encoded = await _ffmpeg("-f", "s16le", "-ar", "16000", "-ac", "1", "-i", "pipe:0",
+                    "-c:a", "libmp3lame", "-b:a", "48k", "-f", "mp3", "pipe:1", input_data=data)
+                if not encoded:
+                    raise ValueError("Audio encoding returned an empty segment")
+                chunks.append(encoded)
+        return chunks
+
+
+async def _ffmpeg(*args, input_data=None):
+    proc = await asyncio.create_subprocess_exec("ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", *args,
+        stdin=asyncio.subprocess.PIPE if input_data is not None else asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        output, error = await asyncio.wait_for(proc.communicate(input_data), timeout=300)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+        raise
+    if proc.returncode:
+        raise ValueError("Audio conversion failed: " + error.decode(errors="replace")[:200])
+    return output

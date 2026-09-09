@@ -116,10 +116,14 @@ class BloggerViewModel(application: Application) : AndroidViewModel(application)
                 return@launch
             }
             val followings = _newFollowings.value
-            val selectedList = selected.toList()
-            val midsStr = selectedList.joinToString(",")
-            val namesStr = selectedList.mapNotNull { mid -> followings.find { it.mid == mid }?.name }.joinToString(",")
-            val result = repo.batchAddBloggers(midsStr, namesStr)
+            val inputs = followings.filter { it.mid in selected }.map {
+                com.finapp.appb.data.api.BloggerInput(it.mid, it.name)
+            }
+            if (inputs.size != selected.size) {
+                _toast.value = "关注列表已变化，请重新同步"
+                return@launch
+            }
+            val result = repo.batchAddBloggers(inputs)
             result.onSuccess { resp ->
                 val addedCount = resp.added?.size ?: 0
                 _toast.value = "已添加 $addedCount 个博主"

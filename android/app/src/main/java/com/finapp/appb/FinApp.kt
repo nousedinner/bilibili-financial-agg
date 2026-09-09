@@ -19,9 +19,7 @@ class FinApp : Application() {
     override fun onCreate() {
         super.onCreate()
         appScope.launch {
-            repository.ensureInitialized()
-            // Preload bloggers in background
-            repository.preloadBloggers()
+            if (repository.ensureInitialized()) repository.preloadBloggers()
         }
     }
 }

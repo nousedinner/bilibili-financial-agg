@@ -80,7 +80,19 @@ fun SettingsScreen(
                         }
                         Spacer(modifier = Modifier.height(6.dp))
                         Text("Cookie: ${if (s.cookieValid) "✅ 有效" else "❌ 无效"}", fontSize = 13.sp, color = TextSecondary)
-                        Text("上次抓取: ${(s.lastFetch ?: "尚未抓取").take(16)}", fontSize = 13.sp, color = TextSecondary)
+                        Text("上次完成: ${(s.lastFetch ?: "尚未完成").take(16)}", fontSize = 13.sp, color = TextSecondary)
+                        s.lastJob?.let { job ->
+                            val label = when (job.status) {
+                                "running" -> "运行中"
+                                "completed" -> "已完成"
+                                "partial" -> "部分失败"
+                                "interrupted" -> "已中断"
+                                else -> "失败"
+                            }
+                            Text("最近任务: $label", fontSize = 13.sp)
+                            job.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                        }
+                        TextButton(onClick = { viewModel.loadStatus() }) { Text("刷新状态") }
                     }
                 }
             }
@@ -101,8 +113,7 @@ fun SettingsScreen(
 
             OutlinedButton(
                 onClick = {
-                    viewModel.logout()
-                    onLogout()
+                    viewModel.logout(onLogout)
                 },
                 modifier = Modifier.fillMaxWidth().height(48.dp),
                 shape = RoundedCornerShape(12.dp),

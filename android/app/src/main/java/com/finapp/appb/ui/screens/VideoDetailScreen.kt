@@ -100,6 +100,8 @@ fun VideoDetailScreen(
                         .padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
+                    if (d.fromCache) Text("网络暂不可用，当前显示缓存详情", color = MaterialTheme.colorScheme.error)
+
                     // Header
                     Text(title, fontSize = 20.sp, fontWeight = FontWeight.Bold, lineHeight = 26.sp)
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {

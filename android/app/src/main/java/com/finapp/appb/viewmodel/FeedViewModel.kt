@@ -1,207 +1,96 @@
 package com.finapp.appb.viewmodel
 
 import android.app.Application
-import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.finapp.appb.FinApp
-import com.finapp.appb.data.api.FeedItem
-import kotlinx.coroutines.delay
+import com.finapp.appb.data.api.*
+import com.finapp.appb.data.repository.*
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.launch
 
 class FeedViewModel(application: Application) : AndroidViewModel(application) {
-    private val app = application as FinApp
-    private val repo = app.repository
-
+    private val repo = (application as FinApp).repository
     private val _items = MutableStateFlow<List<FeedItem>>(emptyList())
     val items: StateFlow<List<FeedItem>> = _items
-
-    private val _isLoading = MutableStateFlow(true)
+    private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading
-
-    private val _error = MutableStateFlow<String?>(null)
-    val error: StateFlow<String?> = _error
-
     private val _isRefreshing = MutableStateFlow(false)
     val isRefreshing: StateFlow<Boolean> = _isRefreshing
-
+    private val _error = MutableStateFlow<String?>(null)
+    val error: StateFlow<String?> = _error
     private val _authError = MutableStateFlow(false)
     val authError: StateFlow<Boolean> = _authError
-
     private val _bloggerNames = MutableStateFlow<Map<Long, String>>(emptyMap())
     val bloggerNames: StateFlow<Map<Long, String>> = _bloggerNames
+    private var cursor: FeedCursor? = null
+    private var hasMore = false
+    private var pageFailed = false
+    private var generation = 0
+    private var job: Job? = null
 
-    private var currentCursor: Double? = null
-    private var hasMore = true
-    private val pageSize = 50
-    private var lastRefreshTime = 0L
+    init { refresh() }
+    fun loadFeed() = refresh()
+    fun dismissAuthError() { _authError.value = false }
+    fun retry() { if (pageFailed) { pageFailed = false; loadMore() } else refresh() }
 
-    init {
-        Log.d("FeedVM", "init called")
-        loadFeed()
-    }
-
-    fun loadFeed() {
-        Log.d("FeedVM", "loadFeed called, items=${_items.value.size}")
-        viewModelScope.launch {
-            val hasDataInMemory = _items.value.isNotEmpty()
-
-            if (!hasDataInMemory) {
-                _isLoading.value = true
+    fun refresh() {
+        val token = ++generation
+        job?.cancel()
+        _isLoading.value = true
+        _isRefreshing.value = _items.value.isNotEmpty()
+        _error.value = null
+        _authError.value = false
+        pageFailed = false
+        hasMore = false
+        cursor = null
+        job = viewModelScope.launch {
+            try {
+                val result = repo.getFeedPage()
+                ensureActive()
+                if (token != generation) return@launch
+                result.onSuccess { data ->
+                    _items.value = mergeFeedItems(emptyList(), data.items)
+                    cursor = data.nextCursor
+                    hasMore = data.hasMore && cursor?.before != null && cursor?.beforeId != null
+                    if (data.fromCache) _error.value = "网络暂不可用，当前显示缓存内容；下拉可重试"
+                }.onFailure { failed(it) }
+                repo.getBloggers().onSuccess { _bloggerNames.value = it.associate { b -> b.mid to b.name } }
+            } finally {
+                if (token == generation) { _isLoading.value = false; _isRefreshing.value = false }
             }
-            _error.value = null
-            _authError.value = false
-
-            loadBloggerNames()
-
-            if (hasDataInMemory) {
-                Log.d("FeedVM", "Has data in memory, delayed background refresh")
-                launch {
-                    delay(1000) // Wait 1 second before background refresh
-                    refreshInBackground()
-                }
-                return@launch
-            }
-
-            val cached = repo.getFeed(limit = pageSize)
-            if (cached.isSuccess && cached.getOrNull()?.isNotEmpty() == true) {
-                _items.value = cached.getOrNull()!!
-                _isLoading.value = false
-                Log.d("FeedVM", "Loaded from cache: ${_items.value.size} items")
-            }
-
-            var ready = false
-            repeat(15) {
-                if (repo.ensureInitialized()) { ready = true; return@repeat }
-                delay(200)
-            }
-            if (!ready) {
-                if (_items.value.isEmpty()) {
-                    val roomCache = repo.getFeedFromCache()
-                    if (roomCache.isNotEmpty()) {
-                        _items.value = roomCache
-                    } else {
-                        _error.value = "API 未就绪，请重启 APP"
-                    }
-                }
-                _isLoading.value = false
-                return@launch
-            }
-
-            val result = repo.getFeedPage(before = null, limit = pageSize)
-            result.onSuccess { data ->
-                _items.value = data.items
-                hasMore = data.hasMore
-                currentCursor = data.nextCursor?.before
-                repo.cacheFeedItems(data.items)
-                Log.d("FeedVM", "Loaded from API: ${data.items.size} items")
-            }.onFailure {
-                val msg = it.message ?: ""
-                if (msg.contains("401")) {
-                    _authError.value = true
-                    _error.value = "密码已失效，请重新配置"
-                } else if (_items.value.isEmpty()) {
-                    val roomCache = repo.getFeedFromCache()
-                    if (roomCache.isNotEmpty()) {
-                        _items.value = roomCache
-                    } else {
-                        _error.value = msg
-                    }
-                }
-            }
-            _isLoading.value = false
-        }
-    }
-
-    private suspend fun refreshInBackground() {
-        val now = System.currentTimeMillis()
-        if (now - lastRefreshTime < 5000) {
-            Log.d("FeedVM", "Skip refresh - too soon (${now - lastRefreshTime}ms)")
-            return
-        }
-        lastRefreshTime = now
-
-        if (!repo.ensureInitialized()) return
-
-        Log.d("FeedVM", "Background refresh starting, current items=${_items.value.size}")
-        val result = repo.getFeedPage(before = null, limit = pageSize)
-        result.onSuccess { data ->
-            Log.d("FeedVM", "Background refresh got ${data.items.size} items, hasMore=${data.hasMore}")
-            val sameData = data.items == _items.value
-            Log.d("FeedVM", "Data same=$sameData")
-            if (!sameData) {
-                Log.d("FeedVM", ">>> UPDATING _items.value - this triggers recomposition")
-                _items.value = data.items
-                hasMore = data.hasMore
-                currentCursor = data.nextCursor?.before
-                repo.cacheFeedItems(data.items)
-            } else {
-                Log.d("FeedVM", "Data same, skip update")
-            }
-        }.onFailure {
-            Log.d("FeedVM", "Background refresh failed: ${it.message}")
         }
     }
 
     fun loadMore() {
-        if (!hasMore || _isLoading.value) return
-
-        viewModelScope.launch {
-            _isLoading.value = true
-            val result = repo.getFeedPage(before = currentCursor, limit = pageSize)
-            result.onSuccess { data ->
-                val currentItems = _items.value.toMutableList()
-                currentItems.addAll(data.items)
-                _items.value = currentItems
-                currentCursor = data.nextCursor?.before
-                hasMore = data.hasMore
-                repo.cacheFeedItems(data.items)
-            }.onFailure {
-                Log.d("FeedVM", "loadMore failed: ${it.message}")
+        val next = cursor ?: return
+        if (!hasMore || _isLoading.value || pageFailed) return
+        _isLoading.value = true
+        _error.value = null
+        val token = generation
+        job = viewModelScope.launch {
+            try {
+                val result = repo.getFeedPage(before = next.before, beforeId = next.beforeId)
+                ensureActive()
+                if (token != generation) return@launch
+                result.onSuccess { data ->
+                    _items.value = mergeFeedItems(_items.value, data.items)
+                    cursor = data.nextCursor
+                    hasMore = data.hasMore && cursor != null && cursor != next && cursor?.beforeId != null
+                }.onFailure { pageFailed = true; failed(it) }
+            } finally {
+                if (token == generation) _isLoading.value = false
             }
-            _isLoading.value = false
         }
     }
 
-    fun refresh() {
-        viewModelScope.launch {
-            _isLoading.value = true
-            _isRefreshing.value = true
-            _error.value = null
-            _authError.value = false
-            currentCursor = null
-            hasMore = true
-            loadBloggerNames()
-            val result = repo.getFeedPage(before = null, limit = pageSize)
-            result.onSuccess { data ->
-                _items.value = data.items
-                hasMore = data.hasMore
-                currentCursor = data.nextCursor?.before
-                repo.cacheFeedItems(data.items)
-            }.onFailure {
-                val msg = it.message ?: ""
-                if (msg.contains("401")) {
-                    _authError.value = true
-                    _error.value = "密码已失效，请重新配置"
-                } else {
-                    _error.value = msg
-                }
-            }
-            _isRefreshing.value = false
-            _isLoading.value = false
-        }
-    }
-
-    private suspend fun loadBloggerNames() {
-        try {
-            val result = repo.getBloggers()
-            result.onSuccess { bloggers ->
-                _bloggerNames.value = bloggers.associate { it.mid to it.name }
-            }
-        } catch (e: Exception) {
-            // Ignore
+    private fun failed(error: Throwable) {
+        _error.value = error.message ?: "加载失败，请重试"
+        if (error.isAuthError()) {
+            _items.value = emptyList()
+            _authError.value = true
+            hasMore = false
         }
     }
 }

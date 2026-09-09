@@ -315,13 +315,13 @@ private fun BloggerCard(blogger: Blogger, onDelete: () -> Unit) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(blogger.name, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
                 Text("ID: ${blogger.mid}", fontSize = 12.sp, color = TextSecondary)
-                if (blogger.tags.isNotEmpty()) {
+                if (!blogger.tags.isNullOrEmpty()) {
                     Spacer(modifier = Modifier.height(4.dp))
                     Row(
                         horizontalArrangement = Arrangement.spacedBy(4.dp),
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        blogger.tags.take(3).forEach { tag ->
+                        blogger.tags.orEmpty().take(3).forEach { tag ->
                             AssistChip(
                                 onClick = {},
                                 label = { Text(tag, fontSize = 11.sp) },

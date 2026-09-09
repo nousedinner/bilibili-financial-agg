@@ -1,6 +1,7 @@
 """LLM分析模块 — 单视频分析 + 当日汇总。"""
 
 import json
+import math
 from typing import Optional
 
 import httpx
@@ -110,9 +111,9 @@ async def analyze_dynamic(content: str) -> dict:
     if result:
         parsed = _try_parse_json(result)
         if parsed is not None:
-            summary = str(parsed.get("summary", "")).strip()
+            summary = parsed.get("summary")
             sentiment = str(parsed.get("sentiment", "")).strip().lower()
-            if summary and sentiment in _VALID_SENTIMENTS:
+            if isinstance(summary, str) and summary.strip() and sentiment in _VALID_SENTIMENTS and _string_list(parsed.get("tags", [])):
                 return {
                     "summary": summary,
                     "sentiment": sentiment,
@@ -217,6 +218,7 @@ async def _call_llm(prompt: str) -> Optional[str]:
     async with httpx.AsyncClient(timeout=120) as http:
         try:
             resp = await http.post(api_url, json=payload, headers=headers)
+            resp.raise_for_status()
             result = resp.json()
             choices = result.get("choices", [])
             if choices:
@@ -249,8 +251,7 @@ def _try_parse_json(text: str) -> Optional[dict]:
     """尝试从LLM输出中提取合法JSON，容忍包裹文本。"""
     try:
         parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
+        return parsed if isinstance(parsed, dict) else None
     except (json.JSONDecodeError, TypeError):
         pass
     start = text.find("{")
@@ -269,20 +270,36 @@ _REQUIRED_ANALYSIS_FIELDS = {"summary", "key_points", "sentiment", "sentiment_sc
 
 
 def _validate_analysis(parsed: dict) -> bool:
-    """校验视频分析返回结构是否包含必要字段且类型正确。"""
-    if not _REQUIRED_ANALYSIS_FIELDS.issubset(parsed.keys()):
+    if not isinstance(parsed, dict) or not _REQUIRED_ANALYSIS_FIELDS.issubset(parsed):
         return False
-    sentiment = str(parsed.get("sentiment", "")).strip().lower()
-    if sentiment not in _VALID_SENTIMENTS:
+    if not isinstance(parsed["summary"], str) or not parsed["summary"].strip():
         return False
-    score = parsed.get("sentiment_score")
-    if not isinstance(score, (int, float)):
+    if not _valid_score(parsed.get("sentiment_score")):
         return False
+    sentiment = parsed.get("sentiment")
+    if not isinstance(sentiment, str) or sentiment.strip().lower() not in _VALID_SENTIMENTS:
+        return False
+    defaults = _empty_analysis()
+    for key in ("key_points", "risk_warnings", "data_citations", "tags", "comment_keywords", "danmaku_keywords"):
+        value = parsed.get(key, [])
+        if not _string_list(value):
+            return False
+    for key in ("comment_sentiment", "danmaku_sentiment"):
+        value = parsed.get(key, defaults[key])
+        if not isinstance(value, dict) or set(value) != _VALID_SENTIMENTS:
+            return False
+        if not all(_valid_score(v) and v >= 0 for v in value.values()) or abs(sum(value.values()) - 1) > 0.02:
+            return False
+    for key, value in defaults.items():
+        parsed.setdefault(key, value)
+    parsed["sentiment"] = sentiment.strip().lower()
+    parsed["summary"] = parsed["summary"].strip()
     return True
 
 
 def _empty_digest() -> dict:
     return {
+        "analysis_failed": True,
         "overall_sentiment": "neutral",
         "overall_sentiment_desc": "",
         "consensus": [],
@@ -296,20 +313,22 @@ _VALID_SENTIMENTS = {"bullish", "bearish", "neutral"}
 
 
 def _validate_digest(digest: dict) -> dict:
-    """校验 daily digest，确保 overall_sentiment 是合法枚举值。"""
-    # 兼容旧格式：如果 overall_sentiment 包含中文描述，提取关键词
-    raw = str(digest.get("overall_sentiment", "")).strip().lower()
-    if raw not in _VALID_SENTIMENTS:
-        # 尝试从脏数据中提取
-        for kw in _VALID_SENTIMENTS:
-            if kw in raw:
-                digest["overall_sentiment"] = kw
-                # 如果没有独立的 desc 字段，用原始值作为描述
-                if not digest.get("overall_sentiment_desc"):
-                    digest["overall_sentiment_desc"] = raw
-                break
-        else:
-            digest["overall_sentiment"] = "neutral"
-            if not digest.get("overall_sentiment_desc"):
-                digest["overall_sentiment_desc"] = raw
+    if not isinstance(digest.get("summary"), str) or not digest["summary"].strip():
+        return _empty_digest()
+    sentiment = digest.get("overall_sentiment")
+    if not isinstance(sentiment, str) or sentiment.strip().lower() not in _VALID_SENTIMENTS:
+        return _empty_digest()
+    if not all(_string_list(digest.get(key)) for key in ("consensus", "differences", "key_topics")):
+        return _empty_digest()
+    if not isinstance(digest.get("overall_sentiment_desc", ""), str):
+        return _empty_digest()
+    digest["overall_sentiment"] = sentiment.strip().lower()
     return digest
+
+
+def _string_list(value) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _valid_score(value) -> bool:
+    return type(value) in (int, float) and math.isfinite(value) and -1 <= value <= 1

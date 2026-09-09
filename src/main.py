@@ -4,11 +4,15 @@ import asyncio
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, date
+from zoneinfo import ZoneInfo
+from uuid import uuid4
+from typing import Literal
+from fastapi.responses import JSONResponse
 from typing import Optional
 
-from fastapi import FastAPI, Query, Header, HTTPException, Depends
-from pydantic import BaseModel
-from sqlalchemy import select, func, desc, text
+from fastapi import FastAPI, Query, Header, HTTPException, Depends, Body
+from pydantic import BaseModel, Field
+from sqlalchemy import select, func, desc, text, or_, and_, literal, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import get_config, get_env
@@ -16,16 +20,19 @@ from src.db import init_db, async_session, engine
 from src.models import (
     Blogger, Video, Transcript, Summary,
     CommentAnalysis, DanmakuAnalysis, Dynamic,
-    FetchWatermark, DailyDigest, ApiUser,
+    FetchWatermark, DailyDigest, ApiUser, FetchJob,
 )
-from src.fetcher import run_daily_fetch, run_fetch_only, run_backfill, _get_enabled_bloggers, _generate_digest
+from src.fetcher import run_daily_fetch, run_fetch_only, run_backfill, _get_enabled_bloggers, _generate_digest, regenerate_dirty_digests, _process_video, _video_info, _utcnow
 
 
 # ------------------------------------------------------------------
 # Task mutex flags — prevent overlapping background tasks
 # ------------------------------------------------------------------
-_fetch_task_running = False
-_backfill_task_running = False
+_job_lock = asyncio.Lock()
+_background_tasks = set()
+_scheduler = None
+_cookie_cache = (0.0, {})
+_cookie_lock = asyncio.Lock()
 
 
 # ------------------------------------------------------------------
@@ -35,63 +42,56 @@ _backfill_task_running = False
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    _start_scheduler()
-    yield
+    # One scheduler/writer per database. A second worker fails startup rather
+    # than running competing jobs; the connection keeps the MySQL lock alive.
+    async with engine.connect() as owner:
+        is_mysql = owner.dialect.name == "mysql"
+        if is_mysql:
+            acquired = (await owner.execute(text("SELECT GET_LOCK('fin_agg_scheduler', 0)"))).scalar()
+            if acquired != 1:
+                raise RuntimeError("Another fin-agg worker is active; run uvicorn with --workers 1")
+        try:
+            await _recover_interrupted()
+            _start_scheduler()
+            yield
+        finally:
+            if _scheduler:
+                _scheduler.shutdown(wait=False)
+            tasks = list(_background_tasks)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if is_mysql:
+                await owner.execute(text("SELECT RELEASE_LOCK('fin_agg_scheduler')"))
+    await engine.dispose()
 
 
 def _start_scheduler():
-    """启动APScheduler定时任务：12:00/21:00抓取 + 22:00汇总。"""
-    cfg = get_config()
-    scheduler_cfg = cfg.get("scheduler", {})
-
-    try:
-        from apscheduler.schedulers.asyncio import AsyncIOScheduler
-        from apscheduler.triggers.cron import CronTrigger
-
-        scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
-
-        # 12:00 抓取
-        fetch_cron_1 = scheduler_cfg.get("fetch_cron_1", "0 12 * * *")
-        parts = fetch_cron_1.split()
-        scheduler.add_job(_scheduled_fetch, CronTrigger(minute=parts[0], hour=parts[1]))
-        print(f"[scheduler] 抓取任务1: {fetch_cron_1}")
-
-        # 21:00 抓取
-        fetch_cron_2 = scheduler_cfg.get("fetch_cron_2", "0 21 * * *")
-        parts = fetch_cron_2.split()
-        scheduler.add_job(_scheduled_fetch, CronTrigger(minute=parts[0], hour=parts[1]))
-        print(f"[scheduler] 抓取任务2: {fetch_cron_2}")
-
-        # 22:30 汇总锁定（给21:00抓取留缓冲）
-        digest_cron = scheduler_cfg.get("digest_cron", "30 22 * * *")
-        parts = digest_cron.split()
-        scheduler.add_job(_scheduled_digest, CronTrigger(minute=parts[0], hour=parts[1]))
-        print(f"[scheduler] 汇总任务: {digest_cron}")
-
-        scheduler.start()
-    except Exception as e:
-        print(f"[scheduler] 启动失败: {e}")
+    global _scheduler
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.triggers.cron import CronTrigger
+    cfg = get_config().get("scheduler", {})
+    if cfg.get("timezone", "Asia/Shanghai") != "Asia/Shanghai":
+        raise ValueError("Stored publication times and digest windows use Asia/Shanghai")
+    if not 0 <= int(cfg.get("digest_cutoff_hour", 22)) <= 23:
+        raise ValueError("digest_cutoff_hour must be 0..23")
+    _scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
+    schedules = [("fetch_1", cfg.get("fetch_cron_1", "0 12 * * *"), _scheduled_fetch),
+        ("fetch_2", cfg.get("fetch_cron_2", "0 21 * * *"), _scheduled_fetch),
+        ("digest", cfg.get("digest_cron", cfg.get("daily_cron", "10 22 * * *")), _scheduled_digest)]
+    for job_id, cron, callback in schedules:
+        _scheduler.add_job(callback, CronTrigger.from_crontab(cron, timezone="Asia/Shanghai"),
+            id=job_id, coalesce=True, max_instances=1, misfire_grace_time=3600)
+    _scheduler.start()
 
 
 async def _scheduled_fetch():
-    """定时任务入口：只抓取，不生成汇总。"""
-    print(f"[scheduler] 开始抓取: {datetime.now()}")
-    try:
-        result = await run_fetch_only()
-        print(f"[scheduler] 抓取完成: {result.get('total_new', 0)} 新内容")
-    except Exception as e:
-        print(f"[scheduler] 抓取失败: {e}")
+    return await _run_job("scheduled_fetch", _fetch_work)
 
 
 async def _scheduled_digest():
-    """定时任务入口：只生成汇总，不抓取。"""
-    print(f"[scheduler] 开始生成汇总: {datetime.now()}")
-    try:
-        bloggers = await _get_enabled_bloggers()
-        await _generate_digest(bloggers, {})
-        print(f"[scheduler] 汇总生成完成")
-    except Exception as e:
-        print(f"[scheduler] 汇总生成失败: {e}")
+    return await _run_job("scheduled_digest", _digest_work)
 
 
 app = FastAPI(
@@ -127,14 +127,14 @@ async def list_bloggers():
         return {
             "code": 0,
             "data": [
-                {"mid": b.mid, "name": b.name, "tags": b.tags, "added_at": str(b.added_at)}
+                {"mid": b.mid, "name": b.name, "tags": b.tags or [], "added_at": str(b.added_at)}
                 for b in result
             ],
         }
 
 
 @app.post("/api/bloggers", dependencies=[Depends(require_api_key)])
-async def add_blogger(name: str = Query(...), mid: Optional[int] = Query(None), tags: str = Query("")):
+async def add_blogger(name: str = Query(..., min_length=1, max_length=100, pattern=r".*\S.*"), mid: Optional[int] = Query(None, gt=0, le=9223372036854775807), tags: str = Query("", max_length=1000)):
     """添加博主 - 输入B站用户名自动搜索，或直接输入mid。"""
     from src.bilibili import BiliClient
     from src.config import get_env
@@ -159,6 +159,7 @@ async def add_blogger(name: str = Query(...), mid: Optional[int] = Query(None), 
         if existing:
             existing.enabled = True
             existing.name = real_name
+            existing.tags = [t.strip() for t in tags.split(",") if t.strip()]
         else:
             session.add(Blogger(
                 mid=real_mid, name=real_name,
@@ -177,83 +178,60 @@ async def remove_blogger(mid: int):
             raise HTTPException(404, "博主不存在")
         blogger.enabled = False
         await session.commit()
-    return {"code": 0, "message": f"博主 {mid} 已禁用"}
+    return {"code": 0, "data": {"message": f"博主 {mid} 已禁用"}, "message": f"博主 {mid} 已禁用"}
 
 
 @app.post("/api/bloggers/sync", dependencies=[Depends(require_api_key)])
 async def sync_followings():
-    """同步B站关注列表 — 返回尚未添加到监控的新关注。"""
     from src.bilibili import BiliClient
-    from src.config import get_env
-
-    sessdata = get_env("SESSDATA")
-    bili_uid = get_env("BILI_UID")
-    if not sessdata:
-        raise HTTPException(400, "未配置SESSDATA")
-    if not bili_uid:
-        raise HTTPException(400, "未配置BILI_UID")
-
-    # 1. 拉关注列表
+    sessdata, uid = get_env("SESSDATA"), get_env("BILI_UID")
+    if not sessdata or not uid.isdigit():
+        raise HTTPException(400, "请配置有效的 SESSDATA 和 BILI_UID")
     async with BiliClient(sessdata=sessdata) as client:
-        result = await client.get_followings(int(bili_uid), pn=1, ps=200)
-
-    if not result["list"]:
-        return {"code": 0, "data": {"total_followings": result["total"], "new": [], "message": "获取关注列表失败或为空"}}
-
-    # 2. 对比DB，找出未添加的
+        items = await client.get_followings(int(uid), ps=50)
     async with async_session() as session:
-        stmt = select(Blogger.mid)
-        existing_mids = set((await session.execute(stmt)).scalars().all())
+        existing = set((await session.execute(select(Blogger.mid).where(Blogger.enabled == True))).scalars().all())
+    fresh = [{"mid": f["mid"], "name": f.get("uname") or f.get("name") or str(f["mid"]),
+        "sign": f.get("sign", "")} for f in items if f["mid"] not in existing]
+    return {"code": 0, "data": {"total_followings": len(items), "already_tracked": len(existing),
+        "new_count": len(fresh), "new": fresh}}
 
-    new_followings = [
-        f for f in result["list"]
-        if f["mid"] not in existing_mids
-    ]
 
-    return {
-        "code": 0,
-        "data": {
-            "total_followings": result["total"],
-            "already_tracked": len(existing_mids),
-            "new_count": len(new_followings),
-            "new": new_followings,
-        },
-    }
+class BloggerInput(BaseModel):
+    mid: int = Field(gt=0, le=9223372036854775807)
+    name: str = Field(min_length=1, max_length=100, pattern=r".*\S.*")
 
 
 @app.post("/api/bloggers/sync/add", dependencies=[Depends(require_api_key)])
 async def sync_add_bloggers(
-    mids: str = Query(..., description="逗号分隔的mid列表"),
-    names: str = Query("", description="逗号分隔的用户名列表（与mids一一对应）"),
+    mids: Optional[str] = Query(None, max_length=10000),
+    names: str = Query("", max_length=50000),
+    bloggers: Optional[list[BloggerInput]] = Body(None, max_length=500),
 ):
-    """从同步结果中批量添加博主。mids和names逗号分隔，一一对应。"""
-    try:
-        mid_list = [int(m.strip()) for m in mids.split(",") if m.strip()]
-    except ValueError:
-        raise HTTPException(400, "mids参数格式错误，应为逗号分隔的数字")
-    name_list = [n.strip() for n in names.split(",") if n.strip()]
-    if not mid_list:
-        raise HTTPException(400, "mids不能为空")
-    # 补齐names
-    while len(name_list) < len(mid_list):
-        name_list.append(f"用户{mid_list[len(name_list)]}")
-
+    if bloggers is None:
+        try:
+            ids = [int(m.strip()) for m in (mids or "").split(",")]
+            labels = names.split(",") if names else []
+            if labels and len(labels) != len(ids):
+                raise ValueError("姓名和 MID 数量不一致")
+            bloggers = [BloggerInput(mid=mid, name=(labels[i].strip() if labels else "") or f"用户{mid}") for i, mid in enumerate(ids)]
+        except ValueError as exc:
+            raise HTTPException(400, "无效的 MID 或姓名配对") from exc
+    if not bloggers or len(bloggers) > 500:
+        raise HTTPException(400, "每批需要 1 到 500 位博主")
     added = []
     async with async_session() as session:
-        for i, mid in enumerate(mid_list):
-            name = name_list[i]
-            existing = await session.get(Blogger, mid)
-            if existing:
-                if not existing.enabled:
-                    existing.enabled = True
-                    added.append({"mid": mid, "name": existing.name, "action": "re-enabled"})
+        for item in {b.mid: b for b in bloggers}.values():
+            old = await session.get(Blogger, item.mid)
+            if old and old.enabled:
                 continue
-
-            session.add(Blogger(mid=mid, name=name, tags=[]))
-            added.append({"mid": mid, "name": name, "action": "added"})
-
+            if old:
+                old.enabled = True
+                old.name = item.name
+            else:
+                session.add(Blogger(mid=item.mid, name=item.name, tags=[]))
+            added.append({"mid": item.mid, "name": item.name, "action": "re-enabled" if old else "added"})
         await session.commit()
-
     return {"code": 0, "data": {"added": added}}
 
 
@@ -262,7 +240,7 @@ async def sync_add_bloggers(
 # ------------------------------------------------------------------
 
 class CreateUserRequest(BaseModel):
-    username: str
+    username: str = Field(min_length=1, max_length=50, pattern=r".*\S.*")
 
 @app.post("/api/bootstrap")
 async def bootstrap_user(req: CreateUserRequest):
@@ -318,7 +296,8 @@ async def disable_user(user_id: int):
 @app.get("/api/videos", dependencies=[Depends(require_api_key)])
 async def list_videos(
     blogger: Optional[int] = None,
-    tag: Optional[str] = None,
+    tag: Optional[str] = Query(None, max_length=100),
+    sentiment: Optional[Literal["bullish", "bearish", "neutral"]] = None,
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
 ):
@@ -328,14 +307,20 @@ async def list_videos(
         if blogger:
             stmt = stmt.where(Video.mid == blogger)
 
-        # Count
-        count_stmt = select(func.count(Video.bvid))
-        if blogger:
-            count_stmt = count_stmt.where(Video.mid == blogger)
-        total = (await session.execute(count_stmt)).scalar() or 0
+        stmt = stmt.where(Video.mid.in_(select(Blogger.mid).where(Blogger.enabled == True)))
+        if sentiment:
+            stmt = stmt.where(Summary.sentiment == sentiment)
+        if tag:
+            if session.bind.dialect.name == "sqlite":
+                elements = func.json_each(Summary.tags).table_valued("value")
+                stmt = stmt.where(select(1).select_from(elements).where(elements.c.value == tag).exists())
+            else:
+                import json
+                stmt = stmt.where(func.json_contains(Summary.tags, json.dumps(tag, ensure_ascii=False)) == 1)
+        total = (await session.execute(select(func.count()).select_from(stmt.subquery()))).scalar() or 0
 
         # Paginate
-        stmt = stmt.order_by(desc(Video.publish_time)).offset((page - 1) * limit).limit(limit)
+        stmt = stmt.order_by(desc(Video.publish_time), desc(Video.bvid)).offset((page - 1) * limit).limit(limit)
         rows = (await session.execute(stmt)).all()
 
         items = []
@@ -351,9 +336,6 @@ async def list_videos(
                 "sentiment_score": s.sentiment_score if s else None,
                 "summary": s.summary[:200] if s and s.summary else None,
             }
-            # Tag filter
-            if tag and s and s.tags and tag not in s.tags:
-                continue
             items.append(item)
 
         return {
@@ -478,77 +460,55 @@ async def list_dynamics(
 @app.get("/api/feed", dependencies=[Depends(require_api_key)])
 async def get_feed(
     limit: int = Query(20, ge=1, le=100),
-    before: Optional[float] = None,
-    before_id: Optional[str] = None,
+    before: Optional[float] = Query(None, ge=0, le=253402214400, allow_inf_nan=False),
+    before_id: Optional[str] = Query(None, max_length=80, pattern=r"^(video|dynamic):[A-Za-z0-9]+$"),
+    blogger: Optional[int] = Query(None, gt=0),
+    sentiment: Optional[Literal["bullish", "bearish", "neutral"]] = None,
 ):
-    """时间线（视频+动态混合）。支持时间+ID复合游标分页。"""
+    if before_id and before is None:
+        raise HTTPException(400, "before_id requires before")
     async with async_session() as session:
-        # 只返回启用博主的内容
-        enabled_mids = select(Blogger.mid).where(Blogger.enabled == True)
-
-        # Videos — 多取一条用于判断has_more
-        v_stmt = (
-            select(Video, Summary)
-            .outerjoin(Summary, Video.bvid == Summary.bvid)
-            .where(Video.mid.in_(enabled_mids))
-        )
-        if before:
-            v_stmt = v_stmt.where(Video.publish_time < datetime.fromtimestamp(before))
-        v_stmt = v_stmt.order_by(desc(Video.publish_time)).limit(limit + 1)
-        videos = (await session.execute(v_stmt)).all()
-
-        # Dynamics — 只返回启用博主的，多取一条
-        d_stmt = select(Dynamic).where(Dynamic.mid.in_(enabled_mids))
-        if before:
-            d_stmt = d_stmt.where(Dynamic.publish_time < datetime.fromtimestamp(before))
-        d_stmt = d_stmt.order_by(desc(Dynamic.publish_time)).limit(limit + 1)
-        dynamics = (await session.execute(d_stmt)).scalars().all()
-
-        # Merge and sort
-        feed = []
-        for v, s in videos:
-            feed.append({
-                "type": "video",
-                "bvid": v.bvid,
-                "mid": v.mid,
-                "title": v.title,
-                "publish_time": v.publish_time.isoformat() if v.publish_time else None,
-                "sentiment": s.sentiment if s else None,
-                "sentiment_score": s.sentiment_score if s else None,
-                "summary": s.summary[:200] if s and s.summary else None,
-            })
-        for d in dynamics:
-            feed.append({
-                "type": "dynamic",
-                "dyn_id": d.dyn_id,
-                "mid": d.mid,
-                "publish_time": d.publish_time.isoformat() if d.publish_time else None,
-                "sentiment": d.sentiment,
-                "summary": d.summary,
-            })
-
-        feed.sort(key=lambda x: x.get("publish_time", "") or "", reverse=True)
+        enabled = select(Blogger.mid).where(Blogger.enabled == True)
+        vk, dk = literal("video:") + Video.bvid, literal("dynamic:") + Dynamic.dyn_id
+        if session.bind.dialect.name == "mysql":
+            # Python/Kotlin use case-sensitive ID ordering; default MySQL
+            # collations may be case-insensitive and would break the boundary.
+            vk, dk = vk.collate("utf8mb4_bin"), dk.collate("utf8mb4_bin")
+        vs = select(Video, Summary).outerjoin(Summary, Video.bvid == Summary.bvid).where(Video.mid.in_(enabled))
+        ds = select(Dynamic).where(Dynamic.mid.in_(enabled))
+        if blogger:
+            vs, ds = vs.where(Video.mid == blogger), ds.where(Dynamic.mid == blogger)
+        if sentiment:
+            vs, ds = vs.where(Summary.sentiment == sentiment), ds.where(Dynamic.sentiment == sentiment)
+        total = (await session.execute(select(func.count()).select_from(vs.subquery()))).scalar()
+        total += (await session.execute(select(func.count()).select_from(ds.subquery()))).scalar()
+        if before is not None:
+            boundary = datetime.fromtimestamp(before, ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+            def earlier(column, key):
+                return or_(column < boundary, and_(column == boundary, key < before_id)) if before_id else column < boundary
+            vs, ds = vs.where(earlier(Video.publish_time, vk)), ds.where(earlier(Dynamic.publish_time, dk))
+        videos = (await session.execute(vs.order_by(Video.publish_time.desc(), vk.desc()).limit(limit + 1))).all()
+        dynamics = (await session.execute(ds.order_by(Dynamic.publish_time.desc(), dk.desc()).limit(limit + 1))).scalars().all()
+        feed = [{"type": "video", "bvid": v.bvid, "mid": v.mid, "title": v.title,
+            "publish_time": v.publish_time.isoformat() if v.publish_time else None,
+            "sentiment": s.sentiment if s else None, "sentiment_score": s.sentiment_score if s else None,
+            "summary": s.summary[:200] if s and s.summary else None, "duration": v.duration, "view_count": v.view_count}
+            for v, s in videos]
+        feed.extend({"type": "dynamic", "dyn_id": d.dyn_id, "mid": d.mid,
+            "publish_time": d.publish_time.isoformat() if d.publish_time else None,
+            "sentiment": d.sentiment, "summary": d.summary} for d in dynamics)
+        def key(item):
+            return item["type"] + ":" + (item.get("bvid") or item.get("dyn_id"))
+        feed.sort(key=lambda item: (item["publish_time"] or "", key(item)), reverse=True)
         has_more = len(feed) > limit
         items = feed[:limit]
-
-        # 生成下一页游标（最后一条的发布时间）
-        next_cursor = None
-        if items and has_more:
+        cursor = None
+        if has_more and items and items[-1]["publish_time"]:
             last = items[-1]
-            next_cursor = {
-                "before": datetime.fromisoformat(last["publish_time"]).timestamp()
-                        if last.get("publish_time") else None,
-            }
-
-        return {
-            "code": 0,
-            "data": {
-                "items": items,
-                "total": len(feed),
-                "has_more": has_more,
-                "cursor": next_cursor,
-            },
-        }
+            cursor = {"before": datetime.fromisoformat(last["publish_time"]).replace(tzinfo=ZoneInfo("Asia/Shanghai")).timestamp(),
+                "before_id": key(last)}
+        return {"code": 0, "data": {"items": items, "total": total,
+            "has_more": has_more and cursor is not None, "next_cursor": cursor, "cursor": cursor}}
 
 
 @app.get("/api/daily", dependencies=[Depends(require_api_key)])
@@ -582,191 +542,216 @@ async def get_daily_digest(date_str: str):
 
 @app.get("/api/health")
 async def health():
-    db_ok = False
     try:
         async with async_session() as session:
             await session.execute(text("SELECT 1"))
-            db_ok = True
-    except Exception as e:
-        print(f"[health] DB check failed: {e}")
-
-    return {
-        "status": "ok" if db_ok else "degraded",
-        "db": "connected" if db_ok else "disconnected",
-    }
+    except Exception:
+        return JSONResponse(status_code=503, content={"status": "degraded", "db": "disconnected"})
+    if _scheduler is not None and not _scheduler.running:
+        return JSONResponse(status_code=503, content={"status": "degraded", "scheduler": "stopped"})
+    return {"status": "ok", "db": "connected"}
 
 
 @app.get("/api/status", dependencies=[Depends(require_api_key)])
 async def status():
     async with async_session() as session:
-        blogger_count = (await session.execute(select(func.count(Blogger.mid)).where(Blogger.enabled == True))).scalar() or 0
-        video_count = (await session.execute(select(func.count(Video.bvid)))).scalar() or 0
-        failed_count = (await session.execute(select(func.count(Video.bvid)).where(Video.fetch_status == "failed"))).scalar() or 0
-
-        # Last fetch watermark
-        wm_stmt = select(FetchWatermark).order_by(desc(FetchWatermark.updated_at)).limit(1)
-        wm = (await session.execute(wm_stmt)).scalar_one_or_none()
-
-        # Cookie status
-        from src.bilibili import BiliClient
-        sessdata = get_env("SESSDATA")
-        cookie_info = {"valid": False, "expire_date": ""}
-        if sessdata:
-            async with BiliClient(sessdata=sessdata) as client:
-                cookie_info = await client.validate_sessdata()
-
-        return {
-            "code": 0,
-            "data": {
-                "bloggers": blogger_count,
-                "videos": video_count,
-                "failed": failed_count,
-                "last_fetch": wm.updated_at.isoformat() if wm else None,
-                "cookie_valid": cookie_info.get("valid", False),
-                "cookie_expire": cookie_info.get("expire_date", ""),
-            },
-        }
+        bloggers = (await session.execute(select(func.count()).select_from(Blogger).where(Blogger.enabled == True))).scalar()
+        videos = (await session.execute(select(func.count()).select_from(Video))).scalar()
+        failed = (await session.execute(select(func.count()).select_from(Video).where(Video.fetch_status == "failed"))).scalar()
+        job = (await session.execute(select(FetchJob).order_by(FetchJob.started_at.desc()).limit(1))).scalar_one_or_none()
+        last_job = _job_json(job) if job else None
+    cookie = await _cached_cookie_status()
+    return {"code": 0, "data": {"bloggers": bloggers, "videos": videos, "failed": failed,
+        "last_fetch": last_job["finished_at"] if last_job else None, "last_job": last_job,
+        "task_running": _job_lock.locked(), "cookie_valid": cookie.get("valid", False),
+        "cookie_expire": cookie.get("expire_date", "")}}
 
 
 @app.post("/api/fetch/trigger", dependencies=[Depends(require_api_key)])
 async def trigger_fetch():
-    """手动触发抓取。"""
-    asyncio.create_task(_run_fetch_task())
-    return {"code": 0, "message": "抓取任务已触发"}
+    return await _submit_job("fetch", _fetch_work)
 
 
 async def _run_fetch_task():
-    global _fetch_task_running
-    if _fetch_task_running:
-        print("[trigger] 抓取任务已在运行，跳过")
-        return
-    _fetch_task_running = True
-    try:
-        result = await run_fetch_only()
-        print(f"[trigger] 抓取完成: {result}")
-    except Exception as e:
-        print(f"[trigger] 抓取失败: {e}")
-    finally:
-        _fetch_task_running = False
+    return await _run_job("fetch", _fetch_work)
 
 
 class BackfillRequest(BaseModel):
-    since: str
-    mid: Optional[int] = None
+    since: date
+    mid: Optional[int] = Field(None, gt=0, le=9223372036854775807)
 
 
 @app.post("/api/fetch/backfill", dependencies=[Depends(require_api_key)])
 async def trigger_backfill(req: BackfillRequest):
-    """历史补抓（后台执行）。"""
-    asyncio.create_task(_run_backfill_task(req.mid, req.since))
-    return {"code": 0, "message": f"补抓任务已触发 (since={req.since})"}
+    if req.since > _utcnow().date():
+        raise HTTPException(400, "since 不能晚于今天")
+    if req.mid:
+        async with async_session() as session:
+            b = await session.get(Blogger, req.mid)
+            if not b or not b.enabled:
+                raise HTTPException(404, "博主不存在或已禁用")
+    return await _submit_job("backfill", lambda: _backfill_work(req.mid, req.since.isoformat()))
 
 
 async def _run_backfill_task(mid: int = None, since: str = "2026-07-01"):
-    global _backfill_task_running
-    if _backfill_task_running:
-        print("[backfill] 补抓任务已在运行，跳过")
-        return
-    _backfill_task_running = True
-    cfg = get_config()
-    cap = cfg.get("data", {}).get("backfill_cap", 20)
-    try:
-        if mid:
-            result = await run_backfill(mid, since, cap)
-            print(f"[backfill] 完成: {result}")
-        else:
-            bloggers = await _get_enabled_bloggers()
-            for b in bloggers:
-                result = await run_backfill(b["mid"], since, cap)
-                print(f"[backfill] {b.get('name', b['mid'])}: {result}")
-    except Exception as e:
-        print(f"[backfill] 失败: {e}")
-    finally:
-        _backfill_task_running = False
+    return await _run_job("backfill", lambda: _backfill_work(mid, since))
 
 
 @app.post("/api/transcripts/retry", dependencies=[Depends(require_api_key)])
 async def retry_transcripts():
-    """补字幕：给没有字幕的视频重新跑ASR。"""
-    asyncio.create_task(_retry_transcripts_task())
-    return {"code": 0, "message": "字幕补全任务已触发"}
+    return await _submit_job("retry_transcripts", _retry_work)
 
 
 async def _retry_transcripts_task():
-    """后台任务：找出没字幕的视频，尝试ASR转写。"""
-    from src.transcript import fetch_transcript
-    from src.analyzer import analyze_video
-    from src.bilibili import BiliClient
-    from src.config import get_env
+    return await _run_job("retry_transcripts", _retry_work)
 
-    sessdata = get_env("SESSDATA")
 
+async def _recover_interrupted():
     async with async_session() as session:
-        # 找出没有字幕的视频
-        stmt = (
-            select(Video)
-            .outerjoin(Transcript, Video.bvid == Transcript.bvid)
-            .where(Video.fetch_status == "ok")
-            .where(Transcript.bvid.is_(None))
-        )
-        videos = (await session.execute(stmt)).scalars().all()
+        await session.execute(update(FetchJob).where(FetchJob.status == "running").values(
+            status="interrupted", finished_at=_utcnow(), error_message="Service restarted"))
+        await session.execute(update(Video).where(Video.fetch_status == "pending").values(
+            fetch_status="failed", error_message="Previous task interrupted"))
+        await session.commit()
 
-    if not videos:
-        print("[retry] 没有需要补字幕的视频")
-        return
 
-    print(f"[retry] 找到 {len(videos)} 个没字幕的视频，开始ASR转写")
+def _job_json(job):
+    return {"id": job.id, "kind": job.kind, "status": job.status,
+        "started_at": job.started_at.isoformat() if job.started_at else None,
+        "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+        "result": job.result, "error": job.error_message}
 
-    async with BiliClient(sessdata=sessdata) as client:
+
+async def _reserve_job(kind):
+    if _job_lock.locked():
+        raise HTTPException(409, "已有采集或补算任务正在运行")
+    await _job_lock.acquire()
+    try:
+        async with async_session() as session:
+            job = FetchJob(id=str(uuid4()), kind=kind, status="running")
+            session.add(job)
+            await session.commit()
+            return job.id
+    except BaseException:
+        _job_lock.release()
+        raise
+
+
+async def _execute_job(job_id, work):
+    task = asyncio.current_task()
+    _background_tasks.add(task)
+    status, result, error = "completed", None, None
+    try:
+        result = await work()
+        if result and (result.get("total_failed", 0) or result.get("failed", 0)):
+            status = "partial"
+    except asyncio.CancelledError:
+        status, error = "interrupted", "Task cancelled"
+        raise
+    except Exception as exc:
+        status, error = "failed", str(exc)[:1000]
+    finally:
+        try:
+            async with async_session() as session:
+                job = await session.get(FetchJob, job_id)
+                job.status, job.result, job.error_message = status, result, error
+                job.finished_at = _utcnow()
+                await session.commit()
+        finally:
+            _job_lock.release()
+            _background_tasks.discard(task)
+    return {"id": job_id, "status": status, "result": result, "error": error}
+
+
+async def _run_job(kind, work):
+    try:
+        job_id = await _reserve_job(kind)
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            return {"status": "busy"}
+        raise
+    return await _execute_job(job_id, work)
+
+
+async def _submit_job(kind, work):
+    job_id = await _reserve_job(kind)
+    task = asyncio.create_task(_execute_job(job_id, work))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return {"code": 0, "data": {"id": job_id, "status": "accepted", "message": "任务已接受，可在状态页查看结果"}}
+
+
+async def _fetch_work():
+    result = await run_fetch_only()
+    digests = await regenerate_dirty_digests()
+    result["digests"] = digests
+    result["total_failed"] = result.get("total_failed", 0) + digests["failed"]
+    return result
+
+
+async def _digest_work():
+    result = await run_fetch_only()
+    digests = await regenerate_dirty_digests(include_latest=True)
+    result["digests"] = digests
+    result["total_failed"] = result.get("total_failed", 0) + digests["failed"]
+    return result
+
+
+async def _backfill_work(mid, since):
+    bloggers = [{"mid": mid}] if mid else await _get_enabled_bloggers()
+    results = []
+    for b in bloggers:
+        results.append(await run_backfill(b["mid"], since, get_config().get("data", {}).get("backfill_cap", 20)))
+    digests = await regenerate_dirty_digests()
+    return {"bloggers": results, "failed": sum(r["failed"] for r in results) + digests["failed"], "digests": digests}
+
+
+async def _retry_work():
+    from src.fetcher import _bili_client
+    async with async_session() as session:
+        videos = (await session.execute(select(Video).outerjoin(Transcript, Video.bvid == Transcript.bvid)
+            .outerjoin(Summary, Video.bvid == Summary.bvid).where(Video.mid.in_(select(Blogger.mid).where(Blogger.enabled == True)),
+                or_(Video.fetch_status != "ok", Transcript.bvid.is_(None), Transcript.full_text == "", Summary.bvid.is_(None))))).scalars().all()
+    result = {"processed": 0, "failed": 0}
+    async with _bili_client() as client:
         for video in videos:
             try:
-                # 获取CID
-                vid_info = await client.get_video_info(video.bvid)
-                cid = vid_info.get("cid", 0) or vid_info.get("pages", [{}])[0].get("cid", 0)
-                if not cid:
-                    print(f"[retry] {video.bvid}: 无法获取CID，跳过")
-                    continue
+                await _process_video(client, video.mid, _video_info(video), is_retry=True)
+                result["processed"] += 1
+            except Exception:
+                result["failed"] += 1
+            await asyncio.sleep(get_config().get("limits", {}).get("video_interval_seconds", 5))
+    digests = await regenerate_dirty_digests()
+    result["failed"] += digests["failed"]
+    return result
 
-                # 尝试获取字幕（含ASR降级）
-                result = await fetch_transcript(client, video.bvid, cid, video.duration or 0)
-                text = result.get("text", "")
 
-                if text:
-                    # 保存字幕
-                    async with async_session() as session:
-                        session.add(Transcript(
-                            bvid=video.bvid,
-                            source=result["source"],
-                            full_text=text,
-                            segment_count=result["segments"],
-                        ))
-                        await session.commit()
-                    print(f"[retry] ✅ {video.bvid}: {result['source']} ({len(text)} chars)")
+async def _cached_cookie_status():
+    import time
+    from src.bilibili import BiliClient
+    global _cookie_cache
+    async with _cookie_lock:
+        timestamp, data = _cookie_cache
+        if time.monotonic() - timestamp < 60:
+            return data
+        async with BiliClient(sessdata=get_env("SESSDATA")) as client:
+            data = await client.validate_sessdata()
+        _cookie_cache = (time.monotonic(), data)
+        return data
 
-                    # 重新分析
-                    comments_resp = await client.get_comments(oid=vid_info.get("aid", 0), oid_type=1, count=20)
-                    comments = comments_resp.get("replies", [])
-                    danmakus = await client.get_danmaku(cid, max_count=2000)
-                    analysis = await analyze_video(video.title, text, comments, danmakus, video.duration or 0)
 
-                    async with async_session() as session:
-                        existing_sum = await session.get(Summary, video.bvid)
-                        if existing_sum:
-                            existing_sum.summary = analysis["summary"]
-                            existing_sum.key_points = analysis["key_points"]
-                            existing_sum.sentiment = analysis["sentiment"]
-                            existing_sum.sentiment_score = analysis["sentiment_score"]
-                            existing_sum.risk_warnings = analysis["risk_warnings"]
-                            existing_sum.data_citations = analysis["data_citations"]
-                            existing_sum.tags = analysis["tags"]
-                        await session.commit()
-                    print(f"[retry] ✅ {video.bvid}: 分析已更新")
-                else:
-                    print(f"[retry] ❌ {video.bvid}: ASR也拿不到字幕")
+@app.get("/api/tasks/{job_id}", dependencies=[Depends(require_api_key)])
+async def task_status(job_id: str):
+    async with async_session() as session:
+        job = await session.get(FetchJob, job_id)
+        if not job:
+            raise HTTPException(404, "任务不存在")
+        return {"code": 0, "data": _job_json(job)}
 
-            except Exception as e:
-                print(f"[retry] ❌ {video.bvid}: {e}")
 
-            await asyncio.sleep(5)  # 限速
+from src.bilibili import BiliAPIError
 
-    print("[retry] 字幕补全完成")
+
+@app.exception_handler(BiliAPIError)
+async def upstream_error(request, exc):
+    return JSONResponse(status_code=502, content={"detail": "B站请求失败，请稍后重试", "upstream_code": exc.code})

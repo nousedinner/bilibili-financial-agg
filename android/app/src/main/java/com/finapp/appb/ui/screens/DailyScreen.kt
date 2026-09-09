@@ -152,15 +152,6 @@ private fun DailyCard(
                 )
             }
 
-            // 查看详情提示
-            Text(
-                text = "查看详情 →",
-                fontSize = 12.sp,
-                color = Primary,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 8.dp),
-            )
         }
     }
 }

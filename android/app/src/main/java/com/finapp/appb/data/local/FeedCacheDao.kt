@@ -4,7 +4,7 @@ import androidx.room.*
 
 @Dao
 interface FeedCacheDao {
-    @Query("SELECT * FROM feed_cache ORDER BY cachedAt DESC")
+    @Query("SELECT * FROM feed_cache ORDER BY publishTime DESC")
     suspend fun getAll(): List<FeedCacheEntity>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)

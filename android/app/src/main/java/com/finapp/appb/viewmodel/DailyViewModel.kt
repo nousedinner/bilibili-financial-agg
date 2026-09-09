@@ -6,8 +6,6 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.finapp.appb.FinApp
 import com.finapp.appb.data.api.DailyContent
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -28,6 +26,9 @@ class DailyViewModel(application: Application) : AndroidViewModel(application) {
     private val _expandedDate = MutableStateFlow<String?>(null)
     val expandedDate: StateFlow<String?> = _expandedDate
 
+    // 按日期缓存已加载的详情
+    private val _details = mutableMapOf<String, DailyContent>()
+
     init {
         loadAll()
     }
@@ -45,15 +46,11 @@ class DailyViewModel(application: Application) : AndroidViewModel(application) {
                     return@launch
                 }
 
-                // 并发加载所有日期的详情
-                val details = dates.map { date ->
-                    async {
-                        repo.getDailyDetail(date).getOrNull()
-                    }
-                }.awaitAll()
-
-                _summaries.value = details.filterNotNull().sortedByDescending { it.date }
-                Log.d("DailyVM", "Loaded ${_summaries.value.size} summaries")
+                // 只加载日期列表，创建空壳 DailyContent 占位
+                _summaries.value = dates.map { date ->
+                    _details[date] ?: DailyContent(date = date)
+                }
+                Log.d("DailyVM", "Loaded ${dates.size} date entries (details lazy)")
             }.onFailure {
                 _error.value = it.message ?: "加载失败"
             }
@@ -63,6 +60,23 @@ class DailyViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun toggleExpand(date: String) {
-        _expandedDate.value = if (_expandedDate.value == date) null else date
+        if (_expandedDate.value == date) {
+            _expandedDate.value = null
+        } else {
+            _expandedDate.value = date
+            // 展开时如果还没有该日期的详情数据，加载之
+            if (_details[date] == null) {
+                viewModelScope.launch {
+                    val detail = repo.getDailyDetail(date).getOrNull()
+                    if (detail != null) {
+                        _details[date] = detail
+                        // 更新 summaries 中对应项
+                        _summaries.value = _summaries.value.map {
+                            if (it.date == date) detail else it
+                        }
+                    }
+                }
+            }
+        }
     }
 }

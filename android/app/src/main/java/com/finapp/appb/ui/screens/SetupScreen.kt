@@ -1,6 +1,5 @@
 package com.finapp.appb.ui.screens
 
-import android.widget.Toast
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -44,7 +43,6 @@ fun SetupScreen(onSetupComplete: () -> Unit) {
     var username by remember { mutableStateOf("") }
     var showPassword by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(false) }
-    var isBootstrapping by remember { mutableStateOf(false) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
 
     // Load saved config
@@ -150,45 +148,12 @@ fun SetupScreen(onSetupComplete: () -> Unit) {
             },
             modifier = Modifier.fillMaxWidth().height(52.dp),
             shape = RoundedCornerShape(12.dp),
-            enabled = !isLoading && !isBootstrapping
+            enabled = !isLoading
         ) {
             if (isLoading) {
                 CircularProgressIndicator(modifier = Modifier.size(24.dp), color = MaterialTheme.colorScheme.onPrimary, strokeWidth = 2.dp)
             } else {
                 Text("保存并连接", fontSize = 16.sp)
-            }
-        }
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        // Bootstrap button
-        OutlinedButton(
-            onClick = {
-                focusManager.clearFocus()
-                isBootstrapping = true
-                errorMsg = null
-                scope.launch {
-                    val uname = username.ifBlank { "android" }
-                    val result = repo.bootstrap(apiUrl, uname)
-                    result.onSuccess { user ->
-                        apiKey = user.apiKey
-                        username = user.username
-                        errorMsg = null
-                        Toast.makeText(context, "用户创建成功！密码已自动填入", Toast.LENGTH_LONG).show()
-                    }.onFailure {
-                        errorMsg = "创建用户失败: ${it.message}"
-                    }
-                    isBootstrapping = false
-                }
-            },
-            modifier = Modifier.fillMaxWidth().height(48.dp),
-            shape = RoundedCornerShape(12.dp),
-            enabled = !isLoading && !isBootstrapping
-        ) {
-            if (isBootstrapping) {
-                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-            } else {
-                Text("没有账号？创建用户", fontSize = 14.sp)
             }
         }
     }

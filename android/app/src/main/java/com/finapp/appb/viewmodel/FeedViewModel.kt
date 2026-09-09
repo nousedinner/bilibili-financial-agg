@@ -159,7 +159,7 @@ class FeedViewModel(application: Application) : AndroidViewModel(application) {
                 hasMore = data.hasMore
                 repo.cacheFeedItems(data.items)
             }.onFailure {
-                // Silently fail
+                Log.d("FeedVM", "loadMore failed: ${it.message}")
             }
             _isLoading.value = false
         }
@@ -167,6 +167,7 @@ class FeedViewModel(application: Application) : AndroidViewModel(application) {
 
     fun refresh() {
         viewModelScope.launch {
+            _isLoading.value = true
             _isRefreshing.value = true
             _error.value = null
             _authError.value = false
@@ -189,6 +190,7 @@ class FeedViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             _isRefreshing.value = false
+            _isLoading.value = false
         }
     }
 

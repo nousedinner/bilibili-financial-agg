@@ -73,6 +73,14 @@ class FinRepository(
         return api ?: throw IllegalStateException("API not initialized")
     }
 
+    fun reset() {
+        api = null
+        currentBaseUrl = ""
+        currentApiKey = ""
+        cachedBloggers = null
+        cachedFeedItems = null
+    }
+
     // ── Health (no auth) ──
     suspend fun healthCheck(baseUrl: String): Boolean {
         return try {
@@ -130,6 +138,9 @@ class FinRepository(
             val resp = requireApi().getFeedPage(before, limit)
             if (resp.isSuccessful) {
                 Result.success(resp.body()!!.data)
+            } else if (resp.code() == 401) {
+                // 401 不回退缓存，直接返回错误让上层检测 authError
+                Result.failure(Exception("401"))
             } else {
                 // API 失败，回退到 Room 缓存
                 val cached = getFeedFromCache()
@@ -164,6 +175,9 @@ class FinRepository(
                 }
                 cacheFeedItems(items)
                 Result.success(items)
+            } else if (resp.code() == 401) {
+                // 401 不回退缓存，直接返回错误
+                Result.failure(Exception("401"))
             } else {
                 Result.failure(Exception("加载失败: ${resp.code()}"))
             }
@@ -307,6 +321,9 @@ class FinRepository(
                     videoDetailCacheDao.insert(VideoDetailCacheEntity(bvid = bvid, json = json))
                 } catch (_: Exception) { }
                 Result.success(detail)
+            } else if (resp.code() == 401) {
+                // 401 不回退缓存，直接返回错误
+                Result.failure(Exception("401"))
             } else {
                 // API 失败，回退到缓存
                 val cached = getVideoDetailFromCache(bvid)

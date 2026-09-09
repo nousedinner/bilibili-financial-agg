@@ -45,6 +45,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun logout() {
+        repo.reset()
         viewModelScope.launch { prefs.clearConfig() }
     }
 

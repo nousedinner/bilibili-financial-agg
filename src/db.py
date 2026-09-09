@@ -24,11 +24,14 @@ async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit
 
 
 async def init_db():
-    """Verify database connection (tables pre-created by root)."""
+    """创建表（如不存在）并验证连接。"""
     from sqlalchemy import text
+    # 自动创建缺失的表（不会修改已有表结构）
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
     async with engine.connect() as conn:
         await conn.execute(text("SELECT 1"))
-    print("[db] Database connection OK (MySQL TZ=CST via docker env)")
+    print("[db] Database init OK (create_all + connection verified)")
 
 
 async def get_session() -> AsyncSession:

@@ -80,18 +80,13 @@ async def analyze_video(
 
     result = await _call_llm(prompt)
     if result:
-        try:
-            return json.loads(result)
-        except json.JSONDecodeError:
-            # Try to extract JSON from response
-            start = result.find("{")
-            end = result.rfind("}") + 1
-            if start >= 0 and end > start:
-                try:
-                    return json.loads(result[start:end])
-                except json.JSONDecodeError:
-                    pass
-    return _empty_analysis()
+        parsed = _try_parse_json(result)
+        if parsed is not None:
+            if _validate_analysis(parsed):
+                return parsed
+            # JSON合法但字段缺失 → 记录警告，返回empty标记
+            print(f"[analyzer] LLM返回了不完整的JSON结构，视为分析失败")
+    return _empty_analysis(analysis_failed=True)
 
 
 async def analyze_dynamic(content: str) -> dict:
@@ -113,17 +108,18 @@ async def analyze_dynamic(content: str) -> dict:
 
     result = await _call_llm(prompt)
     if result:
-        try:
-            return json.loads(result)
-        except json.JSONDecodeError:
-            start = result.find("{")
-            end = result.rfind("}") + 1
-            if start >= 0 and end > start:
-                try:
-                    return json.loads(result[start:end])
-                except json.JSONDecodeError:
-                    pass
-    return {"summary": "", "sentiment": "neutral", "tags": []}
+        parsed = _try_parse_json(result)
+        if parsed is not None:
+            summary = str(parsed.get("summary", "")).strip()
+            sentiment = str(parsed.get("sentiment", "")).strip().lower()
+            if summary and sentiment in _VALID_SENTIMENTS:
+                return {
+                    "summary": summary,
+                    "sentiment": sentiment,
+                    "tags": parsed.get("tags", []),
+                }
+            print(f"[analyzer] dynamic LLM返回无效结构，视为分析失败")
+    return {"summary": "", "sentiment": "neutral", "tags": [], "analysis_failed": True}
 
 
 async def generate_daily_digest(blogger_analyses: list) -> dict:
@@ -177,18 +173,13 @@ async def generate_daily_digest(blogger_analyses: list) -> dict:
 
     result = await _call_llm(prompt)
     if result:
-        try:
-            digest = json.loads(result)
-            return _validate_digest(digest)
-        except json.JSONDecodeError:
-            start = result.find("{")
-            end = result.rfind("}") + 1
-            if start >= 0 and end > start:
-                try:
-                    digest = json.loads(result[start:end])
-                    return _validate_digest(digest)
-                except json.JSONDecodeError:
-                    pass
+        parsed = _try_parse_json(result)
+        if parsed is not None:
+            digest = _validate_digest(parsed)
+            # 校验必要字段
+            if digest.get("overall_sentiment") and digest.get("summary"):
+                return digest
+            print("[analyzer] daily digest LLM返回结构不完整，视为分析失败")
     return _empty_digest()
 
 
@@ -235,8 +226,8 @@ async def _call_llm(prompt: str) -> Optional[str]:
     return None
 
 
-def _empty_analysis() -> dict:
-    return {
+def _empty_analysis(analysis_failed: bool = False) -> dict:
+    d = {
         "summary": "",
         "key_points": [],
         "sentiment": "neutral",
@@ -249,6 +240,45 @@ def _empty_analysis() -> dict:
         "danmaku_sentiment": {"bullish": 0, "bearish": 0, "neutral": 1.0},
         "danmaku_keywords": [],
     }
+    if analysis_failed:
+        d["analysis_failed"] = True
+    return d
+
+
+def _try_parse_json(text: str) -> Optional[dict]:
+    """尝试从LLM输出中提取合法JSON，容忍包裹文本。"""
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except (json.JSONDecodeError, TypeError):
+        pass
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(text[start:end])
+            if isinstance(parsed, dict):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return None
+
+
+_REQUIRED_ANALYSIS_FIELDS = {"summary", "key_points", "sentiment", "sentiment_score"}
+
+
+def _validate_analysis(parsed: dict) -> bool:
+    """校验视频分析返回结构是否包含必要字段且类型正确。"""
+    if not _REQUIRED_ANALYSIS_FIELDS.issubset(parsed.keys()):
+        return False
+    sentiment = str(parsed.get("sentiment", "")).strip().lower()
+    if sentiment not in _VALID_SENTIMENTS:
+        return False
+    score = parsed.get("sentiment_score")
+    if not isinstance(score, (int, float)):
+        return False
+    return True
 
 
 def _empty_digest() -> dict:

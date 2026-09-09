@@ -182,9 +182,7 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str) -> dict:
         last_bvid = wm.last_bvid if wm else None
         last_dyn_id = wm.last_dyn_id if wm else None
 
-    # Fetch new videos
-    vlist = await client.get_video_list(mid, page=1, page_size=30)
-    videos = vlist.get("list", {}).get("vlist", [])
+    # Fetch new videos (with pagination until we find last_bvid)
     cfg = get_config()
     first_run_cap = cfg.get("data", {}).get("first_run_cap", 20)
     video_interval = cfg.get("limits", {}).get("video_interval_seconds", 5)
@@ -192,6 +190,27 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str) -> dict:
     new_videos = []
     backfill_since = cfg.get("data", {}).get("backfill_since", "2026-07-01")
     since_dt = datetime.strptime(backfill_since, "%Y-%m-%d") if backfill_since else None
+
+    # Paginate until we find last_bvid or run out of pages
+    videos = []
+    page = 1
+    max_pages = 10  # Safety limit to avoid infinite loops
+    found_watermark = False
+    while page <= max_pages:
+        vlist = await client.get_video_list(mid, page=page, page_size=30)
+        page_videos = vlist.get("list", {}).get("vlist", [])
+        if not page_videos:
+            break
+        for v in page_videos:
+            if v.get("bvid") == last_bvid:
+                found_watermark = True
+                break
+            videos.append(v)
+        if found_watermark:
+            break
+        if not last_bvid and len(videos) >= first_run_cap:
+            break  # First run: limit total videos
+        page += 1
 
     # Batch check: which bvids already exist with fetch_status='ok' OR have a Summary
     # (Summary existence is a more reliable dedup signal than fetch_status alone)
@@ -213,8 +232,6 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str) -> dict:
 
     for v in videos:
         bvid = v.get("bvid", "")
-        if bvid == last_bvid:
-            break  # Reached watermark
         if bvid in already_done:
             result["skipped_count"] += 1
             continue  # Already processed — skip
@@ -223,8 +240,6 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str) -> dict:
         if since_dt and pub_ts and datetime.fromtimestamp(pub_ts) < since_dt:
             continue  # 跳过太旧的视频
         new_videos.append(v)
-        if not last_bvid and len(new_videos) >= first_run_cap:
-            break  # First run: limit
 
     if result["skipped_count"] > 0:
         print(f"[fetcher] {name}: 跳过{result['skipped_count']}条已有视频，待处理{len(new_videos)}条")
@@ -261,6 +276,47 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str) -> dict:
                 ))
             await session.commit()
 
+    # Step 3: Fetch dynamics
+    try:
+        dyn_result = await client.get_dynamics(mid)
+        dyn_items = dyn_result.get("items", [])
+        new_dyn_count = 0
+        for dyn in dyn_items:
+            dyn_id = str(dyn.get("id_str", ""))
+            if not dyn_id:
+                continue
+            # Dedup: skip if already exists
+            async with async_session() as session:
+                existing_dyn = await session.get(Dynamic, dyn_id)
+                if existing_dyn:
+                    continue
+            try:
+                await _process_dynamic(client, mid, dyn)
+                new_dyn_count += 1
+            except Exception as e:
+                print(f"[fetcher] ❌ dynamic {dyn_id} failed: {e}")
+            await asyncio.sleep(2)
+
+        # Update watermark with last_dyn_id
+        if dyn_items:
+            newest_dyn_id = str(dyn_items[0].get("id_str", ""))
+            if newest_dyn_id:
+                async with async_session() as session:
+                    wm = await session.get(FetchWatermark, mid)
+                    if wm:
+                        wm.last_dyn_id = newest_dyn_id
+                        wm.updated_at = _utcnow()
+                    else:
+                        session.add(FetchWatermark(
+                            mid=mid,
+                            last_dyn_id=newest_dyn_id,
+                        ))
+                    await session.commit()
+
+        result["dynamics_count"] = new_dyn_count
+    except Exception as e:
+        print(f"[fetcher] ❌ dynamics for {name} failed: {e}")
+
     return result
 
 
@@ -282,14 +338,7 @@ async def _process_video(client: BiliClient, mid: int, vinfo: dict, is_retry: bo
 
     pub_dt = datetime.fromtimestamp(pub_ts) if pub_ts else _utcnow().replace(tzinfo=None)
 
-    # Get video info for CID
-    vid_info = await client.get_video_info(bvid)
-    cid = vid_info.get("cid", 0) or vid_info.get("pages", [{}])[0].get("cid", 0)
-
-    if not cid:
-        raise ValueError(f"Cannot get CID for {bvid}")
-
-    # Store video record
+    # P1-3: 先创建/更新video记录，确保任何阶段失败都能持久化状态
     async with async_session() as session:
         video = await session.get(Video, bvid)
         if not video:
@@ -305,19 +354,48 @@ async def _process_video(client: BiliClient, mid: int, vinfo: dict, is_retry: bo
             video.duration = dur_sec
             video.view_count = view_count
             if is_retry:
-                video.fetch_status = "pending"  # 重试时重置状态
+                video.fetch_status = "pending"
         await session.commit()
+
+    # Get video info for CID
+    vid_info = await client.get_video_info(bvid)
+    cid = vid_info.get("cid", 0) or vid_info.get("pages", [{}])[0].get("cid", 0)
+
+    if not cid:
+        # P1-3: CID获取失败时更新状态（video记录已存在）
+        async with async_session() as session:
+            video = await session.get(Video, bvid)
+            if video:
+                video.fetch_status = "failed"
+                video.error_message = "Cannot get CID"
+                video.retry_count = (video.retry_count or 0) + 1
+                await session.commit()
+        raise ValueError(f"Cannot get CID for {bvid}")
 
     # Step 1: Transcript
     transcript_result = await fetch_transcript(client, bvid, cid, dur_sec)
     transcript_text = transcript_result.get("text", "")
 
     # Step 2: Comments + Danmaku
-    comments = await client.get_comments(oid=vid_info.get("aid", 0), oid_type=1, count=20)
+    comments_resp = await client.get_comments(oid=vid_info.get("aid", 0), oid_type=1, count=20)
+    comments = comments_resp.get("replies", [])
+    comment_total = comments_resp.get("total", len(comments))
     danmakus = await client.get_danmaku(cid, max_count=2000)
 
     # Step 3: LLM Analysis
     analysis = await analyze_video(title, transcript_text, comments, danmakus, dur_sec)
+
+    # P1-5: 如果分析失败，不标ok，保持failed状态
+    if analysis.get("analysis_failed"):
+        print(f"[fetcher] ❌ {bvid}: LLM分析失败，标记为failed")
+        async with async_session() as session:
+            video = await session.get(Video, bvid)
+            if video:
+                video.fetch_status = "failed"
+                video.error_message = "LLM analysis failed"
+                video.retry_count = (video.retry_count or 0) + 1
+                await session.commit()
+        raise ValueError(f"LLM analysis failed for {bvid}")
 
     # Step 4: Save everything to DB
     try:
@@ -364,7 +442,7 @@ async def _process_video(client: BiliClient, mid: int, vinfo: dict, is_retry: bo
             await session.merge(CommentAnalysis(
                 ref_id=bvid,
                 ref_type="video",
-                total_count=len(comments),
+                total_count=comment_total,
                 fetched_count=len(comments),
                 sentiment_bullish=cs.get("bullish", 0),
                 sentiment_bearish=cs.get("bearish", 0),
@@ -498,9 +576,9 @@ async def _generate_digest(bloggers: list, results: dict):
     today = now.date()
     blogger_analyses = []
 
-    # 时间范围：昨日22:00 → 今日22:00
-    yesterday_22 = datetime.combine(today, time(22, 0)).replace(tzinfo=tz_shanghai) - timedelta(days=1)
-    today_22 = datetime.combine(today, time(22, 0)).replace(tzinfo=tz_shanghai)
+    # 时间范围：昨日23:00 → 今日23:00（给21:00抓取留2小时缓冲）
+    yesterday_23 = datetime.combine(today, time(23, 0)).replace(tzinfo=tz_shanghai) - timedelta(days=1)
+    today_23 = datetime.combine(today, time(23, 0)).replace(tzinfo=tz_shanghai)
 
     async with async_session() as session:
         for b in bloggers:
@@ -514,8 +592,8 @@ async def _generate_digest(bloggers: list, results: dict):
                 select(Video, Summary)
                 .outerjoin(Summary, Video.bvid == Summary.bvid)
                 .where(Video.mid == mid)
-                .where(Video.publish_time >= yesterday_22)
-                .where(Video.publish_time < today_22)
+                .where(Video.publish_time >= yesterday_23)
+                .where(Video.publish_time < today_23)
                 .order_by(Video.publish_time.desc())
             )
             rows = (await session.execute(stmt)).all()
@@ -534,8 +612,8 @@ async def _generate_digest(bloggers: list, results: dict):
             dyn_stmt = (
                 select(Dynamic)
                 .where(Dynamic.mid == mid)
-                .where(Dynamic.publish_time >= yesterday_22)
-                .where(Dynamic.publish_time < today_22)
+                .where(Dynamic.publish_time >= yesterday_23)
+                .where(Dynamic.publish_time < today_23)
             )
             dyns = (await session.execute(dyn_stmt)).scalars().all()
 

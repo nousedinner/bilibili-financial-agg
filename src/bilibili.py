@@ -13,6 +13,73 @@ import httpx
 
 from src.config import get_config, get_env
 
+
+class BiliAPIError(Exception):
+    """B站 API 返回错误码时抛出（code != 0）。"""
+
+    def __init__(self, code: int, message: str, result: dict | None = None):
+        super().__init__(f"BiliAPIError(code={code}, msg={message})")
+        self.code = code
+        self.message = message
+        self.result = result or {}
+
+
+# ------------------------------------------------------------------
+# curl 统一请求（含超时回收）
+# ------------------------------------------------------------------
+
+async def _run_curl(
+    args: list[str],
+    timeout: float = 20,
+    sep_body_status: bool = False,
+) -> tuple[bytes, int]:
+    """执行 curl 子进程并返回 (stdout_bytes, http_status_code)。
+
+    - timeout 超时后会 terminate 进程并等待回收，防止僵尸进程。
+    - sep_body_status=True 时，用 -w '\\n%{http_code}' 分离 body 和状态码。
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise TimeoutError(f"curl timed out after {timeout}s: {' '.join(args[:3])}")
+
+    status = 0
+    body = stdout
+    if sep_body_status and stdout:
+        text = stdout.decode("utf-8", errors="replace")
+        lines = text.rsplit("\n", 1)
+        if len(lines) >= 2:
+            body = lines[0].encode()
+            try:
+                status = int(lines[1].strip())
+            except ValueError:
+                status = 0
+    return body, status
+
+
+def _bili_curl_args(url: str, sessdata: str = "", cookie_extra: str = "", sep: bool = False) -> list[str]:
+    """构建 B站 API curl 命令行参数。"""
+    cmd = ["curl", "-s"]
+    if sep:
+        cmd += ["-w", "\n%{http_code}"]
+    parts = []
+    if sessdata:
+        parts.append(f"SESSDATA={sessdata}")
+    if cookie_extra:
+        parts.append(cookie_extra)
+    if parts:
+        cmd += ["-b", "; ".join(parts)]
+    cmd.append(url)
+    return cmd
+
+
 # WBI mixin key lookup table (B站混淆表)
 _MIXIN_KEY_ENC_TAB = [
     46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
@@ -61,15 +128,10 @@ class BiliClient:
         if self._img_key and (now - self._wbi_ts) < 600:  # cache 10min
             return
 
-        cmd = ["curl", "-s", "https://api.bilibili.com/x/web-interface/nav"]
-        if self._sessdata:
-            cmd += ["-b", f"SESSDATA={self._sessdata}"]
+        url = "https://api.bilibili.com/x/web-interface/nav"
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-            data = _json.loads(stdout)
+            body, _ = await _run_curl(_bili_curl_args(url, self._sessdata), timeout=10)
+            data = _json.loads(body)
         except Exception as e:
             print(f"[bili] WBI keys curl error: {e}")
             return
@@ -125,17 +187,18 @@ class BiliClient:
         backoff_base = cfg.get("backoff_base_seconds", 10)
 
         for attempt in range(4):
-            cmd = ["curl", "-s", "-w", "\n%{http_code}"]
-            if self._sessdata:
-                cmd += ["-b", f"SESSDATA={self._sessdata}"]
-            cmd.append(url)
-
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                body, status_code = await _run_curl(
+                    _bili_curl_args(url, self._sessdata, sep=True), timeout=20,
                 )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
-                text = stdout.decode("utf-8", errors="replace")
+                text = body.decode("utf-8", errors="replace")
+            except TimeoutError as e:
+                print(f"[bili] curl error: {e}")
+                if attempt < 3:
+                    wait = backoff_base * (2 ** attempt)
+                    await asyncio.sleep(wait)
+                    continue
+                return {"code": -1, "message": str(e)}
             except Exception as e:
                 print(f"[bili] curl error: {e}")
                 if attempt < 3:
@@ -144,8 +207,16 @@ class BiliClient:
                     continue
                 return {"code": -1, "message": f"curl error: {e}"}
 
-            lines = text.rsplit("\n", 1)
-            if len(lines) < 2:
+            # status_code 已由 _run_curl 分离
+            if status_code and status_code != 200:
+                print(f"[bili] HTTP {status_code}")
+                if attempt < 3:
+                    wait = backoff_base * (2 ** attempt)
+                    await asyncio.sleep(wait)
+                    continue
+                return {"code": -1, "message": f"HTTP {status_code}"}
+
+            if not text.strip():
                 if attempt < 3:
                     wait = backoff_base * (2 ** attempt)
                     await asyncio.sleep(wait)
@@ -153,12 +224,7 @@ class BiliClient:
                 return {"code": -1, "message": "curl: empty response"}
 
             try:
-                status_code = int(lines[1].strip())
-            except ValueError:
-                status_code = 0
-
-            try:
-                result = _json.loads(lines[0])
+                result = _json.loads(text)
             except _json.JSONDecodeError:
                 print(f"[bili] non-JSON response ({status_code})")
                 if attempt < 3:
@@ -180,9 +246,9 @@ class BiliClient:
                 await asyncio.sleep(wait)
                 continue
 
-            # Other errors
+            # Other errors — raise instead of silently returning
             print(f"[bili] API error: code={code} msg={result.get('message', '')}")
-            return result
+            raise BiliAPIError(code, result.get("message", ""), result)
 
         return {"code": -1, "message": "max retries exceeded"}
 
@@ -230,37 +296,19 @@ class BiliClient:
         query = urllib.parse.urlencode(params)
         url = f"https://api.bilibili.com/x/polymer/web-dynamic/desktop/v1/feed/space?{query}"
 
-        cmd = ["curl", "-s", "-w", "\n%{http_code}"]
-        cookie = f"SESSDATA={self._sessdata}" if self._sessdata else ""
-        if self._buvid3:
-            cookie = f"{cookie}; buvid3={self._buvid3}" if cookie else f"buvid3={self._buvid3}"
-        if cookie:
-            cmd += ["-b", cookie]
-        cmd.append(url)
-
+        cmd = _bili_curl_args(
+            url, self._sessdata,
+            cookie_extra=f"buvid3={self._buvid3}" if self._buvid3 else "",
+            sep=True,
+        )
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
-            text = stdout.decode("utf-8", errors="replace")
-        except Exception as e:
+            body, status_code = await _run_curl(cmd, timeout=15)
+            if status_code != 200:
+                print(f"[bili] dynamics {status_code}")
+                return {}
+            result = _json.loads(body)
+        except (TimeoutError, Exception) as e:
             print(f"[bili] dynamics curl error: {e}")
-            return {}
-
-        lines = text.rsplit("\n", 1)
-        if len(lines) < 2:
-            return {}
-        try:
-            status_code = int(lines[1].strip())
-        except ValueError:
-            status_code = 0
-        if status_code != 200:
-            print(f"[bili] dynamics {status_code}")
-            return {}
-        try:
-            result = _json.loads(lines[0])
-        except _json.JSONDecodeError:
             return {}
         return result.get("data", {})
 
@@ -269,12 +317,11 @@ class BiliClient:
         if self._buvid3:
             return
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "curl", "-s", "https://api.bilibili.com/x/frontend/finger/spi",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            body, _ = await _run_curl(
+                _bili_curl_args("https://api.bilibili.com/x/frontend/finger/spi"),
+                timeout=10,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-            data = _json.loads(stdout).get("data", {})
+            data = _json.loads(body).get("data", {})
             self._buvid3 = data.get("b_3", "")
         except Exception:
             self._buvid3 = ""
@@ -298,12 +345,10 @@ class BiliClient:
         url = f"https://api.bilibili.com/x/player/wbi/v2?{query}"
         
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "curl", "-s", "-b", f"SESSDATA={self._sessdata}", url,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            body, _ = await _run_curl(
+                _bili_curl_args(url, self._sessdata), timeout=10,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-            data = _json.loads(stdout).get("data", {})
+            data = _json.loads(body).get("data", {})
         except Exception as e:
             print(f"[bili] AI字幕 curl error {bvid}: {e}")
             return None
@@ -325,12 +370,8 @@ class BiliClient:
         """
         url = f"https://api.bilibili.com/x/player/v2?bvid={bvid}&cid={cid}"
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "curl", "-s", url,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-            data = _json.loads(stdout).get("data", {})
+            body, _ = await _run_curl(_bili_curl_args(url), timeout=10)
+            data = _json.loads(body).get("data", {})
         except Exception as e:
             print(f"[bili] CC字幕 curl error {bvid}: {e}")
             return None
@@ -383,11 +424,11 @@ class BiliClient:
     # 评论
     # ------------------------------------------------------------------
 
-    async def get_comments(self, oid: int, oid_type: int = 1, count: int = 20) -> list:
+    async def get_comments(self, oid: int, oid_type: int = 1, count: int = 20) -> dict:
         """获取评论列表。
 
         oid_type: 1=视频, 17=动态, 11=图文
-        Returns list of comment dicts.
+        Returns {"replies": list, "total": int}.
         """
         params = {
             "oid": oid,
@@ -401,8 +442,10 @@ class BiliClient:
             params=params,
             signed=False,
         )
-        replies = result.get("data", {}).get("replies", []) or []
-        return replies[:count]
+        data = result.get("data", {})
+        replies = data.get("replies", []) or []
+        total = data.get("page", {}).get("count", len(replies))
+        return {"replies": replies[:count], "total": total}
 
     # ------------------------------------------------------------------
     # 弹幕
@@ -413,12 +456,8 @@ class BiliClient:
         import re
         url = f"https://api.bilibili.com/x/v1/dm/list.so?oid={cid}"
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "curl", "-s", url,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
-            text = stdout.decode("utf-8", errors="ignore")
+            body, _ = await _run_curl(_bili_curl_args(url), timeout=15)
+            text = body.decode("utf-8", errors="ignore")
         except Exception as e:
             print(f"[bili] danmaku curl error: {e}")
             return []
@@ -441,13 +480,14 @@ class BiliClient:
             return {"valid": False, "username": "", "expire_date": ""}
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "curl", "-s", "-b", f"SESSDATA={self._sessdata}",
-                "https://api.bilibili.com/x/web-interface/nav",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            body, _ = await _run_curl(
+                _bili_curl_args(
+                    "https://api.bilibili.com/x/web-interface/nav",
+                    self._sessdata,
+                ),
+                timeout=10,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-            data = _json.loads(stdout).get("data", {})
+            data = _json.loads(body).get("data", {})
         except Exception as e:
             print(f"[bili] validate_sessdata curl error: {e}")
             return {"valid": False, "username": "", "expire_date": ""}
@@ -504,37 +544,44 @@ class BiliClient:
         return None
 
     async def get_followings(self, vmid: int, pn: int = 1, ps: int = 50) -> dict:
-        """获取用户关注列表（需要SESSDATA）。使用 curl 获取。
+        """获取用户所有关注（需要SESSDATA）。自动翻页获取全部。
 
         Returns: {"total": int, "list": [{"mid": int, "name": str, "sign": str}, ...]}
         """
-        url = f"https://api.bilibili.com/x/relation/followings?vmid={vmid}&pn={pn}&ps={ps}&order=desc"
-        cmd = ["curl", "-s"]
-        if self._sessdata:
-            cmd += ["-b", f"SESSDATA={self._sessdata}"]
-        cmd.append(url)
+        all_followings = []
+        total = 0
+        page = pn
 
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-            data = _json.loads(stdout)
-        except Exception as e:
-            print(f"[bili] get_followings curl error: {e}")
-            return {"total": 0, "list": []}
-        if data.get("code") != 0:
-            print(f"[bili] get_followings failed: code={data.get('code')}, msg={data.get('message')}")
-            return {"total": 0, "list": []}
+        while True:
+            url = f"https://api.bilibili.com/x/relation/followings?vmid={vmid}&pn={page}&ps={ps}&order=desc"
+            try:
+                body, _ = await _run_curl(
+                    _bili_curl_args(url, self._sessdata), timeout=10,
+                )
+                data = _json.loads(body)
+            except Exception as e:
+                print(f"[bili] get_followings curl error: {e}")
+                return {"total": total, "list": all_followings}
 
-        followings = []
-        for f in data.get("data", {}).get("list", []):
-            followings.append({
-                "mid": f.get("mid"),
-                "name": f.get("uname", ""),
-                "sign": f.get("sign", ""),
-            })
-        return {
-            "total": data.get("data", {}).get("total", 0),
-            "list": followings,
-        }
+            if data.get("code") != 0:
+                print(f"[bili] get_followings failed: code={data.get('code')}, msg={data.get('message')}")
+                return {"total": total, "list": all_followings}
+
+            page_data = data.get("data", {})
+            total = page_data.get("total", 0)
+            page_list = page_data.get("list", [])
+
+            for f in page_list:
+                all_followings.append({
+                    "mid": f.get("mid"),
+                    "name": f.get("uname", ""),
+                    "sign": f.get("sign", ""),
+                })
+
+            # B站关注接口上限500页（ps=50时最多25000条），防止无限循环
+            if len(page_list) < ps or page >= 500:
+                break
+            page += 1
+            await asyncio.sleep(0.5)
+
+        return {"total": total, "list": all_followings}

@@ -8,7 +8,7 @@ from typing import Optional
 
 from fastapi import FastAPI, Query, Header, HTTPException, Depends
 from pydantic import BaseModel
-from sqlalchemy import select, func, desc
+from sqlalchemy import select, func, desc, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import get_config, get_env
@@ -19,6 +19,13 @@ from src.models import (
     FetchWatermark, DailyDigest, ApiUser,
 )
 from src.fetcher import run_daily_fetch, run_fetch_only, run_backfill, _get_enabled_bloggers, _generate_digest
+
+
+# ------------------------------------------------------------------
+# Task mutex flags — prevent overlapping background tasks
+# ------------------------------------------------------------------
+_fetch_task_running = False
+_backfill_task_running = False
 
 
 # ------------------------------------------------------------------
@@ -55,8 +62,8 @@ def _start_scheduler():
         scheduler.add_job(_scheduled_fetch, CronTrigger(minute=parts[0], hour=parts[1]))
         print(f"[scheduler] 抓取任务2: {fetch_cron_2}")
 
-        # 22:00 汇总锁定
-        digest_cron = scheduler_cfg.get("digest_cron", "0 22 * * *")
+        # 22:30 汇总锁定（给21:00抓取留缓冲）
+        digest_cron = scheduler_cfg.get("digest_cron", "30 22 * * *")
         parts = digest_cron.split()
         scheduler.add_job(_scheduled_digest, CronTrigger(minute=parts[0], hour=parts[1]))
         print(f"[scheduler] 汇总任务: {digest_cron}")
@@ -220,7 +227,10 @@ async def sync_add_bloggers(
     names: str = Query("", description="逗号分隔的用户名列表（与mids一一对应）"),
 ):
     """从同步结果中批量添加博主。mids和names逗号分隔，一一对应。"""
-    mid_list = [int(m.strip()) for m in mids.split(",") if m.strip()]
+    try:
+        mid_list = [int(m.strip()) for m in mids.split(",") if m.strip()]
+    except ValueError:
+        raise HTTPException(400, "mids参数格式错误，应为逗号分隔的数字")
     name_list = [n.strip() for n in names.split(",") if n.strip()]
     if not mid_list:
         raise HTTPException(400, "mids不能为空")
@@ -469,13 +479,14 @@ async def list_dynamics(
 async def get_feed(
     limit: int = Query(20, ge=1, le=100),
     before: Optional[float] = None,
+    before_id: Optional[str] = None,
 ):
-    """时间线（视频+动态混合）。"""
+    """时间线（视频+动态混合）。支持时间+ID复合游标分页。"""
     async with async_session() as session:
         # 只返回启用博主的内容
         enabled_mids = select(Blogger.mid).where(Blogger.enabled == True)
 
-        # Videos
+        # Videos — 多取一条用于判断has_more
         v_stmt = (
             select(Video, Summary)
             .outerjoin(Summary, Video.bvid == Summary.bvid)
@@ -483,14 +494,14 @@ async def get_feed(
         )
         if before:
             v_stmt = v_stmt.where(Video.publish_time < datetime.fromtimestamp(before))
-        v_stmt = v_stmt.order_by(desc(Video.publish_time)).limit(limit)
+        v_stmt = v_stmt.order_by(desc(Video.publish_time)).limit(limit + 1)
         videos = (await session.execute(v_stmt)).all()
 
-        # Dynamics
-        d_stmt = select(Dynamic)
+        # Dynamics — 只返回启用博主的，多取一条
+        d_stmt = select(Dynamic).where(Dynamic.mid.in_(enabled_mids))
         if before:
             d_stmt = d_stmt.where(Dynamic.publish_time < datetime.fromtimestamp(before))
-        d_stmt = d_stmt.order_by(desc(Dynamic.publish_time)).limit(limit)
+        d_stmt = d_stmt.order_by(desc(Dynamic.publish_time)).limit(limit + 1)
         dynamics = (await session.execute(d_stmt)).scalars().all()
 
         # Merge and sort
@@ -517,9 +528,27 @@ async def get_feed(
             })
 
         feed.sort(key=lambda x: x.get("publish_time", "") or "", reverse=True)
-        total = len(feed)
-        has_more = total > limit
-        return {"code": 0, "data": {"items": feed[:limit], "total": total, "has_more": has_more}}
+        has_more = len(feed) > limit
+        items = feed[:limit]
+
+        # 生成下一页游标（最后一条的发布时间）
+        next_cursor = None
+        if items and has_more:
+            last = items[-1]
+            next_cursor = {
+                "before": datetime.fromisoformat(last["publish_time"]).timestamp()
+                        if last.get("publish_time") else None,
+            }
+
+        return {
+            "code": 0,
+            "data": {
+                "items": items,
+                "total": len(feed),
+                "has_more": has_more,
+                "cursor": next_cursor,
+            },
+        }
 
 
 @app.get("/api/daily", dependencies=[Depends(require_api_key)])
@@ -553,7 +582,18 @@ async def get_daily_digest(date_str: str):
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok"}
+    db_ok = False
+    try:
+        async with async_session() as session:
+            await session.execute(text("SELECT 1"))
+            db_ok = True
+    except Exception as e:
+        print(f"[health] DB check failed: {e}")
+
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "db": "connected" if db_ok else "disconnected",
+    }
 
 
 @app.get("/api/status", dependencies=[Depends(require_api_key)])
@@ -596,11 +636,18 @@ async def trigger_fetch():
 
 
 async def _run_fetch_task():
+    global _fetch_task_running
+    if _fetch_task_running:
+        print("[trigger] 抓取任务已在运行，跳过")
+        return
+    _fetch_task_running = True
     try:
         result = await run_fetch_only()
         print(f"[trigger] 抓取完成: {result}")
     except Exception as e:
         print(f"[trigger] 抓取失败: {e}")
+    finally:
+        _fetch_task_running = False
 
 
 class BackfillRequest(BaseModel):
@@ -616,6 +663,11 @@ async def trigger_backfill(req: BackfillRequest):
 
 
 async def _run_backfill_task(mid: int = None, since: str = "2026-07-01"):
+    global _backfill_task_running
+    if _backfill_task_running:
+        print("[backfill] 补抓任务已在运行，跳过")
+        return
+    _backfill_task_running = True
     cfg = get_config()
     cap = cfg.get("data", {}).get("backfill_cap", 20)
     try:
@@ -623,12 +675,14 @@ async def _run_backfill_task(mid: int = None, since: str = "2026-07-01"):
             result = await run_backfill(mid, since, cap)
             print(f"[backfill] 完成: {result}")
         else:
-            bloggers = cfg.get("bloggers", [])
+            bloggers = await _get_enabled_bloggers()
             for b in bloggers:
                 result = await run_backfill(b["mid"], since, cap)
                 print(f"[backfill] {b.get('name', b['mid'])}: {result}")
     except Exception as e:
         print(f"[backfill] 失败: {e}")
+    finally:
+        _backfill_task_running = False
 
 
 @app.post("/api/transcripts/retry", dependencies=[Depends(require_api_key)])
@@ -690,7 +744,8 @@ async def _retry_transcripts_task():
                     print(f"[retry] ✅ {video.bvid}: {result['source']} ({len(text)} chars)")
 
                     # 重新分析
-                    comments = await client.get_comments(oid=vid_info.get("aid", 0), oid_type=1, count=20)
+                    comments_resp = await client.get_comments(oid=vid_info.get("aid", 0), oid_type=1, count=20)
+                    comments = comments_resp.get("replies", [])
                     danmakus = await client.get_danmaku(cid, max_count=2000)
                     analysis = await analyze_video(video.title, text, comments, danmakus, video.duration or 0)
 

@@ -9,7 +9,7 @@ from typing import Optional
 
 import httpx
 
-from src.bilibili import BiliClient
+from src.bilibili import BiliClient, _run_curl
 from src.config import get_config, get_env
 
 
@@ -27,20 +27,26 @@ async def fetch_transcript(client: BiliClient, bvid: str, cid: int, duration: in
     """
 
     # Layer 1: CC字幕
-    cc_url = await client.get_cc_subtitle(bvid, cid)
-    if cc_url:
-        text = await _download_subtitle(cc_url)
-        if text and len(text) > 50:
-            print(f"[transcript] {bvid}: CC字幕命中 ({len(text)} chars)")
-            return {"source": "cc_subtitle", "text": text, "segments": 1}
+    try:
+        cc_url = await client.get_cc_subtitle(bvid, cid)
+        if cc_url:
+            text = await _download_subtitle(cc_url)
+            if text and len(text) > 50:
+                print(f"[transcript] {bvid}: CC字幕命中 ({len(text)} chars)")
+                return {"source": "cc_subtitle", "text": text, "segments": 1}
+    except Exception as e:
+        print(f"[transcript] {bvid}: CC字幕降级失败: {e}")
 
     # Layer 2: AI中文字幕 (需SESSDATA)
-    ai_url = await client.get_subtitle_url(bvid, cid)
-    if ai_url:
-        text = await _download_subtitle(ai_url)
-        if text and len(text) > 50:
-            print(f"[transcript] {bvid}: ai-zh字幕命中 ({len(text)} chars)")
-            return {"source": "ai_subtitle", "text": text, "segments": 1}
+    try:
+        ai_url = await client.get_subtitle_url(bvid, cid)
+        if ai_url:
+            text = await _download_subtitle(ai_url)
+            if text and len(text) > 50:
+                print(f"[transcript] {bvid}: ai-zh字幕命中 ({len(text)} chars)")
+                return {"source": "ai_subtitle", "text": text, "segments": 1}
+    except Exception as e:
+        print(f"[transcript] {bvid}: AI字幕降级失败: {e}")
 
     # Layer 3: MiMo ASR (切片≤3min)
     print(f"[transcript] {bvid}: 无字幕，降级到ASR")
@@ -52,19 +58,21 @@ async def fetch_transcript(client: BiliClient, bvid: str, cid: int, duration: in
 
 
 async def _download_subtitle(url: str) -> str:
-    """下载字幕JSON并提取纯文本。"""
-    async with httpx.AsyncClient(timeout=15) as http:
-        resp = await http.get(url)
-        if resp.status_code != 200:
+    """下载字幕JSON并提取纯文本。使用curl避免httpx超时中断降级链。"""
+    try:
+        cmd = ["curl", "-s", "--max-time", "15", "-L", url]
+        body, status = await _run_curl(cmd, timeout=20)
+        if status and status != 200:
+            print(f"[transcript] subtitle download HTTP {status}")
             return ""
-        try:
-            data = resp.json()
-            body = data.get("body", [])
-            # Each item: {"from": 0.0, "to": 2.0, "content": "text"}
-            texts = [item.get("content", "") for item in body]
-            return " ".join(texts)
-        except (json.JSONDecodeError, KeyError):
-            return ""
+        data = json.loads(body)
+        segs = data.get("body", [])
+        # Each item: {"from": 0.0, "to": 2.0, "content": "text"}
+        texts = [item.get("content", "") for item in segs]
+        return " ".join(texts)
+    except (TimeoutError, OSError, json.JSONDecodeError, KeyError, ValueError) as e:
+        print(f"[transcript] subtitle download failed: {e}")
+        return ""
 
 
 async def _asr_transcribe(client: BiliClient, bvid: str, cid: int, duration: int) -> Optional[dict]:

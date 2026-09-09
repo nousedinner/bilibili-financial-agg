@@ -256,15 +256,8 @@ class CreateUserRequest(BaseModel):
 
 @app.post("/api/bootstrap")
 async def bootstrap_user(req: CreateUserRequest):
-    """首次启动时创建第一个API用户（仅当无任何用户时可用）。"""
-    async with async_session() as session:
-        count = (await session.execute(select(func.count(ApiUser.id)))).scalar() or 0
-        if count > 0:
-            raise HTTPException(409, "已有用户存在，请使用 /api/users 创建")
-        api_key = secrets.token_urlsafe(32)
-        session.add(ApiUser(username=req.username, api_key=api_key))
-        await session.commit()
-    return {"code": 0, "data": {"username": req.username, "api_key": api_key}}
+    """已禁用：首次部署时创建用户后关闭此端点。"""
+    raise HTTPException(403, "注册接口已关闭，请联系管理员")
 
 
 @app.post("/api/users", dependencies=[Depends(require_api_key)])
@@ -524,7 +517,9 @@ async def get_feed(
             })
 
         feed.sort(key=lambda x: x.get("publish_time", "") or "", reverse=True)
-        return {"code": 0, "data": {"items": feed[:limit]}}
+        total = len(feed)
+        has_more = total > limit
+        return {"code": 0, "data": {"items": feed[:limit], "total": total, "has_more": has_more}}
 
 
 @app.get("/api/daily", dependencies=[Depends(require_api_key)])

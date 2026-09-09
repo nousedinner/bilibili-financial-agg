@@ -2,6 +2,8 @@
 
 import asyncio
 import hashlib
+import json as _json
+import subprocess
 import time
 import urllib.parse
 from datetime import datetime
@@ -54,20 +56,23 @@ class BiliClient:
     # ------------------------------------------------------------------
 
     async def _refresh_wbi_keys(self):
-        """从B站nav接口获取最新的img_key和sub_key。"""
+        """从B站nav接口获取最新的img_key和sub_key。使用 curl 获取。"""
         now = time.time()
         if self._img_key and (now - self._wbi_ts) < 600:  # cache 10min
             return
 
-        headers = {**_HEADERS}
+        cmd = ["curl", "-s", "https://api.bilibili.com/x/web-interface/nav"]
         if self._sessdata:
-            headers["Cookie"] = f"SESSDATA={self._sessdata}"
-
-        resp = await self._client.get(
-            "https://api.bilibili.com/x/web-interface/nav",
-            headers=headers,
-        )
-        data = resp.json()
+            cmd += ["-b", f"SESSDATA={self._sessdata}"]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            data = _json.loads(stdout)
+        except Exception as e:
+            print(f"[bili] WBI keys curl error: {e}")
+            return
         wbi_img = data.get("data", {}).get("wbi_img", {})
         img_url = wbi_img.get("img_url", "")
         sub_url = wbi_img.get("sub_url", "")
@@ -104,32 +109,65 @@ class BiliClient:
     # ------------------------------------------------------------------
 
     async def _get(self, url: str, params: dict = None, signed: bool = True) -> dict:
-        """GET with optional WBI signing and exponential backoff on -412/-352."""
+        """GET with optional WBI signing and exponential backoff on -412/-352.
+
+        使用 subprocess curl 替代 httpx，绕过容器内 httpx 的 TLS 指纹被 B站 412 拦截。
+        """
         if signed and params is not None:
             params = await self.sign_params(params)
 
-        headers = {**_HEADERS}
-        if self._sessdata:
-            headers["Cookie"] = f"SESSDATA={self._sessdata}"
+        # 构建完整 URL
+        if params:
+            separator = "&" if "?" in url else "?"
+            url = url + separator + urllib.parse.urlencode(params)
 
         cfg = get_config().get("limits", {})
         backoff_base = cfg.get("backoff_base_seconds", 10)
 
         for attempt in range(4):
-            resp = await self._client.get(url, params=params, headers=headers)
+            cmd = ["curl", "-s", "-w", "\n%{http_code}"]
+            if self._sessdata:
+                cmd += ["-b", f"SESSDATA={self._sessdata}"]
+            cmd.append(url)
 
-            # Handle non-JSON responses (412 HTML pages etc.)
-            content_type = resp.headers.get("content-type", "")
-            if "json" not in content_type:
-                print(f"[bili] non-JSON response ({resp.status_code}), content-type={content_type[:30]}")
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+                text = stdout.decode("utf-8", errors="replace")
+            except Exception as e:
+                print(f"[bili] curl error: {e}")
+                if attempt < 3:
+                    wait = backoff_base * (2 ** attempt)
+                    await asyncio.sleep(wait)
+                    continue
+                return {"code": -1, "message": f"curl error: {e}"}
+
+            lines = text.rsplit("\n", 1)
+            if len(lines) < 2:
+                if attempt < 3:
+                    wait = backoff_base * (2 ** attempt)
+                    await asyncio.sleep(wait)
+                    continue
+                return {"code": -1, "message": "curl: empty response"}
+
+            try:
+                status_code = int(lines[1].strip())
+            except ValueError:
+                status_code = 0
+
+            try:
+                result = _json.loads(lines[0])
+            except _json.JSONDecodeError:
+                print(f"[bili] non-JSON response ({status_code})")
                 if attempt < 3:
                     wait = backoff_base * (2 ** attempt)
                     print(f"[bili] backoff {wait}s (attempt {attempt+1})")
                     await asyncio.sleep(wait)
                     continue
-                return {"code": -1, "message": f"non-JSON response {resp.status_code}"}
+                return {"code": -1, "message": f"non-JSON response {status_code}"}
 
-            result = resp.json()
             code = result.get("code", 0)
 
             if code == 0:
@@ -177,7 +215,7 @@ class BiliClient:
     # ------------------------------------------------------------------
 
     async def get_dynamics(self, mid: int, offset: str = "") -> dict:
-        """获取用户动态列表。使用桌面端endpoint + buvid3防412。
+        """获取用户动态列表。使用桌面端endpoint + buvid3防412。使用 curl 获取。
 
         Returns: {"items": [...], "has_more": bool, "offset": str}
         """
@@ -189,33 +227,54 @@ class BiliClient:
             "offset": offset,
             "timezone_offset": "-480",
         }
+        query = urllib.parse.urlencode(params)
+        url = f"https://api.bilibili.com/x/polymer/web-dynamic/desktop/v1/feed/space?{query}"
 
-        # Use desktop endpoint (less strict than mobile)
-        headers = {**_HEADERS}
-        if self._sessdata:
-            headers["Cookie"] = f"SESSDATA={self._sessdata}; buvid3={self._buvid3}"
+        cmd = ["curl", "-s", "-w", "\n%{http_code}"]
+        cookie = f"SESSDATA={self._sessdata}" if self._sessdata else ""
+        if self._buvid3:
+            cookie = f"{cookie}; buvid3={self._buvid3}" if cookie else f"buvid3={self._buvid3}"
+        if cookie:
+            cmd += ["-b", cookie]
+        cmd.append(url)
 
-        resp = await self._client.get(
-            "https://api.bilibili.com/x/polymer/web-dynamic/desktop/v1/feed/space",
-            params=params,
-            headers=headers,
-        )
-        if resp.status_code != 200:
-            print(f"[bili] dynamics {resp.status_code}")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+            text = stdout.decode("utf-8", errors="replace")
+        except Exception as e:
+            print(f"[bili] dynamics curl error: {e}")
             return {}
-        result = resp.json()
+
+        lines = text.rsplit("\n", 1)
+        if len(lines) < 2:
+            return {}
+        try:
+            status_code = int(lines[1].strip())
+        except ValueError:
+            status_code = 0
+        if status_code != 200:
+            print(f"[bili] dynamics {status_code}")
+            return {}
+        try:
+            result = _json.loads(lines[0])
+        except _json.JSONDecodeError:
+            return {}
         return result.get("data", {})
 
     async def _ensure_buvid3(self):
-        """获取buvid3设备标识cookie。"""
+        """获取buvid3设备标识cookie。使用 curl 获取。"""
         if self._buvid3:
             return
         try:
-            resp = await self._client.get(
-                "https://api.bilibili.com/x/frontend/finger/spi",
-                headers=_HEADERS,
+            proc = await asyncio.create_subprocess_exec(
+                "curl", "-s", "https://api.bilibili.com/x/frontend/finger/spi",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
-            data = resp.json().get("data", {})
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            data = _json.loads(stdout).get("data", {})
             self._buvid3 = data.get("b_3", "")
         except Exception:
             self._buvid3 = ""
@@ -225,21 +284,29 @@ class BiliClient:
     # ------------------------------------------------------------------
 
     async def get_subtitle_url(self, bvid: str, cid: int) -> Optional[str]:
-        """获取AI中文字幕URL（需SESSDATA）。
+        """获取AI中文字幕URL（需SESSDATA + WBI签名）。使用 curl 获取。
 
         Returns subtitle URL or None.
         """
         if not self._sessdata:
             return None
 
-        headers = {**_HEADERS, "Cookie": f"SESSDATA={self._sessdata}"}
+        # 需要WBI签名
         params = {"bvid": bvid, "cid": cid}
-        resp = await self._client.get(
-            "https://api.bilibili.com/x/player/wbi/v2",
-            params=params,
-            headers=headers,
-        )
-        data = resp.json().get("data", {})
+        signed_params = await self.sign_params(params)
+        query = "&".join([f"{k}={v}" for k, v in signed_params.items()])
+        url = f"https://api.bilibili.com/x/player/wbi/v2?{query}"
+        
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "curl", "-s", "-b", f"SESSDATA={self._sessdata}", url,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            data = _json.loads(stdout).get("data", {})
+        except Exception as e:
+            print(f"[bili] AI字幕 curl error {bvid}: {e}")
+            return None
         subtitles = data.get("subtitle", {}).get("subtitles", [])
 
         # Prefer ai-zh, then any Chinese
@@ -252,17 +319,21 @@ class BiliClient:
         return None
 
     async def get_cc_subtitle(self, bvid: str, cid: int) -> Optional[str]:
-        """获取CC字幕URL（不需要cookie）。
+        """获取CC字幕URL（不需要cookie）。使用 curl 获取。
 
         Returns subtitle URL or None.
         """
-        params = {"bvid": bvid, "cid": cid}
-        resp = await self._client.get(
-            "https://api.bilibili.com/x/player/v2",
-            params=params,
-            headers=_HEADERS,
-        )
-        data = resp.json().get("data", {})
+        url = f"https://api.bilibili.com/x/player/v2?bvid={bvid}&cid={cid}"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "curl", "-s", url,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            data = _json.loads(stdout).get("data", {})
+        except Exception as e:
+            print(f"[bili] CC字幕 curl error {bvid}: {e}")
+            return None
         subtitles = data.get("subtitle", {}).get("subtitles", [])
 
         for sub in subtitles:
@@ -338,15 +409,19 @@ class BiliClient:
     # ------------------------------------------------------------------
 
     async def get_danmaku(self, cid: int, max_count: int = 2000) -> list:
-        """获取弹幕列表（protobuf接口，返回文本列表）。"""
-        headers = {**_HEADERS}
-        resp = await self._client.get(
-            f"https://api.bilibili.com/x/v1/dm/list.so?oid={cid}",
-            headers=headers,
-        )
-        # 弹幕返回XML/protobuf，解析XML格式
+        """获取弹幕列表（protobuf接口，返回文本列表）。使用 curl 获取。"""
         import re
-        text = resp.content.decode("utf-8", errors="ignore")
+        url = f"https://api.bilibili.com/x/v1/dm/list.so?oid={cid}"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "curl", "-s", url,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+            text = stdout.decode("utf-8", errors="ignore")
+        except Exception as e:
+            print(f"[bili] danmaku curl error: {e}")
+            return []
         danmakus = re.findall(r'<d [^>]*>(.*?)</d>', text)
         if len(danmakus) > max_count:
             import random
@@ -358,19 +433,24 @@ class BiliClient:
     # ------------------------------------------------------------------
 
     async def validate_sessdata(self) -> dict:
-        """验证SESSDATA是否有效。
+        """验证SESSDATA是否有效。使用 curl 获取。
 
         Returns: {"valid": bool, "username": str, "expire_date": str}
         """
         if not self._sessdata:
             return {"valid": False, "username": "", "expire_date": ""}
 
-        headers = {**_HEADERS, "Cookie": f"SESSDATA={self._sessdata}"}
-        resp = await self._client.get(
-            "https://api.bilibili.com/x/web-interface/nav",
-            headers=headers,
-        )
-        data = resp.json().get("data", {})
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "curl", "-s", "-b", f"SESSDATA={self._sessdata}",
+                "https://api.bilibili.com/x/web-interface/nav",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            data = _json.loads(stdout).get("data", {})
+        except Exception as e:
+            print(f"[bili] validate_sessdata curl error: {e}")
+            return {"valid": False, "username": "", "expire_date": ""}
         is_login = data.get("isLogin", False)
         uname = data.get("uname", "")
 
@@ -424,20 +504,25 @@ class BiliClient:
         return None
 
     async def get_followings(self, vmid: int, pn: int = 1, ps: int = 50) -> dict:
-        """获取用户关注列表（需要SESSDATA，且SESSDATA账号与vmid一致或为公开关注）。
+        """获取用户关注列表（需要SESSDATA）。使用 curl 获取。
 
         Returns: {"total": int, "list": [{"mid": int, "name": str, "sign": str}, ...]}
         """
-        headers = {**_HEADERS}
+        url = f"https://api.bilibili.com/x/relation/followings?vmid={vmid}&pn={pn}&ps={ps}&order=desc"
+        cmd = ["curl", "-s"]
         if self._sessdata:
-            headers["Cookie"] = f"SESSDATA={self._sessdata}"
+            cmd += ["-b", f"SESSDATA={self._sessdata}"]
+        cmd.append(url)
 
-        resp = await self._client.get(
-            "https://api.bilibili.com/x/relation/followings",
-            params={"vmid": vmid, "pn": pn, "ps": ps, "order": "desc"},
-            headers=headers,
-        )
-        data = resp.json()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            data = _json.loads(stdout)
+        except Exception as e:
+            print(f"[bili] get_followings curl error: {e}")
+            return {"total": 0, "list": []}
         if data.get("code") != 0:
             print(f"[bili] get_followings failed: code={data.get('code')}, msg={data.get('message')}")
             return {"total": 0, "list": []}

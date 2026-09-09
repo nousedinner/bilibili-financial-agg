@@ -24,6 +24,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.finapp.appb.data.api.Blogger
 import com.finapp.appb.data.api.SyncFollowing
+import com.finapp.appb.ui.BiliLink
 import com.finapp.appb.ui.friendlyErrorMessage
 import com.finapp.appb.ui.theme.*
 import com.finapp.appb.viewmodel.BloggerViewModel
@@ -306,8 +307,11 @@ private fun AddBloggerDialog(onDismiss: () -> Unit, onConfirm: (String) -> Unit)
 
 @Composable
 private fun BloggerCard(blogger: Blogger, onDelete: () -> Unit) {
+    val context = LocalContext.current
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { BiliLink.openSpace(context, blogger.mid) },
         shape = RoundedCornerShape(12.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {

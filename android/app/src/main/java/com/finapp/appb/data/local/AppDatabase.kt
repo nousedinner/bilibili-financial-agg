@@ -6,13 +6,20 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 
 @Database(
-    entities = [FeedCacheEntity::class, VideoDetailCacheEntity::class],
-    version = 2,
+    entities = [
+        FeedCacheEntity::class,
+        VideoDetailCacheEntity::class,
+        BloggerCacheEntity::class,
+        DailyCacheEntity::class
+    ],
+    version = 3,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
     abstract fun feedCacheDao(): FeedCacheDao
     abstract fun videoDetailCacheDao(): VideoDetailCacheDao
+    abstract fun bloggerCacheDao(): BloggerCacheDao
+    abstract fun dailyCacheDao(): DailyCacheDao
 
     companion object {
         @Volatile

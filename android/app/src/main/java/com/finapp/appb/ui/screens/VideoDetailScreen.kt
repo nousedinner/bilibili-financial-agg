@@ -2,8 +2,6 @@
 
 package com.finapp.appb.ui.screens
 
-import android.content.Intent
-import android.net.Uri
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.FlowRow
@@ -23,6 +21,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.finapp.appb.ui.BiliLink
 import com.finapp.appb.ui.FormatUtils
 import com.finapp.appb.ui.components.SentimentBadge
 import com.finapp.appb.ui.components.SkeletonDetail
@@ -58,17 +57,7 @@ fun VideoDetailScreen(
                     IconButton(onClick = { viewModel.loadDetail(bvid) }) {
                         Icon(Icons.Default.Refresh, "刷新")
                     }
-                    IconButton(onClick = {
-                        try {
-                            // 优先用B站APP打开
-                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse("bilibili://video/$bvid"))
-                            intent.setPackage("tv.danmaku.bili")
-                            context.startActivity(intent)
-                        } catch (_: Exception) {
-                            // 没装B站APP，fallback到浏览器
-                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.bilibili.com/video/$bvid")))
-                        }
-                    }) {
+                    IconButton(onClick = { BiliLink.openVideo(context, bvid) }) {
                         Icon(Icons.Default.OpenInBrowser, "在B站打开")
                     }
                 }

@@ -37,6 +37,8 @@ class FinRepository(private val prefs: ConnectionStore, private val cache: Conte
     private var bloggersAt = 0L
     private val feedDao = cache.feed
     private val detailDao = cache.details
+    private val bloggerDao = cache.bloggers
+    private val dailyDao = cache.daily
     private val gson = Gson()
     private val maxAge = TimeUnit.DAYS.toMillis(7)
 
@@ -59,7 +61,7 @@ class FinRepository(private val prefs: ConnectionStore, private val cache: Conte
     private suspend fun clearCache() {
         cachedBloggers = null
         bloggersAt = 0
-        cache.transaction { feedDao.clear(); detailDao.clear() }
+        cache.transaction { feedDao.clear(); detailDao.clear(); bloggerDao.clear(); dailyDao.clear() }
     }
 
     private suspend fun initialized(): Session? {
@@ -81,6 +83,8 @@ class FinRepository(private val prefs: ConnectionStore, private val cache: Conte
         current = candidate
         feedDao.deleteOlderThan(System.currentTimeMillis() - maxAge)
         detailDao.deleteOlderThan(System.currentTimeMillis() - maxAge)
+        bloggerDao.deleteOlderThan(System.currentTimeMillis() - maxAge)
+        dailyDao.deleteOlderThan(System.currentTimeMillis() - maxAge)
         return candidate
     }
 
@@ -157,6 +161,31 @@ class FinRepository(private val prefs: ConnectionStore, private val cache: Conte
         }
     }
 
+    // ── Feed: Cache-First ──
+
+    /** Read feed from Room cache. Returns empty list if no cache. */
+    suspend fun getCachedFeed(): List<FeedItem> = feedDao.getAll()
+        .filter { it.cachedAt >= System.currentTimeMillis() - maxAge }
+        .map { e ->
+            val id = e.bvid.substringAfter(':')
+            FeedItem(e.type, id.takeIf { e.type == "video" }, id.takeIf { e.type == "dynamic" }, e.title,
+                e.sentiment, e.summary, e.publishTime, e.mid, e.viewCount, e.duration, e.sentimentScore)
+        }
+
+    /** Fetch feed from network and update Room cache. */
+    suspend fun refreshFeed(): Result<FeedPageData> =
+        request(call = { it.getFeedPage(null, 50, null) }, save = { data ->
+            cache.transaction {
+                feedDao.clear()
+                feedDao.insertAll(data.items.mapNotNull { item -> item.stableId()?.let { id ->
+                    FeedCacheEntity(id, item.type, item.title, item.summary, item.sentiment, item.sentimentScore,
+                        item.publishTime, item.mid, item.viewCount, item.duration)
+                } })
+                feedDao.deleteOlderThan(System.currentTimeMillis() - maxAge)
+                feedDao.trim()
+            }
+        })
+
     suspend fun getFeedPage(before: Double? = null, limit: Int = 50, beforeId: String? = null): Result<FeedPageData> =
         request(call = { it.getFeedPage(before, limit, beforeId) }, save = { data ->
             cache.transaction {
@@ -168,40 +197,99 @@ class FinRepository(private val prefs: ConnectionStore, private val cache: Conte
                 feedDao.deleteOlderThan(System.currentTimeMillis() - maxAge)
                 feedDao.trim()
             }
-        }, fallback = if (before == null) ({
-            val items = feedDao.getAll().filter { it.cachedAt >= System.currentTimeMillis() - maxAge }.map { e ->
-                val id = e.bvid.substringAfter(':')
-                FeedItem(e.type, id.takeIf { e.type == "video" }, id.takeIf { e.type == "dynamic" }, e.title,
-                    e.sentiment, e.summary, e.publishTime, e.mid, e.viewCount, e.duration, e.sentimentScore)
-            }
-            if (items.isEmpty()) null else FeedPageData(items, items.size, false, fromCache = true)
-        }) else null)
+        })
 
-    suspend fun getBloggers(forceRefresh: Boolean = false): Result<List<Blogger>> {
-        try {
-            mutex.withLock {
-                initialized()
-                if (!forceRefresh && cachedBloggers != null && System.currentTimeMillis() - bloggersAt < 60_000)
-                    return Result.success(cachedBloggers!!)
-            }
-        } catch (e: CancellationException) { throw e } catch (e: Exception) { return Result.failure(e) }
-        return request({ it.getBloggers() }, save = { cachedBloggers = it; bloggersAt = System.currentTimeMillis() })
+    // ── Bloggers: Cache-First + Room persistence ──
+
+    /** Read bloggers from Room cache. */
+    suspend fun getCachedBloggers(): List<Blogger> {
+        // Check in-memory cache first (60s)
+        if (cachedBloggers != null && System.currentTimeMillis() - bloggersAt < 60_000)
+            return cachedBloggers!!
+        // Check Room
+        val dbBloggers = bloggerDao.getAll()
+        if (dbBloggers.isNotEmpty()) {
+            val result = dbBloggers.map { Blogger(it.mid, it.name, it.tags?.let { parseTags(it) }, it.addedAt ?: "") }
+            cachedBloggers = result
+            bloggersAt = System.currentTimeMillis()
+            return result
+        }
+        return emptyList()
     }
 
+    /** Fetch bloggers from network and update Room cache. */
+    suspend fun refreshBloggers(): Result<List<Blogger>> =
+        request({ it.getBloggers() }, save = { bloggers ->
+            cachedBloggers = bloggers
+            bloggersAt = System.currentTimeMillis()
+            cache.transaction {
+                bloggerDao.clear()
+                bloggerDao.insertAll(bloggers.map { b ->
+                    BloggerCacheEntity(b.mid, b.name, b.tags?.let { gson.toJson(it) }, b.addedAt)
+                })
+            }
+        })
+
+    suspend fun getBloggers(forceRefresh: Boolean = false): Result<List<Blogger>> {
+        if (!forceRefresh) {
+            val cached = try { getCachedBloggers() } catch (_: Exception) { emptyList() }
+            if (cached.isNotEmpty()) return Result.success(cached)
+        }
+        return refreshBloggers()
+    }
+
+    private fun parseTags(json: String): List<String>? = try {
+        gson.fromJson(json, Array<String>::class.java)?.toList()
+    } catch (_: Exception) { null }
+
+    // ── Daily: Cache-First + Detail pre-loading ──
+
+    suspend fun getDailyDates(): Result<List<String>> = request({ it.getDailyDates() }).map { it.dates }
+
+    /** Read daily detail from Room cache. */
+    suspend fun getCachedDailyDetail(date: String): DailyContent? = try {
+        dailyDao.getByDate(date)?.let { gson.fromJson(it.json, DailyContent::class.java) }
+    } catch (_: Exception) { null }
+
+    /** Fetch daily detail from network and update Room cache. */
+    suspend fun refreshDailyDetail(date: String): Result<DailyContent> =
+        request({ it.getDailyDetail(date) }, save = { content ->
+            cache.transaction { dailyDao.insert(DailyCacheEntity(date, gson.toJson(content))) }
+        })
+
+    suspend fun getDailyDetail(date: String): Result<DailyContent> {
+        val cached = try { getCachedDailyDetail(date) } catch (_: Exception) { null }
+        if (cached != null) return Result.success(cached)
+        return refreshDailyDetail(date)
+    }
+
+    /** Pre-load all daily details into Room cache. Call from ViewModel init. */
+    suspend fun preloadDailyDetails(dates: List<String>) {
+        for (date in dates) {
+            try {
+                val existing = dailyDao.getByDate(date)
+                if (existing == null) refreshDailyDetail(date)
+            } catch (_: Exception) {}
+        }
+    }
+
+    /** Read all cached daily details from Room. */
+    suspend fun getAllCachedDailyDetails(): List<DailyContent> = dailyDao.getAll().mapNotNull { try {
+        gson.fromJson(it.json, DailyContent::class.java)
+    } catch (_: Exception) { null } }
+
+    // ── Other endpoints ──
+
     private suspend fun invalidateContent() {
-        // Reject reads started before a blogger was disabled or added.
         current?.client?.dispatcher?.cancelAll()
         current = current?.copy()
         clearCache()
     }
 
-    suspend fun preloadBloggers() { getBloggers() }
     suspend fun addBloggerByName(name: String) = request({ it.addBloggerByName(name) }, save = { invalidateContent() })
     suspend fun deleteBlogger(mid: Long) = request({ it.deleteBlogger(mid) }, save = { invalidateContent() })
     suspend fun batchAddBloggers(bloggers: List<BloggerInput>) = request({ it.batchAddBloggers(bloggers) }, save = { invalidateContent() })
     suspend fun syncBloggers() = request({ it.syncBloggers() })
-    suspend fun getDailyDates(): Result<List<String>> = request({ it.getDailyDates() }).map { it.dates }
-    suspend fun getDailyDetail(date: String) = request({ it.getDailyDetail(date) })
     suspend fun getStatus() = request({ it.status() })
     suspend fun triggerFetch(): Result<String> = request({ it.triggerFetch() }).map { it.message }
 

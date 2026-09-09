@@ -47,15 +47,23 @@ class FeedViewModel(application: Application) : AndroidViewModel(application) {
         cursor = null
         job = viewModelScope.launch {
             try {
-                val result = repo.getFeedPage()
+                // 1. Show cache immediately
+                val cached = try { repo.getCachedFeed() } catch (_: Exception) { emptyList() }
+                if (cached.isNotEmpty()) {
+                    _items.value = cached
+                    _isLoading.value = false
+                    _isRefreshing.value = true
+                }
+                // 2. Fetch from network
+                val result = repo.refreshFeed()
                 ensureActive()
                 if (token != generation) return@launch
                 result.onSuccess { data ->
                     _items.value = data.items
                     cursor = data.nextCursor
                     hasMore = data.hasMore && cursor?.before != null && cursor?.beforeId != null
-                    if (data.fromCache) _error.value = "网络暂不可用，当前显示缓存内容；下拉可重试"
                 }.onFailure { failed(it) }
+                // 3. Load blogger names
                 repo.getBloggers().onSuccess { _bloggerNames.value = it.associate { b -> b.mid to b.name } }
             } finally {
                 if (token == generation) { _isLoading.value = false; _isRefreshing.value = false }

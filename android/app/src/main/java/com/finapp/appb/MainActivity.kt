@@ -137,7 +137,27 @@ fun FinAppRoot() {
 
             composable(Screen.DAILY.route) {
                 val dailyVm: DailyViewModel = viewModel()
-                DailyScreen(viewModel = dailyVm)
+                DailyScreen(
+                    viewModel = dailyVm,
+                    onDateClick = { date -> navController.navigate("daily/$date") }
+                )
+            }
+
+            composable(
+                route = Screen.DAILY_DETAIL.route,
+                arguments = listOf(navArgument("date") { type = NavType.StringType }),
+                enterTransition = { fadeIn(animationSpec = tween(150)) },
+                exitTransition = { fadeOut(animationSpec = tween(150)) },
+                popEnterTransition = { fadeIn(animationSpec = tween(150)) },
+                popExitTransition = { fadeOut(animationSpec = tween(150)) }
+            ) { backStackEntry ->
+                val date = backStackEntry.arguments?.getString("date") ?: return@composable
+                val detailVm: DailyDetailViewModel = viewModel()
+                DailyDetailScreen(
+                    date = date,
+                    viewModel = detailVm,
+                    onBack = { navController.popBackStack() }
+                )
             }
 
             composable(Screen.SETTINGS.route) {

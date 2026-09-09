@@ -44,9 +44,18 @@ class BloggerViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             _isLoading.value = true
             _error.value = null
-            val result = repo.getBloggers()
+            // 1. Show cache immediately
+            val cached = try { repo.getCachedBloggers() } catch (_: Exception) { emptyList() }
+            if (cached.isNotEmpty()) {
+                _bloggers.value = cached
+                _isLoading.value = false
+            }
+            // 2. Fetch from network
+            val result = repo.refreshBloggers()
             result.onSuccess { _bloggers.value = it }
-                .onFailure { _error.value = it.message ?: "加载失败" }
+                .onFailure {
+                    if (cached.isEmpty()) _error.value = it.message ?: "加载失败"
+                }
             _isLoading.value = false
         }
     }
@@ -55,7 +64,7 @@ class BloggerViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             _isLoading.value = true
             _error.value = null
-            val result = repo.getBloggers(forceRefresh = true)
+            val result = repo.refreshBloggers()
             result.onSuccess { _bloggers.value = it }
                 .onFailure {
                     val msg = it.message ?: "加载失败"

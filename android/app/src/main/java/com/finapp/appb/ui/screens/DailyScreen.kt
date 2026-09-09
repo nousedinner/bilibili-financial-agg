@@ -1,7 +1,5 @@
 package com.finapp.appb.ui.screens
 
-import androidx.activity.compose.BackHandler
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -22,18 +20,13 @@ import com.finapp.appb.viewmodel.DailyViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DailyScreen(viewModel: DailyViewModel) {
+fun DailyScreen(
+    viewModel: DailyViewModel,
+    onDateClick: (String) -> Unit
+) {
     val summaries by viewModel.summaries.collectAsState()
     val isLoading by viewModel.isLoading.collectAsState()
     val error by viewModel.error.collectAsState()
-    val detailLoading by viewModel.detailLoading.collectAsState()
-    val detailError by viewModel.detailError.collectAsState()
-    val expandedDate by viewModel.expandedDate.collectAsState()
-
-    // 返回键拦截：有展开的卡片时先收起，否则放行
-    BackHandler(enabled = expandedDate != null) {
-        viewModel.toggleExpand(expandedDate ?: "")
-    }
 
     Scaffold(
         topBar = {
@@ -88,11 +81,7 @@ fun DailyScreen(viewModel: DailyViewModel) {
                 items(summaries, key = { it.date ?: "" }) { item ->
                     DailyCard(
                         item = item,
-                        isExpanded = expandedDate == item.date,
-                        isLoading = detailLoading == item.date,
-                        error = detailError.takeIf { expandedDate == item.date },
-                        onRetry = { viewModel.retryDetail() },
-                        onClick = { viewModel.toggleExpand(item.date ?: "") }
+                        onClick = { item.date?.let { onDateClick(it) } }
                     )
                 }
             }
@@ -103,15 +92,10 @@ fun DailyScreen(viewModel: DailyViewModel) {
 @Composable
 private fun DailyCard(
     item: DailyContent,
-    isExpanded: Boolean,
-    isLoading: Boolean,
-    error: String?,
-    onRetry: () -> Unit,
     onClick: () -> Unit
 ) {
-    val sentiment = com.finapp.appb.ui.components.Sentiment.fromString(item.overallSentiment ?: "neutral")
+    val sentiment = com.finapp.appb.ui.components.Sentiment.fromString(item.overallSentiment)
     val score = item.sentimentScore ?: 0.0
-    val bloggers = item.bloggers?.joinToString("、") ?: ""
     val summary = item.summary ?: ""
 
     Card(
@@ -147,23 +131,7 @@ private fun DailyCard(
                 }
             }
 
-            // 博主（API 数据不完整，暂不显示）
-            // if (bloggers.isNotEmpty()) {
-            //     Text(
-            //         text = "👤 $bloggers",
-            //         fontSize = 13.sp,
-            //         color = TextSecondary,
-            //         modifier = Modifier.padding(top = 4.dp)
-            //     )
-            // }
-
-            if (item.summary == null && !isExpanded) Text("点击加载详情", color = TextSecondary)
-            if (isExpanded && isLoading) LinearProgressIndicator(Modifier.fillMaxWidth().padding(top = 8.dp))
-            if (isExpanded && error != null) {
-                Text(error, color = MaterialTheme.colorScheme.error)
-                TextButton(onClick = onRetry) { Text("重试详情") }
-            }
-            // Only loaded data has a sentiment score.
+            // 情绪分数
             if (item.sentimentScore != null) Text(
                 text = "情绪分数: ${String.format("%.2f", score)}",
                 fontSize = 12.sp,
@@ -171,53 +139,22 @@ private fun DailyCard(
                 modifier = Modifier.padding(top = 2.dp)
             )
 
-            // 摘要（截断）
+            // 摘要（截断3行）
             if (summary.isNotEmpty()) {
                 Text(
                     text = summary,
                     fontSize = 14.sp,
                     color = TextPrimary,
-                    maxLines = if (isExpanded) Int.MAX_VALUE else 3,
+                    maxLines = 3,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.padding(top = 8.dp),
                     lineHeight = 20.sp
                 )
             }
 
-            // 展开详情
-            AnimatedVisibility(visible = isExpanded) {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    // 共识
-                    val consensus = item.consensus ?: emptyList()
-                    if (consensus.isNotEmpty()) {
-                        DetailSection(title = "🤝 共识观点") {
-                            consensus.forEach { Text("• $it", fontSize = 14.sp, lineHeight = 20.sp) }
-                        }
-                    }
-
-                    // 关键话题
-                    val keyTopics = item.keyTopics ?: emptyList()
-                    if (keyTopics.isNotEmpty()) {
-                        DetailSection(title = "📌 关键话题") {
-                            keyTopics.forEach { Text("• $it", fontSize = 14.sp, lineHeight = 20.sp) }
-                        }
-                    }
-
-                    // 分歧点
-                    val differences = item.differences ?: emptyList()
-                    if (differences.isNotEmpty()) {
-                        DetailSection(title = "⚡ 分歧观点", titleColor = WarningRed) {
-                            differences.forEach {
-                                Text("• $it", fontSize = 14.sp, color = WarningRed, lineHeight = 20.sp)
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 展开/收起提示
+            // 查看详情提示
             Text(
-                text = if (isExpanded) "收起 ▲" else "展开详情 ▼",
+                text = "查看详情 →",
                 fontSize = 12.sp,
                 color = Primary,
                 modifier = Modifier
@@ -225,18 +162,5 @@ private fun DailyCard(
                     .padding(top = 8.dp),
             )
         }
-    }
-}
-
-@Composable
-private fun DetailSection(
-    title: String,
-    titleColor: androidx.compose.ui.graphics.Color = TextPrimary,
-    content: @Composable ColumnScope.() -> Unit
-) {
-    Column(modifier = Modifier.padding(top = 4.dp)) {
-        Text(title, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = titleColor)
-        Spacer(modifier = Modifier.height(6.dp))
-        content()
     }
 }

@@ -6,5 +6,6 @@ enum class Screen(val route: String) {
     VIDEO_DETAIL("video/{bvid}"),
     BLOGGERS("bloggers"),
     DAILY("daily"),
+    DAILY_DETAIL("daily/{date}"),
     SETTINGS("settings")
 }

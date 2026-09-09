@@ -105,9 +105,16 @@ fun VideoDetailScreen(
                     }
 
                     // AI Analysis
-                    if (summaryText.isNotBlank()) {
+                    val hasAnyAnalysis = summaryText.isNotBlank() ||
+                        keyPoints.isNotEmpty() || riskWarnings.isNotEmpty() ||
+                        dataCitations.isNotEmpty() || tags.isNotEmpty() ||
+                        d.comments != null || d.danmaku != null
+
+                    if (hasAnyAnalysis) {
                         SectionCard(title = "🤖 AI 分析") {
-                            Text(summaryText, fontSize = 14.sp, lineHeight = 20.sp)
+                            if (summaryText.isNotBlank()) {
+                                Text(summaryText, fontSize = 14.sp, lineHeight = 20.sp)
+                            }
 
                             if (keyPoints.isNotEmpty()) {
                                 Spacer(modifier = Modifier.height(10.dp))
@@ -156,6 +163,21 @@ fun VideoDetailScreen(
 
                             Spacer(modifier = Modifier.height(8.dp))
                             SentimentBadge(sentiment = sentiment)
+                        }
+                    } else {
+                        // 无任何分析数据
+                        SectionCard(title = "🤖 AI 分析") {
+                            Text(
+                                "该视频尚未完成AI分析",
+                                fontSize = 14.sp,
+                                color = TextSecondary
+                            )
+                            Text(
+                                "后端分析流水线尚未处理此视频，请稍后再来查看",
+                                fontSize = 12.sp,
+                                color = TextSecondary,
+                                modifier = Modifier.padding(top = 4.dp)
+                            )
                         }
                     }
 

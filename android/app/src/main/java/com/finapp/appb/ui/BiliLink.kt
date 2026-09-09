@@ -2,7 +2,6 @@ package com.finapp.appb.ui
 
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.net.Uri
 
 object BiliLink {
@@ -18,27 +17,23 @@ object BiliLink {
         openWithFallback(context, uri)
     }
 
+    fun openDynamic(context: Context, dynId: String) {
+        val uri = Uri.parse("https://t.bilibili.com/$dynId")
+        openWithFallback(context, uri)
+    }
+
     private fun openWithFallback(context: Context, uri: Uri) {
-        if (isAppInstalled(context, PKG_DOMESTIC)) {
-            try {
-                context.startActivity(Intent(Intent.ACTION_VIEW, uri).apply {
-                    setPackage(PKG_DOMESTIC)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                })
-                return
-            } catch (_: Exception) {}
-        }
+        try {
+            context.startActivity(Intent(Intent.ACTION_VIEW, uri).apply {
+                setPackage(PKG_DOMESTIC)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            })
+            return
+        } catch (_: Exception) {}
         try {
             context.startActivity(Intent(Intent.ACTION_VIEW, uri).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             })
         } catch (_: Exception) {}
-    }
-
-    private fun isAppInstalled(context: Context, packageName: String): Boolean = try {
-        context.packageManager.getPackageInfo(packageName, 0)
-        true
-    } catch (_: PackageManager.NameNotFoundException) {
-        false
     }
 }

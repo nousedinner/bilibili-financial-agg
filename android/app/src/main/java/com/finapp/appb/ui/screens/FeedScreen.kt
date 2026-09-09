@@ -148,6 +148,8 @@ fun FeedScreen(
                             onClick = {
                                 if (item.type == "video" && item.bvid != null) {
                                     onVideoClick(item.bvid)
+                                } else if (item.type == "dynamic" && item.dynId != null) {
+                                    BiliLink.openDynamic(context, item.dynId)
                                 } else if (item.mid != null) {
                                     BiliLink.openSpace(context, item.mid)
                                 }

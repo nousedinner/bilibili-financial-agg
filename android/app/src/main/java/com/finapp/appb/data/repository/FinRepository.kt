@@ -44,7 +44,7 @@ class FinRepository(
         currentApiKey = apiKey
 
         val logging = HttpLoggingInterceptor().apply {
-            level = HttpLoggingInterceptor.Level.BODY
+            level = HttpLoggingInterceptor.Level.BASIC
         }
 
         val client = OkHttpClient.Builder()
@@ -77,7 +77,7 @@ class FinRepository(
     suspend fun healthCheck(baseUrl: String): Boolean {
         return try {
             val logging = HttpLoggingInterceptor().apply {
-                level = HttpLoggingInterceptor.Level.BODY
+                level = HttpLoggingInterceptor.Level.BASIC
             }
             val client = OkHttpClient.Builder()
                 .addInterceptor(logging)
@@ -100,7 +100,7 @@ class FinRepository(
     suspend fun bootstrap(baseUrl: String, username: String): Result<UserResponse> {
         return try {
             val logging = HttpLoggingInterceptor().apply {
-                level = HttpLoggingInterceptor.Level.BODY
+                level = HttpLoggingInterceptor.Level.BASIC
             }
             val client = OkHttpClient.Builder()
                 .addInterceptor(logging)
@@ -125,9 +125,9 @@ class FinRepository(
     }
 
     // ── Feed with Cache ──
-    suspend fun getFeedPage(page: Int = 1, limit: Int = 50): Result<FeedPageData> {
+    suspend fun getFeedPage(before: Double? = null, limit: Int = 50): Result<FeedPageData> {
         return try {
-            val resp = requireApi().getFeedPage(page, limit)
+            val resp = requireApi().getFeedPage(before, limit)
             if (resp.isSuccessful) {
                 Result.success(resp.body()!!.data)
             } else {

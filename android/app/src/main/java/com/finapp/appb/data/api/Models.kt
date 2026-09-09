@@ -24,7 +24,7 @@ data class SystemStatus(
     val bloggers: Int,
     val videos: Int,
     val failed: Int,
-    @SerializedName("last_fetch") val lastFetch: String,
+    @SerializedName("last_fetch") val lastFetch: String?,
     @SerializedName("cookie_valid") val cookieValid: Boolean,
     @SerializedName("cookie_expire") val cookieExpire: String
 )
@@ -45,7 +45,12 @@ data class FeedResponse(
 data class FeedPageData(
     val items: List<FeedItem>,
     val total: Int?,
-    @SerializedName("has_more") val hasMore: Boolean
+    @SerializedName("has_more") val hasMore: Boolean,
+    @SerializedName("next_cursor") val nextCursor: FeedCursor? = null
+)
+
+data class FeedCursor(
+    val before: Double? = null
 )
 
 data class FeedItem(

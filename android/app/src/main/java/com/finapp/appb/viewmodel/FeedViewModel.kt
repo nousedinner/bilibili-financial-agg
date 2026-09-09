@@ -33,7 +33,7 @@ class FeedViewModel(application: Application) : AndroidViewModel(application) {
     private val _bloggerNames = MutableStateFlow<Map<Long, String>>(emptyMap())
     val bloggerNames: StateFlow<Map<Long, String>> = _bloggerNames
 
-    private var currentPage = 1
+    private var currentCursor: Double? = null
     private var hasMore = true
     private val pageSize = 50
     private var lastRefreshTime = 0L
@@ -90,11 +90,11 @@ class FeedViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
 
-            val result = repo.getFeedPage(page = 1, limit = pageSize)
+            val result = repo.getFeedPage(before = null, limit = pageSize)
             result.onSuccess { data ->
                 _items.value = data.items
                 hasMore = data.hasMore
-                currentPage = 1
+                currentCursor = data.nextCursor?.before
                 repo.cacheFeedItems(data.items)
                 Log.d("FeedVM", "Loaded from API: ${data.items.size} items")
             }.onFailure {
@@ -126,7 +126,7 @@ class FeedViewModel(application: Application) : AndroidViewModel(application) {
         if (!repo.ensureInitialized()) return
 
         Log.d("FeedVM", "Background refresh starting, current items=${_items.value.size}")
-        val result = repo.getFeedPage(page = 1, limit = pageSize)
+        val result = repo.getFeedPage(before = null, limit = pageSize)
         result.onSuccess { data ->
             Log.d("FeedVM", "Background refresh got ${data.items.size} items, hasMore=${data.hasMore}")
             val sameData = data.items == _items.value
@@ -135,7 +135,7 @@ class FeedViewModel(application: Application) : AndroidViewModel(application) {
                 Log.d("FeedVM", ">>> UPDATING _items.value - this triggers recomposition")
                 _items.value = data.items
                 hasMore = data.hasMore
-                currentPage = 1
+                currentCursor = data.nextCursor?.before
                 repo.cacheFeedItems(data.items)
             } else {
                 Log.d("FeedVM", "Data same, skip update")
@@ -150,13 +150,12 @@ class FeedViewModel(application: Application) : AndroidViewModel(application) {
 
         viewModelScope.launch {
             _isLoading.value = true
-            val nextPage = currentPage + 1
-            val result = repo.getFeedPage(page = nextPage, limit = pageSize)
+            val result = repo.getFeedPage(before = currentCursor, limit = pageSize)
             result.onSuccess { data ->
                 val currentItems = _items.value.toMutableList()
                 currentItems.addAll(data.items)
                 _items.value = currentItems
-                currentPage = nextPage
+                currentCursor = data.nextCursor?.before
                 hasMore = data.hasMore
                 repo.cacheFeedItems(data.items)
             }.onFailure {
@@ -171,13 +170,14 @@ class FeedViewModel(application: Application) : AndroidViewModel(application) {
             _isRefreshing.value = true
             _error.value = null
             _authError.value = false
-            currentPage = 1
+            currentCursor = null
             hasMore = true
             loadBloggerNames()
-            val result = repo.getFeedPage(page = 1, limit = pageSize)
+            val result = repo.getFeedPage(before = null, limit = pageSize)
             result.onSuccess { data ->
                 _items.value = data.items
                 hasMore = data.hasMore
+                currentCursor = data.nextCursor?.before
                 repo.cacheFeedItems(data.items)
             }.onFailure {
                 val msg = it.message ?: ""

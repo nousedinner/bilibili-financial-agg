@@ -80,7 +80,7 @@ fun SettingsScreen(
                         }
                         Spacer(modifier = Modifier.height(6.dp))
                         Text("Cookie: ${if (s.cookieValid) "✅ 有效" else "❌ 无效"}", fontSize = 13.sp, color = TextSecondary)
-                        Text("上次抓取: ${s.lastFetch.take(16)}", fontSize = 13.sp, color = TextSecondary)
+                        Text("上次抓取: ${(s.lastFetch ?: "尚未抓取").take(16)}", fontSize = 13.sp, color = TextSecondary)
                     }
                 }
             }

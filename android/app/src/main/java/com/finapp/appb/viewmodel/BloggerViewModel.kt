@@ -116,8 +116,9 @@ class BloggerViewModel(application: Application) : AndroidViewModel(application)
                 return@launch
             }
             val followings = _newFollowings.value
-            val midsStr = selected.joinToString(",")
-            val namesStr = followings.filter { it.mid in selected }.joinToString(",") { it.name }
+            val selectedList = selected.toList()
+            val midsStr = selectedList.joinToString(",")
+            val namesStr = selectedList.mapNotNull { mid -> followings.find { it.mid == mid }?.name }.joinToString(",")
             val result = repo.batchAddBloggers(midsStr, namesStr)
             result.onSuccess { resp ->
                 val addedCount = resp.added?.size ?: 0

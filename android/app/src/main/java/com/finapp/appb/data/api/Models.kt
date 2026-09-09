@@ -99,6 +99,8 @@ data class VideoDetail(
     val transcript: Transcript?,
     val comments: CommentsAnalysis?,
     val danmaku: DanmakuAnalysis?,
+    @SerializedName("fetch_status") val fetchStatus: String? = null,
+    @SerializedName("analysis_status") val analysisStatus: String? = null,
     @Transient val fromCache: Boolean = false
 )
 

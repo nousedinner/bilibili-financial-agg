@@ -105,12 +105,13 @@ fun VideoDetailScreen(
                     }
 
                     // AI Analysis
+                    val status = d.analysisStatus
                     val hasAnyAnalysis = summaryText.isNotBlank() ||
                         keyPoints.isNotEmpty() || riskWarnings.isNotEmpty() ||
                         dataCitations.isNotEmpty() || tags.isNotEmpty() ||
                         d.comments != null || d.danmaku != null
 
-                    if (hasAnyAnalysis) {
+                    if (status == "completed" && hasAnyAnalysis) {
                         SectionCard(title = "🤖 AI 分析") {
                             if (summaryText.isNotBlank()) {
                                 Text(summaryText, fontSize = 14.sp, lineHeight = 20.sp)
@@ -165,19 +166,15 @@ fun VideoDetailScreen(
                             SentimentBadge(sentiment = sentiment)
                         }
                     } else {
-                        // 无任何分析数据
-                        SectionCard(title = "🤖 AI 分析") {
-                            Text(
-                                "该视频尚未完成AI分析",
-                                fontSize = 14.sp,
-                                color = TextSecondary
-                            )
-                            Text(
-                                "后端分析流水线尚未处理此视频，请稍后再来查看",
-                                fontSize = 12.sp,
-                                color = TextSecondary,
-                                modifier = Modifier.padding(top = 4.dp)
-                            )
+                        // 根据 analysisStatus 显示不同提示
+                        val (tipTitle, tipText) = when (status) {
+                            "pending" -> "⏳ 等待分析" to "该视频已采集，等待后端分析流水线处理"
+                            "processing" -> "🔄 分析中" to "该视频正在被AI分析，请稍后再来查看"
+                            "failed" -> "❌ 分析失败" to "该视频AI分析失败，将自动重试"
+                            else -> "🤖 AI 分析" to "该视频尚未完成AI分析"
+                        }
+                        SectionCard(title = tipTitle) {
+                            Text(tipText, fontSize = 14.sp, color = TextSecondary)
                         }
                     }
 

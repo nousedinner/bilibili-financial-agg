@@ -2,33 +2,43 @@ package com.finapp.appb.ui
 
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 
-/**
- * 统一B站跳转工具
- *
- * 国内版/国际版 都通过 https:// web URL 打开视频和空间，
- * 系统会自动选择已安装的B站APP处理（无需指定包名）。
- * 无B站APP时走浏览器。
- */
 object BiliLink {
-    /** 在B站APP打开视频 */
+    private const val PKG_DOMESTIC = "tv.danmaku.bili"
+
     fun openVideo(context: Context, bvid: String) {
         val uri = Uri.parse("https://www.bilibili.com/video/$bvid")
-        openUri(context, uri)
+        openWithFallback(context, uri)
     }
 
-    /** 在B站APP打开UP主空间 */
     fun openSpace(context: Context, mid: Long) {
         val uri = Uri.parse("https://space.bilibili.com/$mid")
-        openUri(context, uri)
+        openWithFallback(context, uri)
     }
 
-    private fun openUri(context: Context, uri: Uri) {
+    private fun openWithFallback(context: Context, uri: Uri) {
+        if (isAppInstalled(context, PKG_DOMESTIC)) {
+            try {
+                context.startActivity(Intent(Intent.ACTION_VIEW, uri).apply {
+                    setPackage(PKG_DOMESTIC)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                })
+                return
+            } catch (_: Exception) {}
+        }
         try {
             context.startActivity(Intent(Intent.ACTION_VIEW, uri).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             })
         } catch (_: Exception) {}
+    }
+
+    private fun isAppInstalled(context: Context, packageName: String): Boolean = try {
+        context.packageManager.getPackageInfo(packageName, 0)
+        true
+    } catch (_: PackageManager.NameNotFoundException) {
+        false
     }
 }

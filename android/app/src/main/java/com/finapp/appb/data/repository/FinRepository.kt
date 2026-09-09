@@ -16,6 +16,7 @@ import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
 class ApiException(val status: Int, message: String) : IOException(message)
+class SessionChangedException : CancellationException("Session switched")
 fun Throwable.isAuthError() = this is ApiException && status in listOf(401, 403)
 fun Throwable.canUseCache() = this is IOException && (this !is ApiException || status >= 500)
 fun FeedItem.stableId(): String? = when (type) {
@@ -116,7 +117,7 @@ class FinRepository(private val prefs: ConnectionStore, private val cache: Conte
     }
 
     private fun checkSession(session: Session) {
-        if (current !== session) throw CancellationException("Connection changed")
+        if (current !== session) throw SessionChangedException()
     }
 
     private fun <T> payload(response: Response<ApiResponse<T>>): T {

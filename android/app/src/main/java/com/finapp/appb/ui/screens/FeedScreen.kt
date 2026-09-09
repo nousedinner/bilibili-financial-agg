@@ -137,7 +137,7 @@ fun FeedScreen(
                     }
                     items(
                         items = items,
-                        key = { it.stableId()!! }
+                        key = { it.stableId() ?: "unknown:${it.publishTime}" }
                     ) { item ->
                         VideoCard(
                             item = item,

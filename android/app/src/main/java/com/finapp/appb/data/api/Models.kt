@@ -39,10 +39,6 @@ data class Blogger(
 )
 
 // ── Feed ──
-data class FeedResponse(
-    val items: List<FeedItem>
-)
-
 data class FeedPageData(
     val items: List<FeedItem>,
     val total: Int?,

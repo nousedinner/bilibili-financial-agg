@@ -51,7 +51,7 @@ class FeedViewModel(application: Application) : AndroidViewModel(application) {
                 ensureActive()
                 if (token != generation) return@launch
                 result.onSuccess { data ->
-                    _items.value = mergeFeedItems(emptyList(), data.items)
+                    _items.value = data.items
                     cursor = data.nextCursor
                     hasMore = data.hasMore && cursor?.before != null && cursor?.beforeId != null
                     if (data.fromCache) _error.value = "网络暂不可用，当前显示缓存内容；下拉可重试"

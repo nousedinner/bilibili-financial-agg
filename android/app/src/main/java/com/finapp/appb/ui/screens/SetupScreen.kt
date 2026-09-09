@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.sp
 import com.finapp.appb.FinApp
 import com.finapp.appb.data.local.UserPreferences
 import com.finapp.appb.data.repository.FinRepository
+import com.finapp.appb.ui.friendlyErrorMessage
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.first
 
@@ -136,7 +137,7 @@ fun SetupScreen(onSetupComplete: () -> Unit) {
                     try {
                         repo.connect(urlSnapshot, keySnapshot, userSnapshot)
                             .onSuccess { onSetupComplete() }
-                            .onFailure { errorMsg = it.message ?: "连接失败，请检查地址和 API Key" }
+                            .onFailure { errorMsg = friendlyErrorMessage(it.message) ?: "连接失败，请检查地址和 API Key" }
                     } finally { isLoading = false }
                 }
             },

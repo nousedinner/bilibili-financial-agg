@@ -54,12 +54,6 @@ interface FinApiService {
 
     // ── Feed ──
     @GET("api/feed")
-    suspend fun getFeed(
-        @Query("limit") limit: Int = 50,
-        @Query("blogger") blogger: Long? = null
-    ): Response<ApiResponse<FeedResponse>>
-
-    @GET("api/feed")
     suspend fun getFeedPage(
         @Query("before") before: Double? = null,
         @Query("limit") limit: Int = 50,

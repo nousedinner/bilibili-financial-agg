@@ -210,12 +210,12 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str) -> dict:
         except Exception:
             result["failed_count"] += 1
         await asyncio.sleep(interval)
-    for d in pending:
-        try:
-            await _process_dynamic(client, mid, d.payload)
-            result["retried_count"] += 1
-        except Exception:
-            result["failed_count"] += 1
+    # for d in pending:  # DISABLED: dynamics fetching paused
+    #     try:
+    #         await _process_dynamic(client, mid, d.payload)
+    #         result["retried_count"] += 1
+    #     except Exception:
+    #         result["failed_count"] += 1
 
     # Persist every discovered video before moving the watermark. A bounded scan
     # never advances it until it reaches the prior boundary; queued rows survive crashes.
@@ -277,43 +277,42 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str) -> dict:
             session.add(wm)
             await session.commit()
 
-    offset, offsets, newest = "", set(), None
-    tried_dyn = {d.dyn_id for d in pending}
-    for _ in range(1000):
-        data = await client.get_dynamics(mid, offset=offset)
-        batch = data.get("items", [])
-        stop = False
-        for dyn in batch:
-            dyn_id = str(dyn.get("id_str", ""))
-            if not dyn_id:
-                continue
-            newest = newest or dyn_id
-            if dyn_id == last_dyn:
-                stop = True
-                continue
-            if dyn_id in tried_dyn:
-                continue
-            tried_dyn.add(dyn_id)
-            async with async_session() as session:
-                if await session.get(Dynamic, dyn_id) or await session.get(PendingDynamic, dyn_id):
-                    continue
-            try:
-                await _process_dynamic(client, mid, dyn)
-                result["dynamics_count"] += 1
-            except Exception:
-                result["failed_count"] += 1
-                async with async_session() as session:
-                    if await session.get(PendingDynamic, dyn_id) is None:
-                        raise
-            await asyncio.sleep(interval)
-        if stop or not data.get("has_more"):
-            break
-        offset = str(data.get("offset", ""))
-        if not offset or offset in offsets:
-            raise ValueError("Dynamic pagination repeated; watermark retained")
-        offsets.add(offset)
-    else:
-        raise ValueError("Dynamic scan limit exceeded; watermark retained")
+    newest = None  # DISABLED: dynamics fetching paused; watermark block below preserves existing last_dyn_id
+    # for _ in range(1000):  # DISABLED: dynamics fetching paused
+    #     data = await client.get_dynamics(mid, offset=offset)
+    #     batch = data.get("items", [])
+    #     stop = False
+    #     for dyn in batch:
+    #         dyn_id = str(dyn.get("id_str", ""))
+    #         if not dyn_id:
+    #             continue
+    #         newest = newest or dyn_id
+    #         if dyn_id == last_dyn:
+    #             stop = True
+    #             continue
+    #         if dyn_id in tried_dyn:
+    #             continue
+    #         tried_dyn.add(dyn_id)
+    #         async with async_session() as session:
+    #             if await session.get(Dynamic, dyn_id) or await session.get(PendingDynamic, dyn_id):
+    #                 continue
+    #         try:
+    #             await _process_dynamic(client, mid, dyn)
+    #             result["dynamics_count"] += 1
+    #         except Exception:
+    #             result["failed_count"] += 1
+    #             async with async_session() as session:
+    #                 if await session.get(PendingDynamic, dyn_id) is None:
+    #                     raise
+    #         await asyncio.sleep(interval)
+    #     if stop or not data.get("has_more"):
+    #         break
+    #     offset = str(data.get("offset", ""))
+    #     if not offset or offset in offsets:
+    #         raise ValueError("Dynamic pagination repeated; watermark retained")
+    #     offsets.add(offset)
+    # else:
+    #     raise ValueError("Dynamic scan limit exceeded; watermark retained")
     if newest:
         async with async_session() as session:
             wm = await session.get(FetchWatermark, mid) or FetchWatermark(mid=mid)

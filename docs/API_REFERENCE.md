@@ -124,7 +124,9 @@ X-API-Key: <密码>
         "view_count": 63622,
         "sentiment": "neutral",
         "sentiment_score": 0.2,
-        "summary": "视频讨论华尔街传奇投资人德鲁肯米勒买入中概股..."
+        "summary": "视频讨论华尔街传奇投资人德鲁肯米勒买入中概股...",
+        "fetch_status": "ok",
+        "analysis_status": "completed"
       }
     ],
     "total": 44,
@@ -146,6 +148,8 @@ X-API-Key: <密码>
     "publish_time": "2026-08-17T15:25:12",
     "view_count": 63622,
     "content_type": "video",
+    "fetch_status": "ok",
+    "analysis_status": "analyzed",
     "transcript": {
       "source": "ai_subtitle",
       "text": "（字幕全文）..."

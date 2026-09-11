@@ -10,8 +10,12 @@ from datetime import datetime
 from typing import Optional
 
 import httpx
+from curl_cffi.requests import AsyncSession as CurlSession
 
 from src.config import get_config, get_env
+
+# curl_cffi 会话复用，伪装 Chrome TLS 指纹绕过 412
+_curl_session = CurlSession(impersonate="chrome")
 
 
 class BiliAPIError(Exception):
@@ -29,30 +33,48 @@ class BiliAPIError(Exception):
 # ------------------------------------------------------------------
 
 async def _run_curl(args: list[str], timeout: float = 20, sep_body_status: bool = False) -> tuple[bytes, int]:
-    # Every caller receives the same body/status contract, including subtitle requests.
-    args = list(args)
-    if "-w" not in args and "--write-out" not in args:
-        args[1:1] = ["-w", "\n%{http_code}"]
-    proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    """用 curl_cffi 伪装 Chrome TLS 指纹发送请求，绕过 B 站 412 风控。"""
+    # 从 curl 参数中解析出 url / headers / cookies
+    url = ""
+    headers = dict(_HEADERS)
+    cookies: dict[str, str] = {}
+    i = 1
+    while i < len(args):
+        a = args[i]
+        if a in ("-w", "--write-out"):
+            i += 2; continue
+        if a in ("-sS", "--compressed", "-s"):
+            i += 1; continue
+        if a == "--connect-timeout" or a == "--max-time":
+            i += 2; continue
+        if a == "-H" and i + 1 < len(args):
+            val = args[i + 1]
+            k, _, v = val.partition(":")
+            headers[k.strip()] = v.strip()
+            i += 2; continue
+        if a in ("-b", "--cookie") and i + 1 < len(args):
+            for part in args[i + 1].split(";"):
+                part = part.strip()
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    cookies[k.strip()] = v.strip()
+            i += 2; continue
+        if not a.startswith("-"):
+            url = a
+        i += 1
+
     try:
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        await proc.wait()
+        resp = await _curl_session.get(
+            url, headers=headers, cookies=cookies,
+            timeout=timeout, allow_redirects=True,
+        )
+        if not 200 <= resp.status_code < 300:
+            raise BiliAPIError(resp.status_code, f"HTTP {resp.status_code}")
+        return resp.content, resp.status_code
+    except BiliAPIError:
         raise
-    if proc.returncode != 0:
-        raise BiliAPIError(-1, f"curl exited with code {proc.returncode}")
-    try:
-        body, raw_status = stdout.rsplit(b"\n", 1)
-        status = int(raw_status.strip())
-    except (ValueError, TypeError):
-        raise BiliAPIError(-1, "curl returned no HTTP status") from None
-    if not 200 <= status < 300:
-        raise BiliAPIError(status, f"HTTP {status}")
-    return body, status
+    except Exception as e:
+        raise BiliAPIError(-1, f"curl_cffi request failed: {e}") from e
 
 
 def _bili_curl_args(url: str, sessdata: str = "", cookie_extra: str = "", sep: bool = False) -> list[str]:
@@ -308,17 +330,25 @@ class BiliClient:
     # ------------------------------------------------------------------
 
     async def get_video_info(self, bvid: str) -> dict:
-        """获取视频详情（cid、时长、标题等）。"""
-        params = {"bvid": bvid}
-        result = await self._get(
-            "https://api.bilibili.com/x/web-interface/view",
-            params=params,
-            signed=False,
-        )
-        data = result.get("data")
-        if not isinstance(data, dict):
-            raise BiliAPIError(-1, "Missing API data")
-        return data
+        """获取视频详情（cid、时长）— 使用 pagelist 端点绕过 view 的412。"""
+        url = f"https://api.bilibili.com/x/player/pagelist?bvid={bvid}"
+        try:
+            body, _ = await _run_curl(_bili_curl_args(url), timeout=10)
+            data = _json.loads(body)
+        except Exception as e:
+            raise BiliAPIError(-1, f"pagelist request failed: {e}")
+        if data.get("code") != 0:
+            raise BiliAPIError(data.get("code", -1), data.get("message", "pagelist error"))
+        pages = data.get("data", [])
+        if not pages:
+            raise BiliAPIError(-1, f"No pages for {bvid}")
+        first = pages[0]
+        # 返回兼容格式：cid + pages 列表（含 duration）
+        return {
+            "cid": first.get("cid"),
+            "duration": first.get("duration", 0),
+            "pages": pages,
+        }
 
     # ------------------------------------------------------------------
     # 音频下载（ASR用）
@@ -340,14 +370,11 @@ class BiliClient:
 
     async def download_audio(self, url: str) -> bytes:
         limit = int(get_config().get("asr", {}).get("max_audio_bytes", 256 * 1024 * 1024))
-        data = bytearray()
-        async with self._client.stream("GET", url, headers=_HEADERS, timeout=120) as resp:
-            resp.raise_for_status()
-            async for chunk in resp.aiter_bytes():
-                data.extend(chunk)
-                if len(data) > limit:
-                    raise ValueError("Audio exceeds configured download limit")
-        return bytes(data)
+        r = await _curl_session.get(url, headers=_HEADERS, timeout=120)
+        r.raise_for_status()
+        if len(r.content) > limit:
+            raise ValueError("Audio exceeds configured download limit")
+        return r.content
 
     # ------------------------------------------------------------------
     # 评论

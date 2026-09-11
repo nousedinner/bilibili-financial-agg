@@ -10,5 +10,6 @@ pyyaml==6.0.2
 apscheduler==3.11.0
 lxml==5.4.0
 cryptography>=44.0.0
+curl_cffi>=0.16.0
 
 python-dotenv==1.1.0

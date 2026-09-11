@@ -70,6 +70,7 @@ CREATE TABLE videos (
     content_type ENUM('video','dynamic') DEFAULT 'video',
     dyn_id VARCHAR(50),
     fetch_status ENUM('pending','ok','failed') DEFAULT 'pending',
+    analysis_status ENUM('pending','processing','completed','failed') DEFAULT 'pending',
     error_message TEXT,
     fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_mid (mid),

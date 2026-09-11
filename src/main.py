@@ -22,7 +22,7 @@ from src.models import (
     CommentAnalysis, DanmakuAnalysis, Dynamic,
     FetchWatermark, DailyDigest, ApiUser, FetchJob,
 )
-from src.fetcher import run_daily_fetch, run_fetch_only, run_backfill, _get_enabled_bloggers, _generate_digest, regenerate_dirty_digests, _process_video, _video_info, _utcnow
+from src.fetcher import run_daily_fetch, run_fetch_only, run_backfill, run_retry_failed, _get_enabled_bloggers, _generate_digest, regenerate_dirty_digests, _process_video, _video_info, _utcnow
 
 
 # ------------------------------------------------------------------
@@ -335,6 +335,8 @@ async def list_videos(
                 "sentiment": s.sentiment if s else None,
                 "sentiment_score": s.sentiment_score if s else None,
                 "summary": s.summary[:200] if s and s.summary else None,
+                "fetch_status": v.fetch_status,
+                "analysis_status": v.analysis_status,
             }
             items.append(item)
 
@@ -370,6 +372,8 @@ async def get_video_detail(bvid: str):
                 "duration": video.duration,
                 "publish_time": video.publish_time.isoformat() if video.publish_time else None,
                 "view_count": video.view_count,
+                "fetch_status": video.fetch_status,
+                "analysis_status": video.analysis_status,
                 "summary": {
                     "text": summary.summary if summary else None,
                     "key_points": summary.key_points if summary else [],
@@ -492,7 +496,8 @@ async def get_feed(
         feed = [{"type": "video", "bvid": v.bvid, "mid": v.mid, "title": v.title,
             "publish_time": v.publish_time.isoformat() if v.publish_time else None,
             "sentiment": s.sentiment if s else None, "sentiment_score": s.sentiment_score if s else None,
-            "summary": s.summary[:200] if s and s.summary else None, "duration": v.duration, "view_count": v.view_count}
+            "summary": s.summary[:200] if s and s.summary else None, "duration": v.duration, "view_count": v.view_count,
+            "fetch_status": v.fetch_status, "analysis_status": v.analysis_status}
             for v, s in videos]
         feed.extend({"type": "dynamic", "dyn_id": d.dyn_id, "mid": d.mid,
             "publish_time": d.publish_time.isoformat() if d.publish_time else None,
@@ -513,11 +518,26 @@ async def get_feed(
 
 @app.get("/api/daily", dependencies=[Depends(require_api_key)])
 async def list_daily_dates():
-    """可用日期列表。"""
+    """可用日期列表（附摘要预览）。"""
     async with async_session() as session:
-        stmt = select(DailyDigest.digest_date).order_by(desc(DailyDigest.digest_date))
-        dates = (await session.execute(stmt)).scalars().all()
-        return {"code": 0, "data": {"dates": [d.isoformat() for d in dates]}}
+        stmt = select(
+            DailyDigest.digest_date,
+            func.json_unquote(func.json_extract(DailyDigest.content, "$.overall_sentiment")).label("overall_sentiment"),
+            func.json_extract(DailyDigest.content, "$.sentiment_score").label("sentiment_score"),
+            func.left(func.json_unquote(func.json_extract(DailyDigest.content, "$.summary")), 100).label("summary"),
+        ).order_by(desc(DailyDigest.digest_date))
+        rows = (await session.execute(stmt)).all()
+        dates = []
+        for r in rows:
+            item = {"date": r.digest_date.isoformat()}
+            if r.overall_sentiment:
+                item["overall_sentiment"] = r.overall_sentiment
+            if r.sentiment_score is not None:
+                item["sentiment_score"] = float(r.sentiment_score)
+            if r.summary:
+                item["summary"] = r.summary
+            dates.append(item)
+        return {"code": 0, "data": {"dates": dates}}
 
 
 @app.get("/api/daily/{date_str}", dependencies=[Depends(require_api_key)])
@@ -600,6 +620,16 @@ async def _run_backfill_task(mid: int = None, since: str = "2026-07-01"):
 @app.post("/api/transcripts/retry", dependencies=[Depends(require_api_key)])
 async def retry_transcripts():
     return await _submit_job("retry_transcripts", _retry_work)
+
+
+@app.post("/api/retry/failed", dependencies=[Depends(require_api_key)])
+async def retry_failed():
+    """针对性重试：只处理失败视频，按错误类型分级，不扫描新视频。"""
+    return await _submit_job("retry_failed", _retry_failed_work)
+
+
+async def _retry_failed_work():
+    return await run_retry_failed()
 
 
 async def _retry_transcripts_task():

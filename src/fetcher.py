@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.bilibili import BiliClient
 from src.transcript import fetch_transcript
 from src.analyzer import analyze_video, analyze_dynamic, generate_daily_digest, _validate_analysis, _validate_digest
+from src.retry_strategy import classify_error, should_retry, is_permanent, max_retries_for
 from src.models import (
     Blogger, Video, Transcript, Summary,
     CommentAnalysis, DanmakuAnalysis, Dynamic,
@@ -126,6 +127,56 @@ async def run_backfill(mid: int, since: str, cap: int = 20) -> dict:
     return result
 
 
+async def run_retry_failed() -> dict:
+    """独立重试：只从数据库捞失败视频，按错误类型分级处理，不扫描新视频。"""
+    bloggers = await _get_enabled_bloggers()
+    if not bloggers:
+        return {"processed": 0, "skipped": 0, "failed": 0}
+    
+    result = {"processed": 0, "skipped": 0, "failed": 0, "details": []}
+    interval = get_config().get("limits", {}).get("video_interval_seconds", 5)
+    
+    async with async_session() as session:
+        # 只捞失败的，不扫列表
+        failed = (await session.execute(select(Video).where(
+            Video.fetch_status.in_(["failed", "pending"]),
+            Video.mid.in_([b["mid"] for b in bloggers])
+        ))).scalars().all()
+    
+    for v in failed:
+        err_type = classify_error(v.error_message or "", v.duration or 0)
+        
+        # 404/永久失败 → 直接跳过
+        if is_permanent(err_type):
+            print(f"[retry] {v.bvid}: 永久失败({err_type})，跳过")
+            result["skipped"] += 1
+            result["details"].append({"bvid": v.bvid, "status": "skipped", "reason": err_type})
+            continue
+        
+        # 达到重试上限 → 跳过
+        if not should_retry(v.retry_count or 0, err_type):
+            print(f"[retry] {v.bvid}: {err_type} 达上限({v.retry_count}/{max_retries_for(err_type)})")
+            result["skipped"] += 1
+            result["details"].append({"bvid": v.bvid, "status": "skipped", "reason": f"{err_type}_limit"})
+            continue
+        
+        # 针对性重试
+        print(f"[retry] {v.bvid}: {err_type}，重试中...")
+        async with _bili_client() as client:
+            try:
+                await _process_video(client, v.mid, _video_info(v), is_retry=True)
+                result["processed"] += 1
+                result["details"].append({"bvid": v.bvid, "status": "ok"})
+                print(f"[retry] {v.bvid}: ✅ 成功")
+            except Exception as e:
+                result["failed"] += 1
+                result["details"].append({"bvid": v.bvid, "status": "failed", "error": str(e)[:100]})
+                print(f"[retry] {v.bvid}: ❌ {e}")
+        await asyncio.sleep(interval)
+    
+    return result
+
+
 async def _fetch_blogger(client: BiliClient, mid: int, name: str) -> dict:
     cfg = get_config()
     retries = cfg.get("retry", {}).get("max_retries", 3)
@@ -133,7 +184,19 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str) -> dict:
     result = {"name": name, "new_count": 0, "failed_count": 0, "retried_count": 0, "dynamics_count": 0}
     async with async_session() as session:
         failed = (await session.execute(select(Video).where(Video.mid == mid,
-            Video.fetch_status.in_(["failed", "pending"]), Video.retry_count < retries))).scalars().all()
+            Video.fetch_status.in_(["failed", "pending"])))).scalars().all()
+        # 按错误类型分级过滤重试
+        retryable = []
+        for v in failed:
+            err_type = classify_error(v.error_message or "", v.duration or 0)
+            if is_permanent(err_type):
+                print(f"[fetcher] {v.bvid}: 永久失败({err_type})，跳过")
+                continue
+            if should_retry(v.retry_count or 0, err_type):
+                retryable.append(v)
+            else:
+                print(f"[fetcher] {v.bvid}: {err_type} 已达重试上限({v.retry_count}/{max_retries_for(err_type)})")
+        failed = retryable
         pending = (await session.execute(select(PendingDynamic).where(PendingDynamic.mid == mid,
             PendingDynamic.retry_count < retries))).scalars().all()
         wm = await session.get(FetchWatermark, mid)
@@ -282,10 +345,28 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
     transcript_text = transcript_result.get("text", "")
     if not transcript_text or transcript_result.get("partial"):
         raise ValueError("Transcript unavailable or incomplete")
-    comment_data = await client.get_comments(oid=info.get("aid", 0), oid_type=1, count=20)
-    comments = comment_data["replies"]
-    danmaku_data = await client.get_danmaku(cid, max_count=2000)
-    danmakus = danmaku_data["items"]
+    # 标记分析阶段开始——拿到字幕，即将调LLM
+    async with async_session() as session:
+        video = await session.get(Video, bvid)
+        video.analysis_status = "processing"
+        await session.commit()
+    # 重试时降级：跳过评论/弹幕，缩短转写文本，减少LLM负担
+    comment_data = {"replies": [], "total": 0}
+    danmaku_data = {"items": [], "total": 0}
+    if is_retry:
+        print(f"[fetcher] {bvid}: 重试降级模式——跳过评论/弹幕，截短转写文本")
+        comments, danmakus = [], []
+        transcript_text = transcript_text[:4000]
+    else:
+        aid = vinfo.get("aid", 0)
+        if aid:
+            try:
+                comment_data = await client.get_comments(oid=aid, oid_type=1, count=20)
+            except Exception as e:
+                print(f"[fetcher] {bvid}: 评论获取失败({e})，跳过")
+        comments = comment_data["replies"]
+        danmaku_data = await client.get_danmaku(cid, max_count=2000)
+        danmakus = danmaku_data["items"]
     analysis = await analyze_video(title, transcript_text, comments, danmakus, dur_sec)
     if analysis.get("analysis_failed") or not _validate_analysis(analysis):
         raise ValueError(f"LLM analysis failed for {bvid}")
@@ -305,6 +386,7 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
         video = await session.get(Video, bvid)
         video.title, video.duration, video.view_count = title, dur_sec, vinfo.get("play", 0)
         video.fetch_status, video.retry_count, video.error_message = "ok", 0, None
+        video.analysis_status = "completed"
         video.fetched_at = _utcnow()
         await _mark_digest_dirty(session, pub_dt)
         await session.commit()
@@ -454,6 +536,7 @@ async def _process_video(client, mid, vinfo, is_retry=False):
                 publish_time=_publish_time(vinfo.get("created", 0)), retry_count=0)
             session.add(video)
         video.fetch_status = "pending"
+        video.analysis_status = "pending"
         await session.commit()
     try:
         await _process_video_core(client, mid, vinfo, is_retry)
@@ -462,6 +545,11 @@ async def _process_video(client, mid, vinfo, is_retry=False):
             video = await session.get(Video, bvid)
             video.fetch_status = "failed"
             video.error_message = (str(exc) or "Task interrupted")[:500]
+            # 区分：LLM分析失败 vs 字幕/抓取失败
+            if "LLM analysis failed" in str(exc) or video.analysis_status == "processing":
+                video.analysis_status = "failed"
+            else:
+                video.analysis_status = "pending"
             video.retry_count = (video.retry_count or 0) + 1
             await session.commit()
         raise

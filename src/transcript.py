@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import tempfile
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -49,6 +50,10 @@ async def fetch_transcript(client: BiliClient, bvid: str, cid: int, duration: in
         print(f"[transcript] {bvid}: AI字幕降级失败: {e}")
 
     # Layer 3: MiMo ASR (切片≤3min)
+    # 60分钟以上无字幕的视频跳过ASR——成本高且直播回放质量低
+    if duration > 3600:
+        print(f"[transcript] {bvid}: {duration}s (>{60}min) 无字幕，跳过ASR")
+        return {"source": "skipped", "text": "", "segments": 0}
     print(f"[transcript] {bvid}: 无字幕，降级到ASR")
     asr_result = await _asr_transcribe(client, bvid, cid, duration)
     if asr_result:
@@ -86,6 +91,8 @@ async def _asr_transcribe(client: BiliClient, bvid: str, cid: int, duration: int
     audio = await client.download_audio(url)
     if not audio:
         return None
+    # M4A → MP3 转码（MiMo ASR 只接受 wav/mp3）
+    audio = await _to_mp3(audio)
     chunks = await _split_audio(audio, int(cfg.get("chunk_seconds", 180)))
     texts = []
     for index, chunk in enumerate(chunks):
@@ -95,6 +102,26 @@ async def _asr_transcribe(client: BiliClient, bvid: str, cid: int, duration: int
             raise ValueError(f"ASR segment {index + 1}/{len(chunks)} failed; transcript is incomplete")
         texts.append(text.strip())
     return {"source": "asr", "text": " ".join(texts), "segments": len(chunks)}
+
+
+async def _to_mp3(audio: bytes) -> bytes:
+    """用 ffmpeg 把任意音频转成 mp3 bytes。"""
+    with tempfile.NamedTemporaryFile(suffix=".m4a", delete=False) as src:
+        src.write(audio)
+        src_path = src.name
+    dst_path = src_path.replace(".m4a", ".mp3")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", src_path, "-vn", "-acodec", "libmp3lame", "-q:a", "4", dst_path,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        await proc.wait()
+        if proc.returncode == 0 and os.path.exists(dst_path):
+            return open(dst_path, "rb").read()
+    finally:
+        for p in (src_path, dst_path):
+            if os.path.exists(p):
+                os.unlink(p)
+    return audio  # fallback: 原样返回
 
 
 async def _call_asr(api_url: str, api_key: str, audio_data: bytes, model: str) -> Optional[str]:
@@ -113,10 +140,6 @@ async def _call_asr(api_url: str, api_key: str, audio_data: bytes, model: str) -
                             "data": audio_b64,
                             "format": "mp3",
                         },
-                    },
-                    {
-                        "type": "text",
-                        "text": "请将这段音频完整转写为文字，不要遗漏、不要总结、不要添加额外内容。",
                     },
                 ],
             }

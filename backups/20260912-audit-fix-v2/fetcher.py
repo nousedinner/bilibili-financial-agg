@@ -113,10 +113,7 @@ async def run_backfill(mid: int, since: str, cap: int = 20) -> dict:
                 for v in fresh:
                     seen.add(v["bvid"])
                     pub = _publish_time(v.get("created", 0))
-                    if pub is None:
-                        # #10: 缺失时间跳过但不阻断翻页
-                        continue
-                    if pub < since_dt:
+                    if pub is None or pub < since_dt:
                         reached_date = True
                         continue
                     async with async_session() as session:
@@ -145,7 +142,6 @@ async def run_backfill(mid: int, since: str, cap: int = 20) -> dict:
                 raise ValueError("Backfill pagination limit exceeded")
     except Exception as exc:
         result["error"] = str(exc)[:200]
-        result["failed"] = max(result["failed"], 1)  # #11: 上游异常算至少1个失败
     return result
 
 
@@ -159,26 +155,31 @@ async def run_retry_failed() -> dict:
     interval = get_config().get("limits", {}).get("video_interval_seconds", 5)
     
     async with async_session() as session:
-        # #5: 先取较大候选集，Python 侧筛资格后再截取
-        candidates = (await session.execute(select(Video).where(
+        # Issue #2: 只捞失败的，过滤历史数据 + 批次上限
+        failed = (await session.execute(select(Video).where(
             Video.fetch_status.in_(["failed", "pending"]),
             Video.mid.in_([b["mid"] for b in bloggers]),
-            Video.publish_time >= _HARD_SINCE,
-            Video.publish_time.isnot(None),
-        ).limit(200))).scalars().all()
-    # 筛资格后取前50条
-    batch_limit = 50
-    failed = []
-    for v in candidates:
-        if len(failed) >= batch_limit:
-            break
-        err_type = classify_error(v.error_message or "", v.duration or 0)
-        if is_permanent(err_type) or not should_retry(v.retry_count or 0, err_type):
-            continue
-        failed.append(v)
-
+            Video.publish_time >= _HARD_SINCE,  # 日期下限
+            Video.publish_time.isnot(None),       # 排除未知时间
+        ).limit(50))).scalars().all()  # 每轮最多50条
+    
     for v in failed:
         err_type = classify_error(v.error_message or "", v.duration or 0)
+        
+        # 404/永久失败 → 直接跳过
+        if is_permanent(err_type):
+            print(f"[retry] {v.bvid}: 永久失败({err_type})，跳过")
+            result["skipped"] += 1
+            result["details"].append({"bvid": v.bvid, "status": "skipped", "reason": err_type})
+            continue
+        
+        # 达到重试上限 → 跳过
+        if not should_retry(v.retry_count or 0, err_type):
+            print(f"[retry] {v.bvid}: {err_type} 达上限({v.retry_count}/{max_retries_for(err_type)})")
+            result["skipped"] += 1
+            result["details"].append({"bvid": v.bvid, "status": "skipped", "reason": f"{err_type}_limit"})
+            continue
+        
         # 针对性重试
         print(f"[retry] {v.bvid}: {err_type}，重试中...")
         async with _bili_client() as client:
@@ -207,11 +208,9 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str) -> dict:
             Video.publish_time >= _HARD_SINCE,
             Video.publish_time.isnot(None),
         ))).scalars().all()
-        # 按错误类型分级过滤重试，加批次上限
+        # 按错误类型分级过滤重试
         retryable = []
         for v in failed:
-            if len(retryable) >= 50:
-                break
             err_type = classify_error(v.error_message or "", v.duration or 0)
             if is_permanent(err_type):
                 print(f"[fetcher] {v.bvid}: 永久失败({err_type})，跳过")
@@ -221,7 +220,8 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str) -> dict:
             else:
                 print(f"[fetcher] {v.bvid}: {err_type} 已达重试上限({v.retry_count}/{max_retries_for(err_type)})")
         failed = retryable
-        # #12: 动态抓取已停用，不查询 PendingDynamic
+        pending = (await session.execute(select(PendingDynamic).where(PendingDynamic.mid == mid,
+            PendingDynamic.retry_count < retries))).scalars().all()
         wm = await session.get(FetchWatermark, mid)
         last_bvid, last_dyn = (wm.last_bvid, wm.last_dyn_id) if wm else (None, None)
     attempted = set()
@@ -386,14 +386,15 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
         video = await session.get(Video, bvid)
         video.analysis_status = "processing"
         await session.commit()
-    # 重试时：优先使用已有数据，缺失时重新抓取
+    # 重试时：跳过评论/弹幕抓取以节省资源，但保留已有完整数据
     comment_data = {"replies": [], "total": 0}
     danmaku_data = {"items": [], "total": 0}
     comments, danmakus = [], []
     existing_comments = existing_danmaku = None
     use_existing_transcript = False
     if is_retry:
-        print(f"[fetcher] {bvid}: 重试模式——读取已有数据，缺失时重新抓取")
+        print(f"[fetcher] {bvid}: 重试降级模式——跳过评论/弹幕抓取，保留已有数据")
+        # 读取已有完整数据，避免覆盖
         async with async_session() as session:
             existing_transcript = await session.get(Transcript, bvid)
             existing_comments = (await session.execute(
@@ -402,25 +403,12 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
             existing_danmaku = (await session.execute(
                 select(DanmakuAnalysis).where(DanmakuAnalysis.bvid == bvid)
             )).scalar_one_or_none()
-        # 已有完整转写直接使用
+        # Issue #5: 如果已有完整转写，直接使用不重新获取
         if existing_transcript and existing_transcript.full_text and len(existing_transcript.full_text) > 100:
             transcript_text = existing_transcript.full_text
             use_existing_transcript = True
             print(f"[fetcher] {bvid}: 使用已有转写({len(transcript_text)}字)")
-        # 已有完整评论/弹幕保留，缺失时重新抓取
-        has_comments = existing_comments and (existing_comments.total_count or 0) > 0
-        has_danmaku = existing_danmaku and (existing_danmaku.total_count or 0) > 0
-        aid = vinfo.get("aid", 0)
-        if not has_comments:
-            if aid:
-                try:
-                    comment_data = await client.get_comments(oid=aid, oid_type=1, count=20)
-                except Exception as e:
-                    print(f"[fetcher] {bvid}: 评论获取失败({e})，跳过")
-            comments = comment_data["replies"]
-        if not has_danmaku:
-            danmaku_data = await client.get_danmaku(cid, max_count=2000)
-            danmakus = danmaku_data["items"]
+        # 不传 hot_comments 给分析器（格式不兼容），只传总数用于统计
     else:
         aid = vinfo.get("aid", 0)
         if aid:
@@ -672,15 +660,10 @@ def _latest_closed_date():
 
 async def _mark_digest_dirty(session, publish_time):
     if publish_time is None:
-        return
+        return  # Issue: 防御性——未知时间不标记 dirty
     day = publish_time.date() + timedelta(days=1 if publish_time.hour >= _cutoff_hour() else 0)
-    existing = await session.get(DirtyDigest, day)
-    if existing is None:
+    if await session.get(DirtyDigest, day) is None:
         session.add(DirtyDigest(digest_date=day))
-    elif (existing.retry_count or 0) > 0:
-        # #9: 新内容到达时重置重试计数，允许重新生成日报
-        existing.retry_count = 0
-        existing.error_message = None
 
 
 async def regenerate_dirty_digests(include_latest=False):

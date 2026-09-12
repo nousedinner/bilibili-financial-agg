@@ -650,13 +650,11 @@ async def _recover_interrupted():
     async with async_session() as session:
         await session.execute(update(FetchJob).where(FetchJob.status == "running").values(
             status="interrupted", finished_at=_utcnow(), error_message="Service restarted"))
-        # #6: 恢复时增加 retry_count，防止无限重试
-        await session.execute(text(
-            "UPDATE videos SET fetch_status='failed', error_message='Previous task interrupted', "
-            "retry_count=retry_count+1 WHERE fetch_status='pending'"))
-        await session.execute(text(
-            "UPDATE videos SET analysis_status='failed', error_message='Service restarted during analysis', "
-            "retry_count=retry_count+1 WHERE analysis_status='processing'"))
+        await session.execute(update(Video).where(Video.fetch_status == "pending").values(
+            fetch_status="failed", error_message="Previous task interrupted"))
+        # Issue #8: 恢复卡在 processing 的分析状态
+        await session.execute(update(Video).where(Video.analysis_status == "processing").values(
+            analysis_status="failed", error_message="Service restarted during analysis"))
         await session.commit()
 
 
@@ -713,14 +711,19 @@ async def _run_job(kind, work):
         job_id = await _reserve_job(kind)
     except HTTPException as exc:
         if exc.status_code == 409:
-            # #7: busy 时等待一次重试，不创建无法消费的 queued 记录
-            print(f"[scheduler] {kind}: busy, waiting 60s for retry...")
+            # Issue #11: busy 时持久化 queued 标记，下次调度可补跑
+            print(f"[scheduler] {kind}: busy, creating queued job for retry...")
+            async with async_session() as session:
+                job = FetchJob(id=str(uuid4()), kind=kind, status="queued",
+                    started_at=_utcnow(), error_message="Delayed: lock busy")
+                session.add(job)
+                await session.commit()
             await asyncio.sleep(60)
             try:
                 job_id = await _reserve_job(kind)
             except HTTPException:
-                print(f"[scheduler] {kind}: still busy, will retry next cron cycle")
-                return {"status": "busy"}
+                print(f"[scheduler] {kind}: still busy after retry, job queued for next cycle")
+                return {"status": "busy", "queued": True}
         else:
             raise
     return await _execute_job(job_id, work)
@@ -792,8 +795,6 @@ async def _retry_work():
             print(f"[retry_work] {v.bvid}: {err_type} 达上限({v.retry_count})，跳过")
             continue
         retryable.append(v)
-        if len(retryable) >= 50:
-            break
     result = {"processed": 0, "skipped": len(videos) - len(retryable), "failed": 0}
     async with _bili_client() as client:
         for video in retryable:

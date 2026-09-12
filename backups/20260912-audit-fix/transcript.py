@@ -50,10 +50,6 @@ async def fetch_transcript(client: BiliClient, bvid: str, cid: int, duration: in
         print(f"[transcript] {bvid}: AI字幕降级失败: {e}")
 
     # Layer 3: MiMo ASR (切片≤3min)
-    # Issue #7: duration 缺失或为0时拒绝进入ASR（防止绕过60分钟限制）
-    if not duration or duration <= 0:
-        print(f"[transcript] {bvid}: duration={duration} 无效，跳过ASR")
-        return {"source": "skipped", "text": "", "segments": 0}
     # 60分钟以上无字幕的视频跳过ASR——成本高且直播回放质量低
     if duration > 3600:
         print(f"[transcript] {bvid}: {duration}s (>{60}min) 无字幕，跳过ASR")

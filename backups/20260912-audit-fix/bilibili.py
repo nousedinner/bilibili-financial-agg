@@ -370,17 +370,11 @@ class BiliClient:
 
     async def download_audio(self, url: str) -> bytes:
         limit = int(get_config().get("asr", {}).get("max_audio_bytes", 256 * 1024 * 1024))
-        # Issue #7: 流式下载——传输过程中检查大小，避免大文件全部读入内存
-        r = await _curl_session.get(url, headers=_HEADERS, timeout=120, stream=True)
+        r = await _curl_session.get(url, headers=_HEADERS, timeout=120)
         r.raise_for_status()
-        chunks = []
-        downloaded = 0
-        async for chunk in r.aiter_bytes(chunk_size=64 * 1024):
-            downloaded += len(chunk)
-            if downloaded > limit:
-                raise ValueError(f"Audio exceeds configured download limit ({limit} bytes)")
-            chunks.append(chunk)
-        return b"".join(chunks)
+        if len(r.content) > limit:
+            raise ValueError("Audio exceeds configured download limit")
+        return r.content
 
     # ------------------------------------------------------------------
     # 评论

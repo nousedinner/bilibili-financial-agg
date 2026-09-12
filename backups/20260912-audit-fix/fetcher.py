@@ -21,16 +21,6 @@ from src.models import (
 from src.db import async_session
 from src.config import get_config, get_env
 
-# ── 硬性时间下限：所有处理入口必须遵守 ──
-_HARD_SINCE = datetime.combine(
-    date.fromisoformat(get_config().get("data", {}).get("backfill_since", "2026-07-01")),
-    dt_time(),
-)
-
-def _is_before_hard_since(pub_dt) -> bool:
-    """发布时间是否早于硬性下限（含 None/无效时间）。"""
-    return pub_dt is None or pub_dt < _HARD_SINCE
-
 
 def _utcnow() -> datetime:
     """返回当前时间（naive，MySQL CST时区）。"""
@@ -114,8 +104,7 @@ async def run_backfill(mid: int, since: str, cap: int = 20) -> dict:
             reached_date = False
             for v in fresh:
                 seen.add(v["bvid"])
-                pub = _publish_time(v.get("created", 0))
-                if pub is None or pub < since_dt:
+                if _publish_time(v.get("created", 0)) < since_dt:
                     reached_date = True
                     continue
                 async with async_session() as session:
@@ -233,10 +222,8 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str) -> dict:
     cap = max(1, int(cfg.get("data", {}).get("first_run_cap", 20)))
     since = cfg.get("data", {}).get("backfill_since")
     since_dt = datetime.combine(date.fromisoformat(since), dt_time()) if since else None
-    max_scan_pages = 50  # Issue #5: 无论水位线状态，每轮最多扫描50页
     seen, videos, complete = set(), [], False
-    watermark_found = not last_bvid  # 无水位线时视为"已找到"
-    for page in range(1, max_scan_pages + 1):
+    for page in range(1, 1001):
         data = await client.get_video_list(mid, page=page, page_size=30)
         batch = data.get("list", {}).get("vlist", [])
         if not batch:
@@ -248,28 +235,23 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str) -> dict:
         stop = False
         for v in fresh:
             seen.add(v["bvid"])
-            if not watermark_found and v["bvid"] == last_bvid:
-                watermark_found = True
+            if v["bvid"] == last_bvid:
                 stop = True
                 continue
-            pub = _publish_time(v.get("created", 0))
-            if since_dt and (pub is None or pub < since_dt):
+            if since_dt and _publish_time(v.get("created", 0)) < since_dt:
                 stop = True
                 continue
             if not stop:
                 videos.append(v)
-        # Issue #5: 每轮全局上限——无论水位线是否有效
-        if len(videos) >= cap:
+        if not last_bvid and len(videos) >= cap:
             videos = videos[:cap]
-            complete = True
+            complete = True  # Explicit first-run scope; older content belongs to backfill.
             break
         if stop:
             complete = True
             break
     if not complete:
-        # Issue #5: 水位线失效时给出明确提示
-        hint = "watermark not found; use backfill" if last_bvid and not watermark_found else "use backfill"
-        raise ValueError(f"Video scan limit exceeded ({max_scan_pages} pages); {hint}")
+        raise ValueError("Video scan limit exceeded; watermark retained, use backfill")
     for v in videos:
         if v["bvid"] in attempted:
             continue
@@ -367,28 +349,13 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
         video = await session.get(Video, bvid)
         video.analysis_status = "processing"
         await session.commit()
-    # 重试时：跳过评论/弹幕抓取以节省资源，但保留已有完整数据
+    # 重试时降级：跳过评论/弹幕，缩短转写文本，减少LLM负担
     comment_data = {"replies": [], "total": 0}
     danmaku_data = {"items": [], "total": 0}
-    comments, danmakus = [], []
-    existing_transcript = existing_comments = existing_danmaku = None
     if is_retry:
-        print(f"[fetcher] {bvid}: 重试降级模式——跳过评论/弹幕抓取，保留已有数据")
-        # 读取已有完整数据，避免覆盖
-        async with async_session() as session:
-            existing_transcript = await session.get(Transcript, bvid)
-            existing_comments = (await session.execute(
-                select(CommentAnalysis).where(CommentAnalysis.ref_id == bvid)
-            )).scalar_one_or_none()
-            existing_danmaku = (await session.execute(
-                select(DanmakuAnalysis).where(DanmakuAnalysis.bvid == bvid)
-            )).scalar_one_or_none()
-        # 如果已有完整评论/弹幕数据，用于 LLM 输入
-        if existing_comments and (existing_comments.total_count or 0) > 0:
-            comments = existing_comments.hot_comments or []
-            comment_data["total"] = existing_comments.total_count
-        if existing_danmaku and (existing_danmaku.total_count or 0) > 0:
-            danmaku_data["total"] = existing_danmaku.total_count
+        print(f"[fetcher] {bvid}: 重试降级模式——跳过评论/弹幕，截短转写文本")
+        comments, danmakus = [], []
+        transcript_text = transcript_text[:4000]
     else:
         aid = vinfo.get("aid", 0)
         if aid:
@@ -403,23 +370,18 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
     if analysis.get("analysis_failed") or not _validate_analysis(analysis):
         raise ValueError(f"LLM analysis failed for {bvid}")
     async with async_session() as session:
-        # 始终写入完整转写文本（不做截断）
         await session.merge(Transcript(bvid=bvid, source=transcript_result["source"],
             full_text=transcript_text, segment_count=transcript_result["segments"]))
         fields = ("summary", "key_points", "sentiment", "sentiment_score", "risk_warnings", "data_citations", "tags")
         await session.merge(Summary(bvid=bvid, **{key: analysis[key] for key in fields}))
-        # Issue #4: 仅在有新抓取数据时覆盖 CommentAnalysis/DanmakuAnalysis
-        # retry 模式且已有完整数据时保留原值不覆盖
         cs, ds = analysis["comment_sentiment"], analysis["danmaku_sentiment"]
-        if not (is_retry and existing_comments and (existing_comments.total_count or 0) > 0):
-            await session.merge(CommentAnalysis(ref_id=bvid, ref_type="video", total_count=comment_data["total"],
-                fetched_count=len(comments), sentiment_bullish=cs["bullish"], sentiment_bearish=cs["bearish"],
-                sentiment_neutral=cs["neutral"], hot_comments=[c.get("content", {}).get("message", "") for c in comments[:5]],
-                keywords=analysis["comment_keywords"]))
-        if not (is_retry and existing_danmaku and (existing_danmaku.total_count or 0) > 0):
-            await session.merge(DanmakuAnalysis(bvid=bvid, total_count=danmaku_data["total"], sampled_count=len(danmakus),
-                sentiment_bullish=ds["bullish"], sentiment_bearish=ds["bearish"], sentiment_neutral=ds["neutral"],
-                keywords=analysis["danmaku_keywords"]))
+        await session.merge(CommentAnalysis(ref_id=bvid, ref_type="video", total_count=comment_data["total"],
+            fetched_count=len(comments), sentiment_bullish=cs["bullish"], sentiment_bearish=cs["bearish"],
+            sentiment_neutral=cs["neutral"], hot_comments=[c.get("content", {}).get("message", "") for c in comments[:5]],
+            keywords=analysis["comment_keywords"]))
+        await session.merge(DanmakuAnalysis(bvid=bvid, total_count=danmaku_data["total"], sampled_count=len(danmakus),
+            sentiment_bullish=ds["bullish"], sentiment_bearish=ds["bearish"], sentiment_neutral=ds["neutral"],
+            keywords=analysis["danmaku_keywords"]))
         video = await session.get(Video, bvid)
         video.title, video.duration, video.view_count = title, dur_sec, vinfo.get("play", 0)
         video.fetch_status, video.retry_count, video.error_message = "ok", 0, None
@@ -526,14 +488,12 @@ async def _generate_digest(bloggers: list, results: dict, target_date: date = No
                 continue
             rows = (await session.execute(select(Video, Summary).join(Summary, Video.bvid == Summary.bvid)
                 .where(Video.mid == b["mid"], Video.fetch_status == "ok", Video.publish_time >= start,
-                    Video.publish_time < end,
-                    Video.publish_time >= _HARD_SINCE))).all()  # Issue #2: 绝对日期下限
+                    Video.publish_time < end))).all()
             videos = [{"bvid": v.bvid, "title": v.title or "", "summary": s.summary or "",
                 "sentiment": s.sentiment or "neutral", "key_points": s.key_points or []} for v, s in rows]
             scores.extend(s.sentiment_score for _, s in rows if s.sentiment_score is not None)
             dyns = (await session.execute(select(Dynamic).where(Dynamic.mid == b["mid"],
-                Dynamic.publish_time >= start, Dynamic.publish_time < end,
-                Dynamic.publish_time >= _HARD_SINCE))).scalars().all()  # Issue #2: 绝对日期下限
+                Dynamic.publish_time >= start, Dynamic.publish_time < end))).scalars().all()
             if videos or dyns:
                 analyses.append({"mid": b["mid"], "name": b.get("name", str(b["mid"])), "videos": videos,
                     "dynamics": [{"summary": d.summary or "", "sentiment": d.sentiment or "neutral"} for d in dyns]})
@@ -555,10 +515,7 @@ async def _generate_digest(bloggers: list, results: dict, target_date: date = No
 
 
 def _publish_time(timestamp):
-    """将时间戳转为 naive datetime；0/None 返回 None（不伪装为当前时间）。"""
-    if not timestamp:
-        return None
-    return datetime.fromtimestamp(timestamp, ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+    return datetime.fromtimestamp(timestamp, ZoneInfo("Asia/Shanghai")).replace(tzinfo=None) if timestamp else _utcnow()
 
 
 def _video_info(video):
@@ -571,12 +528,6 @@ async def _process_video(client, mid, vinfo, is_retry=False):
     bvid = vinfo.get("bvid")
     if not bvid:
         raise ValueError("Missing bvid")
-    # ── Issue #1 兜底：所有入口（扫描/回填/重试/补偿）最终都走这里 ──
-    pub_dt = _publish_time(vinfo.get("created", 0))
-    if _is_before_hard_since(pub_dt):
-        raise ValueError(
-            f"Rejected: publish_time {pub_dt} is before hard limit {_HARD_SINCE.date()}"
-        )
     async with async_session() as session:
         video = await session.get(Video, bvid)
         if not video:
@@ -645,15 +596,12 @@ async def _mark_digest_dirty(session, publish_time):
 
 async def regenerate_dirty_digests(include_latest=False):
     latest = _latest_closed_date()
-    hard_since_date = _HARD_SINCE.date()
     async with async_session() as session:
-        if include_latest and latest >= hard_since_date and await session.get(DirtyDigest, latest) is None:
+        if include_latest and await session.get(DirtyDigest, latest) is None:
             session.add(DirtyDigest(digest_date=latest))
             await session.commit()
         dates = (await session.execute(select(DirtyDigest.digest_date).where(
-            DirtyDigest.digest_date <= latest,
-            DirtyDigest.digest_date >= hard_since_date,  # Issue #2: 绝对日期下限
-        ).order_by(DirtyDigest.digest_date))).scalars().all()
+            DirtyDigest.digest_date <= latest).order_by(DirtyDigest.digest_date))).scalars().all()
     bloggers = await _get_enabled_bloggers()
     result = {"generated": 0, "failed": 0}
     for day in dates:

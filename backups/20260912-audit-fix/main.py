@@ -22,7 +22,7 @@ from src.models import (
     CommentAnalysis, DanmakuAnalysis, Dynamic,
     FetchWatermark, DailyDigest, ApiUser, FetchJob,
 )
-from src.fetcher import run_daily_fetch, run_fetch_only, run_backfill, run_retry_failed, _get_enabled_bloggers, _generate_digest, regenerate_dirty_digests, _process_video, _video_info, _utcnow, _HARD_SINCE
+from src.fetcher import run_daily_fetch, run_fetch_only, run_backfill, run_retry_failed, _get_enabled_bloggers, _generate_digest, regenerate_dirty_digests, _process_video, _video_info, _utcnow
 
 
 # ------------------------------------------------------------------
@@ -480,8 +480,6 @@ async def get_feed(
             vk, dk = vk.collate("utf8mb4_bin"), dk.collate("utf8mb4_bin")
         vs = select(Video, Summary).outerjoin(Summary, Video.bvid == Summary.bvid).where(Video.mid.in_(enabled))
         ds = select(Dynamic).where(Dynamic.mid.in_(enabled))
-        # Issue #8: Feed 只展示已完成的内容，过滤失败/处理中的记录
-        vs = vs.where(Video.fetch_status == "ok", Video.analysis_status == "completed")
         if blogger:
             vs, ds = vs.where(Video.mid == blogger), ds.where(Dynamic.mid == blogger)
         if sentiment:
@@ -529,22 +527,17 @@ async def list_daily_dates():
             func.left(func.json_unquote(func.json_extract(DailyDigest.content, "$.summary")), 100).label("summary"),
         ).order_by(desc(DailyDigest.digest_date))
         rows = (await session.execute(stmt)).all()
-        # Issue #9: dates 返回字符串列表（对齐 Android DailyDatesResponse: List<String>）
-        date_strings = []
-        date_details = {}  # 扩展数据供需要详情的客户端使用
+        dates = []
         for r in rows:
-            ds = r.digest_date.isoformat()
-            date_strings.append(ds)
-            detail = {}
+            item = {"date": r.digest_date.isoformat()}
             if r.overall_sentiment:
-                detail["overall_sentiment"] = r.overall_sentiment
+                item["overall_sentiment"] = r.overall_sentiment
             if r.sentiment_score is not None:
-                detail["sentiment_score"] = float(r.sentiment_score)
+                item["sentiment_score"] = float(r.sentiment_score)
             if r.summary:
-                detail["summary"] = r.summary
-            if detail:
-                date_details[ds] = detail
-        return {"code": 0, "data": {"dates": date_strings, "details": date_details}}
+                item["summary"] = r.summary
+            dates.append(item)
+        return {"code": 0, "data": {"dates": dates}}
 
 
 @app.get("/api/daily/{date_str}", dependencies=[Depends(require_api_key)])
@@ -612,9 +605,6 @@ class BackfillRequest(BaseModel):
 async def trigger_backfill(req: BackfillRequest):
     if req.since > _utcnow().date():
         raise HTTPException(400, "since 不能晚于今天")
-    # Issue #1: API 层拒绝早于硬性下限的日期
-    if req.since < _HARD_SINCE.date():
-        raise HTTPException(400, f"since 不能早于 {_HARD_SINCE.date()}")
     if req.mid:
         async with async_session() as session:
             b = await session.get(Blogger, req.mid)
@@ -652,9 +642,6 @@ async def _recover_interrupted():
             status="interrupted", finished_at=_utcnow(), error_message="Service restarted"))
         await session.execute(update(Video).where(Video.fetch_status == "pending").values(
             fetch_status="failed", error_message="Previous task interrupted"))
-        # Issue #8: 恢复卡在 processing 的分析状态
-        await session.execute(update(Video).where(Video.analysis_status == "processing").values(
-            analysis_status="failed", error_message="Service restarted during analysis"))
         await session.commit()
 
 
@@ -711,16 +698,8 @@ async def _run_job(kind, work):
         job_id = await _reserve_job(kind)
     except HTTPException as exc:
         if exc.status_code == 409:
-            # Issue #10: 定时任务 busy 时延迟重试，不静默丢弃
-            print(f"[scheduler] {kind}: busy, retrying in 60s...")
-            await asyncio.sleep(60)
-            try:
-                job_id = await _reserve_job(kind)
-            except HTTPException:
-                print(f"[scheduler] {kind}: still busy after retry, skipping this cycle")
-                return {"status": "busy"}
-        else:
-            raise
+            return {"status": "busy"}
+        raise
     return await _execute_job(job_id, work)
 
 
@@ -751,46 +730,21 @@ async def _digest_work():
 async def _backfill_work(mid, since):
     bloggers = [{"mid": mid}] if mid else await _get_enabled_bloggers()
     results = []
-    # Issue #6: 共享预算——所有博主共用 backfill_cap
-    remaining = get_config().get("data", {}).get("backfill_cap", 20)
     for b in bloggers:
-        if remaining <= 0:
-            break
-        try:
-            r = await run_backfill(b["mid"], since, remaining)
-            results.append(r)
-            remaining -= r.get("attempted", 0)
-        except Exception as exc:
-            # Issue #6: 单博主异常不阻塞后续博主
-            print(f"[backfill] blogger {b['mid']} failed: {exc}")
-            results.append({"mid": b["mid"], "name": b.get("name", str(b["mid"])),
-                            "processed": 0, "failed": 0, "attempted": 0, "error": str(exc)[:200]})
-    # Issue #6: 补偿阶段始终执行，不受博主异常影响
+        results.append(await run_backfill(b["mid"], since, get_config().get("data", {}).get("backfill_cap", 20)))
     digests = await regenerate_dirty_digests()
-    return {"bloggers": results, "failed": sum(r.get("failed", 0) for r in results) + digests["failed"], "digests": digests}
+    return {"bloggers": results, "failed": sum(r["failed"] for r in results) + digests["failed"], "digests": digests}
 
 
 async def _retry_work():
     from src.fetcher import _bili_client
-    from src.retry_strategy import classify_error, is_permanent, should_retry
     async with async_session() as session:
         videos = (await session.execute(select(Video).outerjoin(Transcript, Video.bvid == Transcript.bvid)
             .outerjoin(Summary, Video.bvid == Summary.bvid).where(Video.mid.in_(select(Blogger.mid).where(Blogger.enabled == True)),
                 or_(Video.fetch_status != "ok", Transcript.bvid.is_(None), Transcript.full_text == "", Summary.bvid.is_(None))))).scalars().all()
-    # Issue #3: 统一重试资格检查——与 run_retry_failed() 一致
-    retryable = []
-    for v in videos:
-        err_type = classify_error(v.error_message or "", v.duration or 0)
-        if is_permanent(err_type):
-            print(f"[retry_work] {v.bvid}: 永久失败({err_type})，跳过")
-            continue
-        if not should_retry(v.retry_count or 0, err_type):
-            print(f"[retry_work] {v.bvid}: {err_type} 达上限({v.retry_count})，跳过")
-            continue
-        retryable.append(v)
-    result = {"processed": 0, "skipped": len(videos) - len(retryable), "failed": 0}
+    result = {"processed": 0, "failed": 0}
     async with _bili_client() as client:
-        for video in retryable:
+        for video in videos:
             try:
                 await _process_video(client, video.mid, _video_info(video), is_retry=True)
                 result["processed"] += 1

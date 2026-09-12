@@ -711,14 +711,19 @@ async def _run_job(kind, work):
         job_id = await _reserve_job(kind)
     except HTTPException as exc:
         if exc.status_code == 409:
-            # Issue #10: 定时任务 busy 时延迟重试，不静默丢弃
-            print(f"[scheduler] {kind}: busy, retrying in 60s...")
+            # Issue #11: busy 时持久化 queued 标记，下次调度可补跑
+            print(f"[scheduler] {kind}: busy, creating queued job for retry...")
+            async with async_session() as session:
+                job = FetchJob(id=str(uuid4()), kind=kind, status="queued",
+                    started_at=_utcnow(), error_message="Delayed: lock busy")
+                session.add(job)
+                await session.commit()
             await asyncio.sleep(60)
             try:
                 job_id = await _reserve_job(kind)
             except HTTPException:
-                print(f"[scheduler] {kind}: still busy after retry, skipping this cycle")
-                return {"status": "busy"}
+                print(f"[scheduler] {kind}: still busy after retry, job queued for next cycle")
+                return {"status": "busy", "queued": True}
         else:
             raise
     return await _execute_job(job_id, work)
@@ -776,6 +781,8 @@ async def _retry_work():
     async with async_session() as session:
         videos = (await session.execute(select(Video).outerjoin(Transcript, Video.bvid == Transcript.bvid)
             .outerjoin(Summary, Video.bvid == Summary.bvid).where(Video.mid.in_(select(Blogger.mid).where(Blogger.enabled == True)),
+                Video.publish_time >= _HARD_SINCE,  # Issue #2: 日期下限
+                Video.publish_time.isnot(None),
                 or_(Video.fetch_status != "ok", Transcript.bvid.is_(None), Transcript.full_text == "", Summary.bvid.is_(None))))).scalars().all()
     # Issue #3: 统一重试资格检查——与 run_retry_failed() 一致
     retryable = []

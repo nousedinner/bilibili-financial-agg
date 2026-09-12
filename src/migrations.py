@@ -20,6 +20,17 @@ def upgrade(connection):
             connection.execute(text("ALTER TABLE videos ADD COLUMN analysis_status ENUM('pending','processing','completed','failed') NOT NULL DEFAULT 'pending'"))
         else:
             connection.execute(text("ALTER TABLE videos ADD COLUMN analysis_status VARCHAR(20) NOT NULL DEFAULT 'pending'"))
+        # Issue #9: 迁移恢复已完成视频的 analysis_status
+        connection.execute(text("""
+            UPDATE videos SET analysis_status = 'completed'
+            WHERE fetch_status = 'ok'
+            AND bvid IN (SELECT bvid FROM transcripts WHERE full_text IS NOT NULL AND full_text != '')
+            AND bvid IN (SELECT bvid FROM summaries WHERE summary IS NOT NULL AND summary != '')
+        """))
+    # Issue #10: DirtyDigest retry_count 列
+    dirty_cols = {c["name"] for c in inspect(connection).get_columns("dirty_digests")} if "dirty_digests" in inspector.get_table_names() else set()
+    if "retry_count" not in dirty_cols:
+        connection.execute(text("ALTER TABLE dirty_digests ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"))
     if connection.dialect.name == "mysql":
         full_text = next(c for c in inspect(connection).get_columns("transcripts") if c["name"] == "full_text")
         if str(full_text["type"]).upper() != "LONGTEXT":

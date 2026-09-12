@@ -375,11 +375,14 @@ class BiliClient:
         r.raise_for_status()
         chunks = []
         downloaded = 0
-        async for chunk in r.aiter_bytes(chunk_size=64 * 1024):
-            downloaded += len(chunk)
-            if downloaded > limit:
-                raise ValueError(f"Audio exceeds configured download limit ({limit} bytes)")
-            chunks.append(chunk)
+        try:
+            async for chunk in r.aiter_content(chunk_size=64 * 1024):
+                downloaded += len(chunk)
+                if downloaded > limit:
+                    raise ValueError(f"Audio exceeds configured download limit ({limit} bytes)")
+                chunks.append(chunk)
+        finally:
+            await r.aclose()
         return b"".join(chunks)
 
     # ------------------------------------------------------------------

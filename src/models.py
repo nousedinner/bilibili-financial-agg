@@ -153,6 +153,7 @@ class DirtyDigest(Base):
     __tablename__ = "dirty_digests"
     digest_date = Column(Date, primary_key=True)
     error_message = Column(Text)
+    retry_count = Column(Integer, default=0)  # Issue #10: 失败计数
 
 
 class FetchJob(Base):

@@ -6,8 +6,16 @@ VERSION = 3
 
 
 def upgrade(connection):
+    # #7: 拒绝高版本数据库被旧程序覆盖
+    inspector = inspect(connection)
+    if "schema_version" in inspector.get_table_names():
+        current_ver = connection.execute(text("SELECT MAX(version) FROM schema_version")).scalar()
+        if current_ver and current_ver > VERSION:
+            raise RuntimeError(
+                f"Database version {current_ver} is newer than program version {VERSION}. "
+                "Cannot downgrade. Deploy the correct version first.")
     Base.metadata.create_all(connection)
-    # #3: create_all 后重建 Inspector，避免复用旧缓存导致重复加列
+    # create_all 后重建 Inspector，避免复用旧缓存导致重复加列
     inspector = inspect(connection)
 
     # ── videos 表 ──

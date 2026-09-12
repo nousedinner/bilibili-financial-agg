@@ -224,10 +224,32 @@ class Acceptance(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(data.get('items', [])), 1)
 
     async def test_partial_asr_is_not_reported_complete(self):
-        c = SimpleNamespace(get_audio_url=AsyncMock(return_value='mock://audio'), download_audio=AsyncMock(return_value=b'12345678'))
-        with patch.object(transcript, '_split_audio', AsyncMock(return_value=[b'part1', b'part2'])), patch.object(transcript, '_call_asr', AsyncMock(side_effect=['first half only', None])):
+        import tempfile, os
+        # 创建临时文件供mock返回
+        fd1, audio_path = tempfile.mkstemp(suffix=".m4a")
+        os.write(fd1, b'12345678')
+        os.close(fd1)
+        fd2, mp3_path = tempfile.mkstemp(suffix=".mp3")
+        os.write(fd2, b'mp3data')
+        os.close(fd2)
+        fd3, chunk1 = tempfile.mkstemp(suffix=".mp3")
+        os.write(fd3, b'part1')
+        os.close(fd3)
+        fd4, chunk2 = tempfile.mkstemp(suffix=".mp3")
+        os.write(fd4, b'part2')
+        os.close(fd4)
+        c = SimpleNamespace(
+            get_audio_url=AsyncMock(return_value='mock://audio'),
+            download_audio=AsyncMock(return_value=audio_path))
+        with patch.object(transcript, '_to_mp3_path', AsyncMock(return_value=mp3_path)), \
+             patch.object(transcript, '_split_audio_from_file', AsyncMock(return_value=[chunk1, chunk2])), \
+             patch.object(transcript, '_call_asr', AsyncMock(side_effect=['first half only', None])):
             with self.assertRaisesRegex(ValueError, '2/2 failed'):
                 await transcript._asr_transcribe(c, 'BVpartial', 1, 360)
+        # 清理
+        for p in (audio_path, mp3_path):
+            try: os.unlink(p)
+            except: pass
 
     async def test_analysis_validator_rejects_invalid_types_and_range(self):
         self.assertFalse(analyzer._validate_analysis({'summary': None, 'key_points': 'wrong type', 'sentiment': 'neutral', 'sentiment_score': 999}))

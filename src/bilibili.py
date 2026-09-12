@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json as _json
+import os
 import subprocess
 import time
 import urllib.parse
@@ -368,10 +369,10 @@ class BiliClient:
             return audio_list[0].get("baseUrl") or audio_list[0].get("base_url")
         return None
 
-    async def download_audio(self, url: str) -> bytes:
-        import tempfile, os
+    async def download_audio(self, url: str) -> str:
+        import tempfile
         limit = int(get_config().get("asr", {}).get("max_audio_bytes", 256 * 1024 * 1024))
-        # #8: 流式写入临时文件，避免大文件全部驻留内存
+        # #5: 返回临时文件路径而非bytes，避免全量驻留内存
         r = await _curl_session.get(url, headers=_HEADERS, timeout=120, stream=True)
         r.raise_for_status()
         fd, tmp_path = tempfile.mkstemp(suffix=".audio")
@@ -383,13 +384,14 @@ class BiliClient:
                     if downloaded > limit:
                         raise ValueError(f"Audio exceeds configured download limit ({limit} bytes)")
                     f.write(chunk)
-            with open(tmp_path, "rb") as f:
-                return f.read()
-        finally:
+            return tmp_path
+        except Exception:
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
+            raise
+        finally:
             await r.aclose()
 
     # ------------------------------------------------------------------

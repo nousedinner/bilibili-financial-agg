@@ -92,14 +92,15 @@ async def run_daily_fetch() -> dict:
 
 
 async def run_backfill(mid: int, since: str, cap: int = 20) -> dict:
-    since_dt = datetime.combine(date.fromisoformat(since), dt_time())
-    async with async_session() as session:
-        blogger = await session.get(Blogger, mid)
-        if not blogger or not blogger.enabled:
-            raise ValueError(f"Enabled blogger {mid} not found")
-    result = {"mid": mid, "name": blogger.name, "processed": 0, "failed": 0, "attempted": 0}
-    seen = set()
+    result = {"mid": mid, "name": "unknown", "processed": 0, "failed": 0, "attempted": 0}
     try:
+        since_dt = datetime.combine(date.fromisoformat(since), dt_time())
+        async with async_session() as session:
+            blogger = await session.get(Blogger, mid)
+            if not blogger or not blogger.enabled:
+                raise ValueError(f"Enabled blogger {mid} not found")
+            result["name"] = blogger.name
+        seen = set()
         async with _bili_client() as client:
             for page in range(1, 1001):
                 data = await client.get_video_list(mid, page=page, page_size=30)
@@ -159,13 +160,13 @@ async def run_retry_failed() -> dict:
     interval = get_config().get("limits", {}).get("video_interval_seconds", 5)
     
     async with async_session() as session:
-        # #5: 先取较大候选集，Python 侧筛资格后再截取
+        # #1: SQL排序——retry_count ASC优先处理可重试记录，permanent记录沉底
         candidates = (await session.execute(select(Video).where(
             Video.fetch_status.in_(["failed", "pending"]),
             Video.mid.in_([b["mid"] for b in bloggers]),
             Video.publish_time >= _HARD_SINCE,
             Video.publish_time.isnot(None),
-        ).limit(200))).scalars().all()
+        ).order_by(Video.retry_count.asc().nullslast()).limit(200))).scalars().all()
     # 筛资格后取前50条
     batch_limit = 50
     failed = []
@@ -386,14 +387,15 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
         video = await session.get(Video, bvid)
         video.analysis_status = "processing"
         await session.commit()
-    # 重试时：优先使用已有数据，缺失时重新抓取
+    # #3: 重试时——先读已有数据，按需远程获取，恢复aid
     comment_data = {"replies": [], "total": 0}
     danmaku_data = {"items": [], "total": 0}
     comments, danmakus = [], []
     existing_comments = existing_danmaku = None
     use_existing_transcript = False
+    aid = vinfo.get("aid", 0)
     if is_retry:
-        print(f"[fetcher] {bvid}: 重试模式——读取已有数据，缺失时重新抓取")
+        print(f"[fetcher] {bvid}: 重试模式——优先读已有数据，缺失时远程获取")
         async with async_session() as session:
             existing_transcript = await session.get(Transcript, bvid)
             existing_comments = (await session.execute(
@@ -402,27 +404,36 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
             existing_danmaku = (await session.execute(
                 select(DanmakuAnalysis).where(DanmakuAnalysis.bvid == bvid)
             )).scalar_one_or_none()
-        # 已有完整转写直接使用
+            # #3: 恢复aid——vinfo可能没有
+            if not aid:
+                db_video = await session.get(Video, bvid)
+                aid = getattr(db_video, 'aid', 0) or 0
+        # 已有完整转写直接使用，不走远程
         if existing_transcript and existing_transcript.full_text and len(existing_transcript.full_text) > 100:
             transcript_text = existing_transcript.full_text
             use_existing_transcript = True
             print(f"[fetcher] {bvid}: 使用已有转写({len(transcript_text)}字)")
+        else:
+            # 远程获取字幕
+            transcript_result = await fetch_transcript(client, bvid, cid, dur_sec)
+            transcript_text = transcript_result.get("text", "")
         # 已有完整评论/弹幕保留，缺失时重新抓取
         has_comments = existing_comments and (existing_comments.total_count or 0) > 0
         has_danmaku = existing_danmaku and (existing_danmaku.total_count or 0) > 0
-        aid = vinfo.get("aid", 0)
-        if not has_comments:
-            if aid:
-                try:
-                    comment_data = await client.get_comments(oid=aid, oid_type=1, count=20)
-                except Exception as e:
-                    print(f"[fetcher] {bvid}: 评论获取失败({e})，跳过")
+        if not has_comments and aid:
+            try:
+                comment_data = await client.get_comments(oid=aid, oid_type=1, count=20)
+            except Exception as e:
+                print(f"[fetcher] {bvid}: 评论获取失败({e})，跳过")
             comments = comment_data["replies"]
+        elif has_comments:
+            comments = []
         if not has_danmaku:
             danmaku_data = await client.get_danmaku(cid, max_count=2000)
             danmakus = danmaku_data["items"]
+        elif has_danmaku:
+            danmakus = []
     else:
-        aid = vinfo.get("aid", 0)
         if aid:
             try:
                 comment_data = await client.get_comments(oid=aid, oid_type=1, count=20)

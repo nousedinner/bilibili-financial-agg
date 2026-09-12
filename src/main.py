@@ -12,7 +12,7 @@ from typing import Optional
 
 from fastapi import FastAPI, Query, Header, HTTPException, Depends, Body
 from pydantic import BaseModel, Field
-from sqlalchemy import select, func, desc, text, or_, and_, literal, update
+from sqlalchemy import select, func, desc, text, or_, and_, literal, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import get_config, get_env
@@ -52,6 +52,16 @@ async def lifespan(app: FastAPI):
                 raise RuntimeError("Another fin-agg worker is active; run uvicorn with --workers 1")
         try:
             await _recover_interrupted()
+            # #4: 启动时认领残留的queued记录
+            async with async_session() as session:
+                queued_jobs = (await session.execute(
+                    select(FetchJob).where(FetchJob.status == "queued")
+                )).scalars().all()
+                for qj in queued_jobs:
+                    print(f"[startup] Claiming queued job {qj.id} ({qj.kind})")
+                    qj.status = "running"
+                    qj.started_at = _utcnow()
+                await session.commit()
             _start_scheduler()
             yield
         finally:
@@ -650,13 +660,17 @@ async def _recover_interrupted():
     async with async_session() as session:
         await session.execute(update(FetchJob).where(FetchJob.status == "running").values(
             status="interrupted", finished_at=_utcnow(), error_message="Service restarted"))
-        # #6: 恢复时增加 retry_count，防止无限重试
-        await session.execute(text(
-            "UPDATE videos SET fetch_status='failed', error_message='Previous task interrupted', "
-            "retry_count=retry_count+1 WHERE fetch_status='pending'"))
-        await session.execute(text(
-            "UPDATE videos SET analysis_status='failed', error_message='Service restarted during analysis', "
-            "retry_count=retry_count+1 WHERE analysis_status='processing'"))
+        # #2: 合并为单条UPDATE，每行最多递增一次
+        await session.execute(text("""
+            UPDATE videos SET
+                fetch_status = CASE WHEN fetch_status='pending' THEN 'failed' ELSE fetch_status END,
+                analysis_status = CASE WHEN analysis_status='processing' THEN 'failed' ELSE analysis_status END,
+                error_message = CASE WHEN fetch_status='pending' OR analysis_status='processing'
+                    THEN 'Service restarted' ELSE error_message END,
+                retry_count = CASE WHEN fetch_status='pending' OR analysis_status='processing'
+                    THEN COALESCE(retry_count, 0) + 1 ELSE COALESCE(retry_count, 0) END
+            WHERE fetch_status = 'pending' OR analysis_status = 'processing'
+        """))
         await session.commit()
 
 
@@ -709,21 +723,34 @@ async def _execute_job(job_id, work):
 
 
 async def _run_job(kind, work):
+    # #4: 先持久化queued，再尝试取锁；取到锁则认领该记录
+    async with async_session() as session:
+        queued = FetchJob(id=str(uuid4()), kind=kind, status="queued",
+            started_at=_utcnow(), error_message="Waiting for lock")
+        session.add(queued)
+        await session.commit()
+        queued_id = queued.id
     try:
         job_id = await _reserve_job(kind)
     except HTTPException as exc:
         if exc.status_code == 409:
-            # #7: busy 时等待一次重试，不创建无法消费的 queued 记录
-            print(f"[scheduler] {kind}: busy, waiting 60s for retry...")
+            print(f"[scheduler] {kind}: busy, queued {queued_id}, waiting 60s...")
             await asyncio.sleep(60)
             try:
                 job_id = await _reserve_job(kind)
             except HTTPException:
-                print(f"[scheduler] {kind}: still busy, will retry next cron cycle")
-                return {"status": "busy"}
+                print(f"[scheduler] {kind}: still busy, {queued_id} pending next cycle")
+                return {"status": "busy", "queued_id": queued_id}
         else:
             raise
-    return await _execute_job(job_id, work)
+    # 认领queued记录——更新为running，删除多余的
+    async with async_session() as session:
+        await session.execute(update(FetchJob).where(FetchJob.id == queued_id).values(
+            status="running", started_at=_utcnow()))
+        await session.execute(delete(FetchJob).where(
+            FetchJob.kind == kind, FetchJob.status == "queued", FetchJob.id != queued_id))
+        await session.commit()
+    return await _execute_job(queued_id, work)
 
 
 async def _submit_job(kind, work):

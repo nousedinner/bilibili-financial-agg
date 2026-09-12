@@ -47,7 +47,7 @@ class Acceptance(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as s:
             s.add(Blogger(mid=1, name='Review', tags=[]))
             for i in range(3):
-                s.add(Video(bvid=f'BVreview{i}', mid=1, title='Review', publish_time=t if tied else t - timedelta(minutes=i), fetch_status='ok'))
+                s.add(Video(bvid=f'BVreview{i}', mid=1, title='Review', publish_time=t if tied else t - timedelta(minutes=i), fetch_status='ok', analysis_status='completed'))
             await s.commit()
 
     def client(self):
@@ -81,7 +81,7 @@ class Acceptance(unittest.IsolatedAsyncioTestCase):
         c = self.client()
         c.get_video_info.return_value = {}
         with self.assertRaises(ValueError):
-            await fetcher._process_video(c, 1, {'bvid': 'BVcid', 'created': 1, 'length': 1})
+            await fetcher._process_video(c, 1, {'bvid': 'BVcid', 'created': 1785513600, 'length': 1})
         async with self.sessions() as s:
             v = await s.get(Video, 'BVcid')
             self.assertEqual(v.fetch_status, 'failed')
@@ -91,7 +91,7 @@ class Acceptance(unittest.IsolatedAsyncioTestCase):
         c = self.client()
         c.get_video_info.side_effect = bilibili.BiliAPIError(-404, 'mock missing video')
         with self.assertRaises(bilibili.BiliAPIError):
-            await fetcher._process_video(c, 1, {'bvid': 'BVexception', 'created': 1, 'length': 1})
+            await fetcher._process_video(c, 1, {'bvid': 'BVexception', 'created': 1785513600, 'length': 1})
         async with self.sessions() as s:
             v = await s.get(Video, 'BVexception')
             self.assertEqual(v.fetch_status, 'failed')
@@ -99,7 +99,7 @@ class Acceptance(unittest.IsolatedAsyncioTestCase):
     async def test_asr_exception_is_persisted_failed(self):
         with patch.object(fetcher, 'fetch_transcript', AsyncMock(side_effect=TimeoutError('mock audio timeout'))):
             with self.assertRaises(TimeoutError):
-                await fetcher._process_video(self.client(), 1, {'bvid': 'BVasr', 'created': 1, 'length': 1})
+                await fetcher._process_video(self.client(), 1, {'bvid': 'BVasr', 'created': 1785513600, 'length': 1})
         async with self.sessions() as s:
             self.assertEqual((await s.get(Video, 'BVasr')).fetch_status, 'failed')
 
@@ -109,13 +109,13 @@ class Acceptance(unittest.IsolatedAsyncioTestCase):
             await s.commit()
         with patch.object(fetcher, 'fetch_transcript', AsyncMock(return_value={'text': 'valid transcript', 'source': 'asr', 'segments': 1})), patch.object(fetcher, 'analyze_video', AsyncMock(return_value=analyzer._empty_analysis(analysis_failed=True))):
             with self.assertRaises(ValueError):
-                await fetcher._process_video(self.client(), 1, {'bvid': 'BVllm', 'created': 1, 'length': 1})
+                await fetcher._process_video(self.client(), 1, {'bvid': 'BVllm', 'created': 1785513600, 'length': 1})
         async with self.sessions() as s:
             self.assertEqual((await s.get(Video, 'BVllm')).fetch_status, 'failed')
             self.assertEqual((await s.get(Summary, 'BVllm')).summary, 'previous good result')
 
     async def test_failed_dynamic_is_not_saved_as_completed(self):
-        payload = {'id_str': 'dynfail', 'modules': {'module_dynamic': {'desc': {'text': 'mock dynamic'}}, 'module_author': {'pub_ts': 1}}}
+        payload = {'id_str': 'dynfail', 'modules': {'module_dynamic': {'desc': {'text': 'mock dynamic'}}, 'module_author': {'pub_ts': 1785513600}}}
         with patch.object(fetcher, 'analyze_dynamic', AsyncMock(return_value={'summary': '', 'sentiment': 'neutral', 'tags': [], 'analysis_failed': True})):
             with self.assertRaises(ValueError):
                 await fetcher._process_dynamic(None, 1, payload)

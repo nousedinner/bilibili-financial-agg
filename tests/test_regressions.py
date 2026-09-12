@@ -94,7 +94,7 @@ class Regressions(unittest.IsolatedAsyncioTestCase):
         c.get_comments.return_value = {'replies': [{'content': {'message': 'hello'}}], 'total': 99}
         c.get_danmaku.return_value = {'items': ['one'], 'total': 501}
         with patch.object(fetcher, 'fetch_transcript', AsyncMock(return_value={'text': 'complete transcript', 'source': 'asr', 'segments': 2})), patch.object(fetcher, 'analyze_video', AsyncMock(return_value=analysis())):
-            await fetcher._process_video(c, 1, {'bvid': 'BVsuccess', 'created': 1788912000, 'length': 10})
+            await fetcher._process_video(c, 1, {'bvid': 'BVsuccess', 'created': 1788912000, 'length': 10, 'aid': 123})
         async with self.sessions() as session:
             self.assertEqual((await session.get(Video, 'BVsuccess')).fetch_status, 'ok')
             self.assertEqual((await session.get(Transcript, 'BVsuccess')).segment_count, 2)
@@ -124,7 +124,7 @@ class Regressions(unittest.IsolatedAsyncioTestCase):
         c = self.client()
         c.get_video_info.side_effect = asyncio.CancelledError()
         with self.assertRaises(asyncio.CancelledError):
-            await fetcher._process_video(c, 1, {'bvid': 'BVcancel', 'created': 1})
+            await fetcher._process_video(c, 1, {'bvid': 'BVcancel', 'created': 1785513600})
         async with self.sessions() as session:
             self.assertEqual((await session.get(Video, 'BVcancel')).fetch_status, 'failed')
 

@@ -273,8 +273,8 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str) -> dict:
                 continue
             if not stop:
                 videos.append(v)
-        # Issue #5: 每轮全局上限——无论水位线是否有效
-        if len(videos) >= cap:
+        # 首次运行（无水位线）时限制新视频数量；增量运行不受此限
+        if not last_bvid and len(videos) >= cap:
             videos = videos[:cap]
             complete = True
             break
@@ -659,6 +659,8 @@ def _latest_closed_date():
 
 
 async def _mark_digest_dirty(session, publish_time):
+    if publish_time is None:
+        return  # Issue: 防御性——未知时间不标记 dirty
     day = publish_time.date() + timedelta(days=1 if publish_time.hour >= _cutoff_hour() else 0)
     if await session.get(DirtyDigest, day) is None:
         session.add(DirtyDigest(digest_date=day))

@@ -95,9 +95,7 @@ async def run_fetch_only() -> dict:
             if not blogger.get("enabled", True):
                 continue
 
-            # Issue #12 #5: 预算耗尽时停止，不把剩余博主计为失败
-            if budget["pages"] <= 0:
-                break
+            # Issue #13 #4: pages=0 时不 break，_fetch_blogger 内部跳扫描但保留重试
 
             mid = blogger["mid"]
             name = blogger.get("name", str(mid))
@@ -115,13 +113,12 @@ async def run_fetch_only() -> dict:
                 results["total_failed"] += 1
                 visited += 1
 
-    # Issue #11 #1: 报告预算截断状态
+    # Issue #13 #7: 只在实际拒绝工作时才设 truncated/budget_exhausted
     not_visited = len(bloggers) - visited
-    budget_exhausted = (budget["pages"] <= 0 or budget["new_videos"] <= 0
-                        or budget["retries"] <= 0)
-    results["truncated"] = not_visited > 0 or budget_exhausted
+    # 有博主因预算被跳过才算 truncated
+    results["truncated"] = not_visited > 0
     results["not_visited"] = not_visited
-    results["budget_exhausted"] = budget_exhausted
+    results["budget_exhausted"] = not_visited > 0
     return results
 
 
@@ -274,7 +271,12 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str, budget: dict =
     retries = cfg.get("retry", {}).get("max_retries", 3)
     interval = cfg.get("limits", {}).get("video_interval_seconds", 5)
     if budget is None:
-        budget = {"pages": 50, "new_videos": 50, "retries": 50}
+        cfg_data = cfg.get("data", {})
+        budget = {
+            "pages": cfg_data.get("task_page_budget", 50),
+            "new_videos": cfg_data.get("task_video_budget", cfg_data.get("first_run_cap", 50)),
+            "retries": cfg_data.get("task_retry_budget", 50),
+        }
     result = {"name": name, "new_count": 0, "failed_count": 0, "retried_count": 0, "dynamics_count": 0}
     async with async_session() as session:
         # #1: 精确SQL重试资格过滤——用持久化的error_type匹配各类型上限
@@ -309,6 +311,8 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str, budget: dict =
         # #12: 动态抓取已停用，不查询 PendingDynamic
         wm = await session.get(FetchWatermark, mid)
         last_bvid, last_dyn = (wm.last_bvid, wm.last_dyn_id) if wm else (None, None)
+    # Issue #13 #5: 限制候选数量，避免无界数据库操作
+    failed = failed[:budget["retries"] + 5]  # 多取5条用于分类筛选
     attempted = set()
     for v in failed:
         # Issue #11 #1: 使用任务级重试预算
@@ -330,17 +334,12 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str, budget: dict =
     #     except Exception:
     #         result["failed_count"] += 1
 
-    # Issue #11 #1: 统一预算——首次和增量共用 new_videos 预算
-    cap = max(1, min(
-        int(cfg.get("data", {}).get("first_run_cap", 20)),
-        budget["new_videos"],
-    ))
+    # Issue #13 #1: cap 仅用于处理循环，扫描收集所有视频
     since = cfg.get("data", {}).get("backfill_since")
     since_dt = datetime.combine(date.fromisoformat(since), dt_time()) if since else None
     max_scan_pages = budget["pages"]  # Issue #11 #1: 使用共享页面预算
     seen, videos, complete = set(), [], False
     watermark_found = not last_bvid  # 无水位线时视为"已找到"
-    budget_truncated_scan = False  # Issue #12 #1: 预算截断时不推进水位线
     for page in range(1, max_scan_pages + 1):
         budget["pages"] -= 1  # Issue #12 #2: 请求前扣减——失败也消耗预算
         data = await client.get_video_list(mid, page=page, page_size=30)
@@ -367,12 +366,8 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str, budget: dict =
                 continue
             if not stop:
                 videos.append(v)
-        # Issue #12 #1: 预算截断——标记为截断而非完成，不推进水位线
-        if len(videos) >= cap:
-            videos = videos[:cap]
-            complete = True
-            budget_truncated_scan = True
-            break
+        # Issue #13 #1: 扫描不截断——收集所有视频直到水位线/页面耗尽
+        # cap 仅在处理循环中限制 new_videos，避免活锁
         if stop:
             complete = True
             break
@@ -403,8 +398,8 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str, budget: dict =
                 if await session.get(Video, v["bvid"]) is None:
                     raise  # A DB failure must not move the boundary past an unqueued item.
         await asyncio.sleep(interval)
-    # Issue #12 #1: 水位线只在扫描真正完成时推进；预算截断时不推进
-    if last_processed and not budget_truncated_scan:
+    # Issue #13 #1: 水位线推进——扫描总是完整到达边界，安全推进
+    if last_processed:
         async with async_session() as session:
             wm = await session.get(FetchWatermark, mid) or FetchWatermark(mid=mid)
             wm.last_bvid = last_processed["bvid"]

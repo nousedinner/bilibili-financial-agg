@@ -719,7 +719,7 @@ async def _reserve_job(kind):
 
 
 async def _execute_job(job_id, work):
-    # Issue #12 #3+#4: 最外层 try/finally 保证取消时也能写终态和释放锁
+    # Issue #13 #3: 最外层 try/finally 保证取消时也能写终态和释放锁
     task = asyncio.current_task()
     _background_tasks.add(task)
     status, result, error = "completed", None, None
@@ -730,7 +730,7 @@ async def _execute_job(job_id, work):
         try:
             result = await work()
             if result and (result.get("total_failed", 0) or result.get("failed", 0)
-                           or result.get("truncated")):
+                           or result.get("truncated") or result.get("has_more")):
                 status = "partial"
         except asyncio.CancelledError as exc:
             status, error = "interrupted", "Task cancelled"
@@ -738,13 +738,12 @@ async def _execute_job(job_id, work):
         except Exception as exc:
             status, error = "failed", str(exc)[:1000]
 
-        # Issue #12 #3: 先注册 pending failure（含完整结果），写入成功后才移除
-        # 这样即使取消发生在写入期间，health 也能正确告警
+        # Issue #13 #3: 先注册 pending failure（含完整结果），写入成功后才移除
         _pending_job_failures[job_id] = {
             "status": status, "result": result, "error": error, "time": _utcnow()
         }
 
-        # Issue #12 #3: 终态写入——catch BaseException 覆盖 CancelledError
+        # Issue #13 #3: 终态写入——catch BaseException 覆盖 CancelledError
         for _attempt in range(3):
             try:
                 async with async_session() as session:
@@ -755,15 +754,20 @@ async def _execute_job(job_id, work):
                 _pending_job_failures.pop(job_id, None)
                 break
             except BaseException as e:
+                if isinstance(e, asyncio.CancelledError):
+                    # Issue #13 #3: 终态阶段取消——记录意图，不重试
+                    logger.warning(f"[execute_job] 终态写入被取消: {job_id}")
+                    cancelled_exc = e
+                    break
                 if _attempt < 2:
                     logger.warning(f"[execute_job] 状态提交失败(尝试{_attempt+1}/3): {e}")
                     try:
                         await asyncio.sleep(1)
-                    except asyncio.CancelledError:
-                        break  # 取消时不重试sleep
+                    except asyncio.CancelledError as ce:
+                        cancelled_exc = ce
+                        break
                 else:
                     logger.error(f"[execute_job] 状态提交最终失败: {job_id} (DEGRADED)")
-                    # 已注册，无需重复设置
     finally:
         _job_lock.release()
         _background_tasks.discard(task)

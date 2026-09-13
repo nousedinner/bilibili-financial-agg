@@ -110,29 +110,27 @@ async def _asr_transcribe(client: BiliClient, bvid: str, cid: int, duration: int
         return None
     # #5: 全链路文件路径化——转码、分片、上传均基于文件，不整体读入内存
     mp3_path = None
+    chunk_paths = []  # 统一跟踪所有分片，finally统一清理
     try:
         mp3_path = await _to_mp3_path(audio_path)
-        # #7: 用ffprobe验证实际时长，防止B站元数据虚报
+        # #6: 用ffprobe验证实际时长——失败直接拒绝ASR，不回退到不可信元数据
         actual_duration = await _probe_duration(mp3_path)
         if actual_duration <= 0:
-            actual_duration = duration
+            print(f"[transcript] {bvid}: ffprobe探测失败，拒绝ASR（防止不可信元数据）")
+            return None
         # #7: 硬上限——实际时长超60分钟拒绝ASR
         if actual_duration > 3600:
             print(f"[transcript] {bvid}: 实际时长{actual_duration}s (>{60}min)，跳过ASR")
             return None
         chunk_seconds = int(cfg.get("chunk_seconds", 180))
+        # #6: 先计算预期分片数，超限直接拒绝，不创建分片
+        expected_chunks = max(1, int(actual_duration / chunk_seconds) + 1)
+        max_chunks = int(cfg.get("max_chunks", 40))
+        if expected_chunks > max_chunks:
+            print(f"[transcript] {bvid}: 预期分片{expected_chunks}超过上限{max_chunks}，拒绝ASR")
+            return None
         chunks = await _split_audio_from_file(mp3_path, chunk_seconds)
-        # #7: 最大分片数限制——防止单条异常内容产生大量ASR调用
-        max_chunks = int(cfg.get("max_chunks", 40))  # 40片 × 3分钟 = 120分钟理论上限
-        if len(chunks) > max_chunks:
-            print(f"[transcript] {bvid}: 分片数{len(chunks)}超过上限{max_chunks}，截断")
-            # 清理多余分片
-            for excess in chunks[max_chunks:]:
-                try:
-                    os.unlink(excess)
-                except OSError:
-                    pass
-            chunks = chunks[:max_chunks]
+        chunk_paths = chunks  # 跟踪，finally统一清理
         texts = []
         for index, chunk_path in enumerate(chunks):
             try:
@@ -144,12 +142,20 @@ async def _asr_transcribe(client: BiliClient, bvid: str, cid: int, duration: int
                     raise ValueError(f"ASR segment {index + 1}/{len(chunks)} failed; transcript is incomplete")
                 texts.append(text.strip())
             finally:
+                # #6: 每片处理完立即删除，不留残留
                 try:
                     os.unlink(chunk_path)
                 except OSError:
                     pass
+        chunk_paths = []  # 已全部清理
         return {"source": "asr", "text": " ".join(texts), "segments": len(chunks)}
     finally:
+        # #6: 统一清理所有残留分片
+        for p in chunk_paths:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
         for p in (audio_path, mp3_path):
             if p:
                 try:
@@ -179,24 +185,40 @@ async def _to_mp3(audio: bytes) -> bytes:
 
 
 async def _to_mp3_path(src_path: str) -> str:
-    """#5: 文件路径版转码——不读入bytes，直接文件到文件。"""
+    """#5: 文件路径版转码——不读入bytes，直接文件到文件。带超时+进程回收。"""
     dst_path = src_path.rsplit(".", 1)[0] + ".mp3"
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg", "-y", "-i", src_path, "-vn", "-acodec", "libmp3lame", "-q:a", "4", dst_path,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-    await proc.wait()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=300)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+        raise
     if proc.returncode == 0 and os.path.exists(dst_path):
         return dst_path
     return src_path  # fallback
 
 
 async def _split_audio_from_file(audio_path: str, chunk_seconds: int) -> list:
-    """#5: 从文件分片——每片写临时文件，返回路径列表。"""
+    """#5: 从文件分片——每片写临时文件，返回路径列表。带超时+进程回收。"""
     duration_proc = await asyncio.create_subprocess_exec(
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1", audio_path,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-    stdout, _ = await duration_proc.communicate()
+    try:
+        stdout, _ = await asyncio.wait_for(duration_proc.communicate(), timeout=30)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        try:
+            duration_proc.kill()
+        except ProcessLookupError:
+            pass
+        await duration_proc.wait()
+        raise
     try:
         total_duration = float(stdout.decode().strip())
     except (ValueError, TypeError):
@@ -213,7 +235,19 @@ async def _split_audio_from_file(audio_path: str, chunk_seconds: int) -> list:
             "ffmpeg", "-y", "-i", audio_path, "-ss", str(start), "-t", str(chunk_seconds),
             "-vn", "-acodec", "libmp3lame", "-q:a", "4", chunk_path,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-        await proc.wait()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=120)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+            try:
+                os.unlink(chunk_path)
+            except OSError:
+                pass
+            raise
         if proc.returncode == 0 and os.path.getsize(chunk_path) > 0:
             chunk_paths.append(chunk_path)
         else:

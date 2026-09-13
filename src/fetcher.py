@@ -55,6 +55,8 @@ async def run_fetch_only() -> dict:
         return {"total_new": 0, "total_failed": 0, "bloggers": {}}
 
     results = {"total_new": 0, "total_failed": 0, "bloggers": {}}
+    # #2: 任务级重试预算——所有博主共享，防止单博主耗尽全局预算
+    retry_budget = 50
 
     async with _bili_client() as client:
         # Validate cookie
@@ -71,10 +73,12 @@ async def run_fetch_only() -> dict:
             print(f"[fetcher] 处理博主: {name} (mid={mid})")
 
             try:
-                b_result = await _fetch_blogger(client, mid, name)
+                b_result = await _fetch_blogger(client, mid, name, retry_budget=retry_budget)
                 results["bloggers"][mid] = b_result
                 results["total_new"] += b_result.get("new_count", 0)
                 results["total_failed"] += b_result.get("failed_count", 0)
+                # #2: 扣减已用预算
+                retry_budget -= b_result.get("retried_count", 0)
             except Exception as e:
                 print(f"[fetcher] 博主 {name} 抓取失败: {e}")
                 results["bloggers"][mid] = {"error": str(e)}
@@ -150,7 +154,7 @@ async def run_backfill(mid: int, since: str, cap: int = 20) -> dict:
     return result
 
 
-async def run_retry_failed() -> dict:
+async def run_retry_failed(batch_limit: int = 50) -> dict:
     """独立重试：只从数据库捞失败视频，按错误类型分级处理，不扫描新视频。"""
     bloggers = await _get_enabled_bloggers()
     if not bloggers:
@@ -160,25 +164,27 @@ async def run_retry_failed() -> dict:
     interval = get_config().get("limits", {}).get("video_interval_seconds", 5)
     
     async with async_session() as session:
-        # #1: MySQL兼容排序——NULL排最后用CASE表达式（NULLS LAST在MySQL不支持）
-        # #2: 筛选条件直接在SQL WHERE中——永久失败记录不进候选集
+        # #1: MySQL兼容排序 + SQL前置过滤
+        # 所有错误类型最大重试次数为3，retry_count>=3的必定已耗尽，SQL直接排除
+        # 这样即使前200条都是耗尽记录，也不会挤掉后面的合法重试
         candidates = (await session.execute(select(Video).where(
             Video.fetch_status.in_(["failed", "pending"]),
             Video.mid.in_([b["mid"] for b in bloggers]),
             Video.publish_time >= _HARD_SINCE,
             Video.publish_time.isnot(None),
-            # 永久失败（404/视频已删除）直接排除——NULL也保留（未出过错）
+            # 永久失败（404/视频已删除）直接排除
             or_(Video.error_message.is_(None),
                 and_(~Video.error_message.icontains("404"),
                      ~Video.error_message.icontains("啥都木有"))),
+            # #1: 重试次数>=3必定耗尽所有错误类型的重试额度，SQL前置排除
+            or_(Video.retry_count.is_(None), Video.retry_count < 3),
         ).order_by(
             case((Video.retry_count.is_(None), 1), else_=0),
             Video.retry_count.asc(),
             Video.fetched_at.asc(),
             Video.bvid.asc(),
         ).limit(200))).scalars().all()
-    # #2: 筛资格后取前50条——重试次数上限在Python中检查
-    batch_limit = 50
+    # #2: Python二次筛选（精确匹配错误类型的重试上限）+ 任务级预算
     failed = []
     for v in candidates:
         if len(failed) >= batch_limit:
@@ -207,7 +213,7 @@ async def run_retry_failed() -> dict:
     return result
 
 
-async def _fetch_blogger(client: BiliClient, mid: int, name: str) -> dict:
+async def _fetch_blogger(client: BiliClient, mid: int, name: str, retry_budget: int = 50) -> dict:
     cfg = get_config()
     retries = cfg.get("retry", {}).get("max_retries", 3)
     interval = cfg.get("limits", {}).get("video_interval_seconds", 5)
@@ -217,11 +223,16 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str) -> dict:
             Video.fetch_status.in_(["failed", "pending"]),
             Video.publish_time >= _HARD_SINCE,
             Video.publish_time.isnot(None),
+            # #1: SQL前置排除耗尽重试的记录
+            or_(Video.error_message.is_(None),
+                and_(~Video.error_message.icontains("404"),
+                     ~Video.error_message.icontains("啥都木有"))),
+            or_(Video.retry_count.is_(None), Video.retry_count < 3),
         ))).scalars().all()
-        # 按错误类型分级过滤重试，加批次上限
+        # 按错误类型分级过滤重试，使用任务级预算
         retryable = []
         for v in failed:
-            if len(retryable) >= 50:
+            if len(retryable) >= retry_budget:
                 break
             err_type = classify_error(v.error_message or "", v.duration or 0)
             if is_permanent(err_type):
@@ -383,11 +394,20 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
     else:
         dur_sec = int(duration or 0)
     pub_dt = _publish_time(vinfo.get("created", 0))
-    info = await client.get_video_info(bvid)
-    cid = info.get("cid") or (info.get("pages") or [{}])[0].get("cid")
+
+    # #2: 重试模式优先从DB读cid，仅缺失时才请求远程接口
+    cid = None
+    if is_retry:
+        async with async_session() as session:
+            db_video = await session.get(Video, bvid)
+            if db_video:
+                cid = getattr(db_video, 'cid', None)  # 未来持久化cid时可用
     if not cid:
-        raise ValueError(f"Cannot get CID for {bvid}")
-    dur_sec = info.get("duration") or dur_sec
+        info = await client.get_video_info(bvid)
+        cid = info.get("cid") or (info.get("pages") or [{}])[0].get("cid")
+        if not cid:
+            raise ValueError(f"Cannot get CID for {bvid}")
+        dur_sec = info.get("duration") or dur_sec
 
     # #5: 获取aid——优先从vinfo，其次从DB，最后远程获取
     aid = vinfo.get("aid", 0) or 0
@@ -449,24 +469,38 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
     comment_data = {"replies": [], "total": 0}
     danmaku_data = {"items": [], "total": 0}
     comments, danmakus = [], []
+    reuse_existing_analysis = False
+    existing_summary = None
 
     if is_retry:
-        # 已有完整评论/弹幕保留，缺失时重新抓取
+        # 检查是否所有分析数据都完整——完整则直接复用，不重走AI
+        async with async_session() as session:
+            existing_summary = (await session.execute(
+                select(Summary).where(Summary.bvid == bvid)
+            )).scalar_one_or_none()
         has_comments = existing_comments and (existing_comments.total_count or 0) > 0
         has_danmaku = existing_danmaku and (existing_danmaku.total_count or 0) > 0
-        if not has_comments and aid:
-            try:
-                comment_data = await client.get_comments(oid=aid, oid_type=1, count=20)
-            except Exception as e:
-                print(f"[fetcher] {bvid}: 评论获取失败({e})，跳过")
-            comments = comment_data["replies"]
-        elif has_comments:
-            comments = []
-        if not has_danmaku:
-            danmaku_data = await client.get_danmaku(cid, max_count=2000)
-            danmakus = danmaku_data["items"]
-        elif has_danmaku:
-            danmakus = []
+        has_summary = existing_summary and existing_summary.summary
+
+        # #3: 所有数据完整 → 直接复用已有分析，跳过AI调用
+        if use_existing_transcript and has_comments and has_danmaku and has_summary:
+            reuse_existing_analysis = True
+            print(f"[fetcher] {bvid}: 所有数据完整，复用已有分析（跳过AI调用）")
+        else:
+            # 部分缺失 → 正常获取缺失部分
+            if not has_comments and aid:
+                try:
+                    comment_data = await client.get_comments(oid=aid, oid_type=1, count=20)
+                except Exception as e:
+                    print(f"[fetcher] {bvid}: 评论获取失败({e})，跳过")
+                comments = comment_data["replies"]
+            elif has_comments:
+                comments = []
+            if not has_danmaku:
+                danmaku_data = await client.get_danmaku(cid, max_count=2000)
+                danmakus = danmaku_data["items"]
+            elif has_danmaku:
+                danmakus = []
     else:
         if aid:
             try:
@@ -477,9 +511,33 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
         danmaku_data = await client.get_danmaku(cid, max_count=2000)
         danmakus = danmaku_data["items"]
 
-    analysis = await analyze_video(title, transcript_text, comments, danmakus, dur_sec)
-    if analysis.get("analysis_failed") or not _validate_analysis(analysis):
-        raise ValueError(f"LLM analysis failed for {bvid}")
+    # #3: 复用已有分析 → 跳过AI调用
+    if reuse_existing_analysis:
+        analysis = {
+            "summary": existing_summary.summary,
+            "key_points": existing_summary.key_points or [],
+            "sentiment": existing_summary.sentiment or "neutral",
+            "sentiment_score": existing_summary.sentiment_score or 0.0,
+            "risk_warnings": existing_summary.risk_warnings or [],
+            "data_citations": existing_summary.data_citations or [],
+            "tags": existing_summary.tags or [],
+            "comment_sentiment": {
+                "bullish": existing_comments.sentiment_bullish if existing_comments else 0,
+                "bearish": existing_comments.sentiment_bearish if existing_comments else 0,
+                "neutral": existing_comments.sentiment_neutral if existing_comments else 0,
+            },
+            "danmaku_sentiment": {
+                "bullish": existing_danmaku.sentiment_bullish if existing_danmaku else 0,
+                "bearish": existing_danmaku.sentiment_bearish if existing_danmaku else 0,
+                "neutral": existing_danmaku.sentiment_neutral if existing_danmaku else 0,
+            },
+            "comment_keywords": existing_comments.keywords if existing_comments else [],
+            "danmaku_keywords": existing_danmaku.keywords if existing_danmaku else [],
+        }
+    else:
+        analysis = await analyze_video(title, transcript_text, comments, danmakus, dur_sec)
+        if analysis.get("analysis_failed") or not _validate_analysis(analysis):
+            raise ValueError(f"LLM analysis failed for {bvid}")
     async with async_session() as session:
         # Issue #5: 使用已有转写时不覆盖
         if not use_existing_transcript:

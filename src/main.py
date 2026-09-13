@@ -52,16 +52,6 @@ async def lifespan(app: FastAPI):
                 raise RuntimeError("Another fin-agg worker is active; run uvicorn with --workers 1")
         try:
             await _recover_interrupted()
-            # #4: 启动时认领残留的queued记录
-            async with async_session() as session:
-                queued_jobs = (await session.execute(
-                    select(FetchJob).where(FetchJob.status == "queued")
-                )).scalars().all()
-                for qj in queued_jobs:
-                    print(f"[startup] Claiming queued job {qj.id} ({qj.kind})")
-                    qj.status = "running"
-                    qj.started_at = _utcnow()
-                await session.commit()
             _start_scheduler()
             yield
         finally:
@@ -658,7 +648,9 @@ async def _retry_transcripts_task():
 
 async def _recover_interrupted():
     async with async_session() as session:
-        await session.execute(update(FetchJob).where(FetchJob.status == "running").values(
+        # 标记残留的running/queued记录为interrupted
+        await session.execute(update(FetchJob).where(
+            FetchJob.status.in_(["running", "queued"])).values(
             status="interrupted", finished_at=_utcnow(), error_message="Service restarted"))
         # #3: 重试计数和错误信息先于状态修改，确保MySQL单语句语义正确
         # MySQL的CASE在UPDATE中使用原始值评估，但为安全起见先写计数再改状态
@@ -722,44 +714,36 @@ async def _execute_job(job_id, work):
 
 
 async def _run_job(kind, work):
-    # #4: 先持久化queued，再尝试取锁；取到锁则认领该记录
-    async with async_session() as session:
-        queued = FetchJob(id=str(uuid4()), kind=kind, status="queued",
-            started_at=_utcnow(), error_message="Waiting for lock")
-        session.add(queued)
-        await session.commit()
-        queued_id = queued.id
+    # #4: 不使用伪队列——直接尝试获取锁，冲突时明确标记busy
     try:
         await _reserve_job(kind)
     except HTTPException as exc:
         if exc.status_code == 409:
-            print(f"[scheduler] {kind}: busy, queued {queued_id}, waiting 60s...")
-            await asyncio.sleep(60)
-            try:
-                await _reserve_job(kind)
-            except HTTPException:
-                print(f"[scheduler] {kind}: still busy, {queued_id} pending next cycle")
-                return {"status": "busy", "queued_id": queued_id}
+            print(f"[scheduler] {kind}: busy, skipping this cycle")
+            return {"status": "busy"}
         else:
             raise
-    # 认领queued记录——更新为running，删除多余的
-    async with async_session() as session:
-        await session.execute(update(FetchJob).where(FetchJob.id == queued_id).values(
-            status="running", started_at=_utcnow()))
-        await session.execute(delete(FetchJob).where(
-            FetchJob.kind == kind, FetchJob.status == "queued", FetchJob.id != queued_id))
-        await session.commit()
-    return await _execute_job(queued_id, work)
-
-
-async def _submit_job(kind, work):
-    await _reserve_job(kind)
-    # 创建任务记录
+    # 创建并直接执行任务记录
     async with async_session() as session:
         job = FetchJob(id=str(uuid4()), kind=kind, status="running", started_at=_utcnow())
         session.add(job)
         await session.commit()
         job_id = job.id
+    return await _execute_job(job_id, work)
+
+
+async def _submit_job(kind, work):
+    await _reserve_job(kind)
+    # #5: 创建任务记录——失败时释放锁
+    try:
+        async with async_session() as session:
+            job = FetchJob(id=str(uuid4()), kind=kind, status="running", started_at=_utcnow())
+            session.add(job)
+            await session.commit()
+            job_id = job.id
+    except Exception:
+        _job_lock.release()
+        raise
     task = asyncio.create_task(_execute_job(job_id, work))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)

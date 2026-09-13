@@ -714,26 +714,22 @@ async def _execute_job(job_id, work):
 
 
 async def _run_job(kind, work):
-    # #4: 不使用伪队列——直接尝试获取锁，冲突时明确标记busy
+    # #4: 不使用伪队列——直接尝试获取锁，冲突时留记录
     try:
         await _reserve_job(kind)
     except HTTPException as exc:
         if exc.status_code == 409:
-            print(f"[scheduler] {kind}: busy, skipping this cycle")
+            # #6: 跳过的任务留持久记录——可观测
+            async with async_session() as session:
+                skipped = FetchJob(id=str(uuid4()), kind=kind, status="skipped",
+                    started_at=_utcnow(), finished_at=_utcnow(),
+                    error_message="Busy: another task holds the lock")
+                session.add(skipped)
+                await session.commit()
+            print(f"[scheduler] {kind}: busy, recorded as skipped")
             return {"status": "busy"}
         else:
             raise
-    # 创建并直接执行任务记录
-    async with async_session() as session:
-        job = FetchJob(id=str(uuid4()), kind=kind, status="running", started_at=_utcnow())
-        session.add(job)
-        await session.commit()
-        job_id = job.id
-    return await _execute_job(job_id, work)
-
-
-async def _submit_job(kind, work):
-    await _reserve_job(kind)
     # #5: 创建任务记录——失败时释放锁
     try:
         async with async_session() as session:
@@ -741,7 +737,22 @@ async def _submit_job(kind, work):
             session.add(job)
             await session.commit()
             job_id = job.id
-    except Exception:
+    except BaseException:
+        _job_lock.release()
+        raise
+    return await _execute_job(job_id, work)
+
+
+async def _submit_job(kind, work):
+    await _reserve_job(kind)
+    # #5: 创建任务记录——BaseException-safe（覆盖CancelledError）
+    try:
+        async with async_session() as session:
+            job = FetchJob(id=str(uuid4()), kind=kind, status="running", started_at=_utcnow())
+            session.add(job)
+            await session.commit()
+            job_id = job.id
+    except BaseException:
         _job_lock.release()
         raise
     task = asyncio.create_task(_execute_job(job_id, work))

@@ -2,7 +2,7 @@
 from sqlalchemy import inspect, text
 from src.models import Base
 
-VERSION = 4
+VERSION = 5
 
 
 def upgrade(connection):
@@ -30,6 +30,9 @@ def upgrade(connection):
     # #5: B站avid列——重试时恢复评论抓取所需
     if "aid" not in columns:
         connection.execute(text("ALTER TABLE videos ADD COLUMN aid BIGINT"))
+    # #1: 错误类型列——SQL精确过滤重试资格
+    if "error_type" not in columns:
+        connection.execute(text("ALTER TABLE videos ADD COLUMN error_type VARCHAR(20)"))
 
     # #2: analysis_status 数据修复——独立执行，不受分支条件限制
     connection.execute(text("""
@@ -77,5 +80,6 @@ def verify(connection):
         or "retry_count" not in videos_cols
         or "analysis_status" not in videos_cols
         or "aid" not in videos_cols
+        or "error_type" not in videos_cols
         or "retry_count" not in dirty_cols):
         raise RuntimeError("Unsupported schema; run python -m scripts.manage_db upgrade")

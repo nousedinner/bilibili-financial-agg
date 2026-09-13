@@ -85,14 +85,21 @@ async def _download_subtitle(url: str) -> str:
 
 
 async def _probe_duration(audio_path: str) -> float:
-    """用ffprobe获取实际音频时长（秒）。失败返回0。"""
+    """用ffprobe获取实际音频时长（秒）。失败返回0。带超时+kill+reap。"""
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", audio_path,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffprobe", "-v", "error", "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1", audio_path,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
         return float(stdout.decode().strip())
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+        return 0.0
     except Exception:
         return 0.0
 
@@ -223,38 +230,48 @@ async def _split_audio_from_file(audio_path: str, chunk_seconds: int) -> list:
         total_duration = float(stdout.decode().strip())
     except (ValueError, TypeError):
         total_duration = 0.0
+    # #7: 第二次探测失败→拒绝（不返回整文件作为分片）
     if total_duration <= 0:
-        return [audio_path]
+        raise ValueError(f"ffprobe returned invalid duration for {audio_path}; refusing to split")
     num_chunks = max(1, int(total_duration / chunk_seconds) + 1)
     chunk_paths = []
-    for i in range(num_chunks):
-        start = i * chunk_seconds
-        fd, chunk_path = tempfile.mkstemp(suffix=".mp3")
-        os.close(fd)
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-i", audio_path, "-ss", str(start), "-t", str(chunk_seconds),
-            "-vn", "-acodec", "libmp3lame", "-q:a", "4", chunk_path,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=120)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+    try:
+        for i in range(num_chunks):
+            start = i * chunk_seconds
+            fd, chunk_path = tempfile.mkstemp(suffix=".mp3")
+            os.close(fd)
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-i", audio_path, "-ss", str(start), "-t", str(chunk_seconds),
+                "-vn", "-acodec", "libmp3lame", "-q:a", "4", chunk_path,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
             try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            await proc.wait()
+                await asyncio.wait_for(proc.wait(), timeout=120)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
+                try:
+                    os.unlink(chunk_path)
+                except OSError:
+                    pass
+                raise
+            if proc.returncode == 0 and os.path.getsize(chunk_path) > 0:
+                chunk_paths.append(chunk_path)
+            else:
+                try:
+                    os.unlink(chunk_path)
+                except OSError:
+                    pass
+    except Exception:
+        # #7: 分片中途异常→清理已创建的分片
+        for p in chunk_paths:
             try:
-                os.unlink(chunk_path)
+                os.unlink(p)
             except OSError:
                 pass
-            raise
-        if proc.returncode == 0 and os.path.getsize(chunk_path) > 0:
-            chunk_paths.append(chunk_path)
-        else:
-            try:
-                os.unlink(chunk_path)
-            except OSError:
-                pass
+        raise
     return chunk_paths
 
 

@@ -36,6 +36,7 @@ class Video(Base):
     title = Column(String(500))
     duration = Column(Integer)
     aid = Column(BigInteger)  # #5: B站avid，重试时恢复评论抓取
+    error_type = Column(String(20))  # #1: 持久化错误类型，SQL精确过滤重试资格
     publish_time = Column(DateTime, index=True)
     view_count = Column(Integer, default=0)
     content_type = Column(Enum("video", "dynamic", name="content_type"), default="video")

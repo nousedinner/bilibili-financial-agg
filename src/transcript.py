@@ -93,12 +93,14 @@ async def _probe_duration(audio_path: str) -> float:
     try:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
         return float(stdout.decode().strip())
-    except (asyncio.TimeoutError, asyncio.CancelledError):
+    except (asyncio.TimeoutError, asyncio.CancelledError) as e:
         try:
             proc.kill()
         except ProcessLookupError:
             pass
         await proc.wait()
+        if isinstance(e, asyncio.CancelledError):
+            raise  # #5: 取消必须沿调用链传播
         return 0.0
     except Exception:
         return 0.0
@@ -130,6 +132,8 @@ async def _asr_transcribe(client: BiliClient, bvid: str, cid: int, duration: int
             print(f"[transcript] {bvid}: 实际时长{actual_duration}s (>{60}min)，跳过ASR")
             return None
         chunk_seconds = int(cfg.get("chunk_seconds", 180))
+        # #5: 强制硬限制——每片不超过3分钟，不可由配置绕过
+        chunk_seconds = max(1, min(chunk_seconds, 180))
         # #6: 先计算预期分片数，超限直接拒绝，不创建分片
         expected_chunks = max(1, int(actual_duration / chunk_seconds) + 1)
         max_chunks = int(cfg.get("max_chunks", 40))
@@ -264,8 +268,8 @@ async def _split_audio_from_file(audio_path: str, chunk_seconds: int) -> list:
                     os.unlink(chunk_path)
                 except OSError:
                     pass
-    except Exception:
-        # #7: 分片中途异常→清理已创建的分片
+    except BaseException:
+        # #7: 分片中途异常→清理已创建的分片（覆盖CancelledError）
         for p in chunk_paths:
             try:
                 os.unlink(p)

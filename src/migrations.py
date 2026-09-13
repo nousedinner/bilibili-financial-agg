@@ -33,6 +33,37 @@ def upgrade(connection):
     # #1: 错误类型列——SQL精确过滤重试资格
     if "error_type" not in columns:
         connection.execute(text("ALTER TABLE videos ADD COLUMN error_type VARCHAR(20)"))
+        # #1: 回填现有失败记录的error_type——按error_message分类
+        # permanent: 404或"啥都木有"
+        connection.execute(text("""
+            UPDATE videos SET error_type = 'permanent'
+            WHERE fetch_status = 'failed' AND error_type IS NULL
+            AND (error_message LIKE '%404%' OR error_message LIKE '%啥都木有%')
+        """))
+        # incomplete_info: duration=0且非字幕问题
+        connection.execute(text("""
+            UPDATE videos SET error_type = 'incomplete_info'
+            WHERE fetch_status = 'failed' AND error_type IS NULL
+            AND (duration = 0 OR duration IS NULL)
+            AND (error_message NOT LIKE '%transcript%' AND error_message NOT LIKE '%subtitle%')
+        """))
+        # llm_failed
+        connection.execute(text("""
+            UPDATE videos SET error_type = 'llm_failed'
+            WHERE fetch_status = 'failed' AND error_type IS NULL
+            AND error_message LIKE '%LLM analysis failed%'
+        """))
+        # transcript
+        connection.execute(text("""
+            UPDATE videos SET error_type = 'transcript'
+            WHERE fetch_status = 'failed' AND error_type IS NULL
+            AND (error_message LIKE '%transcript%' OR error_message LIKE '%subtitle%')
+        """))
+        # 剩余未分类的标记为unknown
+        connection.execute(text("""
+            UPDATE videos SET error_type = 'unknown'
+            WHERE fetch_status = 'failed' AND error_type IS NULL
+        """))
 
     # #2: analysis_status 数据修复——独立执行，不受分支条件限制
     connection.execute(text("""

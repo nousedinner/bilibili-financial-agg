@@ -585,7 +585,10 @@ async def status():
         bloggers = (await session.execute(select(func.count()).select_from(Blogger).where(Blogger.enabled == True))).scalar()
         videos = (await session.execute(select(func.count()).select_from(Video))).scalar()
         failed = (await session.execute(select(func.count()).select_from(Video).where(Video.fetch_status == "failed"))).scalar()
-        job = (await session.execute(select(FetchJob).order_by(FetchJob.started_at.desc()).limit(1))).scalar_one_or_none()
+        # #6: 过滤skipped记录——跳过的任务不代表实际完成
+        job = (await session.execute(select(FetchJob).where(
+            FetchJob.status != "skipped"
+        ).order_by(FetchJob.started_at.desc()).limit(1))).scalar_one_or_none()
         last_job = _job_json(job) if job else None
     cookie = await _cached_cookie_status()
     return {"code": 0, "data": {"bloggers": bloggers, "videos": videos, "failed": failed,
@@ -653,7 +656,7 @@ async def _recover_interrupted():
             FetchJob.status.in_(["running", "queued"])).values(
             status="interrupted", finished_at=_utcnow(), error_message="Service restarted"))
         # #3: 重试计数和错误信息先于状态修改，确保MySQL单语句语义正确
-        # MySQL的CASE在UPDATE中使用原始值评估，但为安全起见先写计数再改状态
+        # #1: 同步写入error_type——恢复记录也必须有分类
         await session.execute(text("""
             UPDATE videos SET
                 retry_count = CASE
@@ -665,6 +668,12 @@ async def _recover_interrupted():
                     WHEN fetch_status = 'pending' OR analysis_status = 'processing'
                     THEN 'Service restarted'
                     ELSE error_message
+                END,
+                error_type = CASE
+                    WHEN (fetch_status = 'pending' OR analysis_status = 'processing')
+                         AND error_type IS NULL
+                    THEN 'unknown'
+                    ELSE error_type
                 END,
                 fetch_status = CASE WHEN fetch_status = 'pending' THEN 'failed' ELSE fetch_status END,
                 analysis_status = CASE WHEN analysis_status = 'processing' THEN 'failed' ELSE analysis_status END
@@ -701,15 +710,23 @@ async def _execute_job(job_id, work):
     except Exception as exc:
         status, error = "failed", str(exc)[:1000]
     finally:
-        try:
-            async with async_session() as session:
-                job = await session.get(FetchJob, job_id)
-                job.status, job.result, job.error_message = status, result, error
-                job.finished_at = _utcnow()
-                await session.commit()
-        finally:
-            _job_lock.release()
-            _background_tasks.discard(task)
+        # #7: 最终状态提交——有界重试，防止DB临时故障导致永久running
+        for _attempt in range(3):
+            try:
+                async with async_session() as session:
+                    job = await session.get(FetchJob, job_id)
+                    job.status, job.result, job.error_message = status, result, error
+                    job.finished_at = _utcnow()
+                    await session.commit()
+                break  # 成功
+            except Exception as e:
+                if _attempt < 2:
+                    print(f"[execute_job] 状态提交失败(尝试{_attempt+1}/3): {e}")
+                    await asyncio.sleep(1)
+                else:
+                    print(f"[execute_job] 状态提交最终失败: {job_id} 将保持running直到重启")
+        _job_lock.release()
+        _background_tasks.discard(task)
     return {"id": job_id, "status": status, "result": result, "error": error}
 
 

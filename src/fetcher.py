@@ -55,8 +55,8 @@ async def run_fetch_only() -> dict:
         return {"total_new": 0, "total_failed": 0, "bloggers": {}}
 
     results = {"total_new": 0, "total_failed": 0, "bloggers": {}}
-    # #2: 任务级重试预算——所有博主共享，防止单博主耗尽全局预算
-    retry_budget = 50
+    # #2: 任务级重试预算——可变对象，所有博主共享，原子扣减
+    budget = {"remaining": 50}
 
     async with _bili_client() as client:
         # Validate cookie
@@ -73,12 +73,10 @@ async def run_fetch_only() -> dict:
             print(f"[fetcher] 处理博主: {name} (mid={mid})")
 
             try:
-                b_result = await _fetch_blogger(client, mid, name, retry_budget=retry_budget)
+                b_result = await _fetch_blogger(client, mid, name, budget=budget)
                 results["bloggers"][mid] = b_result
                 results["total_new"] += b_result.get("new_count", 0)
                 results["total_failed"] += b_result.get("failed_count", 0)
-                # #2: 扣减所有尝试（成功+失败），不只是成功数
-                retry_budget -= b_result.get("retried_count", 0) + b_result.get("failed_count", 0)
             except Exception as e:
                 print(f"[fetcher] 博主 {name} 抓取失败: {e}")
                 results["bloggers"][mid] = {"error": str(e)}
@@ -105,8 +103,9 @@ async def run_backfill(mid: int, since: str, cap: int = 20) -> dict:
                 raise ValueError(f"Enabled blogger {mid} not found")
             result["name"] = blogger.name
         seen = set()
+        max_pages = 50  # #4: 页面请求预算——防止单次回填占用过多资源
         async with _bili_client() as client:
-            for page in range(1, 1001):
+            for page in range(1, max_pages + 1):
                 data = await client.get_video_list(mid, page=page, page_size=30)
                 batch = data.get("list", {}).get("vlist", [])
                 if not batch:
@@ -171,16 +170,15 @@ async def run_retry_failed(batch_limit: int = 50) -> dict:
             Video.mid.in_([b["mid"] for b in bloggers]),
             Video.publish_time >= _HARD_SINCE,
             Video.publish_time.isnot(None),
-            # 永久失败直接排除
-            Video.error_type.isnot(None),  # 有error_type说明出过错
-            Video.error_type != "permanent",
+            # 永久失败直接排除（error_type IS NULL的也保留，由下面的or_处理）
+            or_(Video.error_type.is_(None), Video.error_type != "permanent"),
             # #1: 精确重试上限——incomplete_info/llm_failed最多2次，其他最多3次
             or_(
                 and_(Video.error_type.in_(["incomplete_info", "llm_failed"]),
                      Video.retry_count < 2),
                 and_(Video.error_type.in_(["transcript", "unknown"]),
                      Video.retry_count < 3),
-                Video.error_type.is_(None),  # 未出过错的也保留
+                Video.error_type.is_(None),  # 未分类的也保留（迁移回填可能未覆盖）
             ),
         ).order_by(
             case((Video.retry_count.is_(None), 1), else_=0),
@@ -217,10 +215,12 @@ async def run_retry_failed(batch_limit: int = 50) -> dict:
     return result
 
 
-async def _fetch_blogger(client: BiliClient, mid: int, name: str, retry_budget: int = 50) -> dict:
+async def _fetch_blogger(client: BiliClient, mid: int, name: str, budget: dict = None) -> dict:
     cfg = get_config()
     retries = cfg.get("retry", {}).get("max_retries", 3)
     interval = cfg.get("limits", {}).get("video_interval_seconds", 5)
+    if budget is None:
+        budget = {"remaining": 50}
     result = {"name": name, "new_count": 0, "failed_count": 0, "retried_count": 0, "dynamics_count": 0}
     async with async_session() as session:
         # #1: 精确SQL重试资格过滤——用持久化的error_type匹配各类型上限
@@ -243,8 +243,6 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str, retry_budget: 
         # 按错误类型分级过滤重试，使用任务级预算
         retryable = []
         for v in failed:
-            if len(retryable) >= retry_budget:
-                break
             err_type = classify_error(v.error_message or "", v.duration or 0)
             if is_permanent(err_type):
                 print(f"[fetcher] {v.bvid}: 永久失败({err_type})，跳过")
@@ -259,6 +257,11 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str, retry_budget: 
         last_bvid, last_dyn = (wm.last_bvid, wm.last_dyn_id) if wm else (None, None)
     attempted = set()
     for v in failed:
+        # #2: 原子扣减——每次重试前检查并扣减预算
+        if budget["remaining"] <= 0:
+            print(f"[fetcher] 重试预算耗尽，停止博主 {name} 的重试")
+            break
+        budget["remaining"] -= 1
         attempted.add(v.bvid)
         try:
             await _process_video(client, mid, _video_info(v), is_retry=True)
@@ -522,19 +525,36 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
         # 部分缺失 → 正常获取缺失部分（完整的已在上面早返回）
         has_comments = existing_comments and (existing_comments.total_count or 0) > 0
         has_danmaku = existing_danmaku and (existing_danmaku.total_count or 0) > 0
-        if not has_comments and aid:
+
+        # #3: 用已有互动数据供AI分析，而非传空列表
+        if has_comments:
+            # 从CommentAnalysis重建comments供AI使用
+            comments = [{"content": {"message": c}} for c in (existing_comments.hot_comments or [])]
+            comment_data["total"] = existing_comments.total_count or 0
+        elif aid:
             try:
                 comment_data = await client.get_comments(oid=aid, oid_type=1, count=20)
             except Exception as e:
                 print(f"[fetcher] {bvid}: 评论获取失败({e})，跳过")
             comments = comment_data["replies"]
-        elif has_comments:
-            comments = []
-        if not has_danmaku:
-            danmaku_data = await client.get_danmaku(cid, max_count=2000)
-            danmakus = danmaku_data["items"]
-        elif has_danmaku:
-            danmakus = []
+
+        if has_danmaku:
+            # #3: 弹幕已有分析结果，但无原始文本——传关键词作为上下文
+            danmakus = [{"content": k} for k in (existing_danmaku.keywords or [])]
+            danmaku_data["total"] = existing_danmaku.total_count or 0
+        else:
+            # #3: 获取弹幕前确保有CID
+            if not cid:
+                info = await client.get_video_info(bvid)
+                cid = info.get("cid") or (info.get("pages") or [{}])[0].get("cid")
+                if not cid:
+                    print(f"[fetcher] {bvid}: 无法获取CID，跳过弹幕")
+                else:
+                    danmaku_data = await client.get_danmaku(cid, max_count=2000)
+                    danmakus = danmaku_data["items"]
+            else:
+                danmaku_data = await client.get_danmaku(cid, max_count=2000)
+                danmakus = danmaku_data["items"]
     else:
         if aid:
             try:

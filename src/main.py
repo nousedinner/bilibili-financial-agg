@@ -719,7 +719,7 @@ async def _reserve_job(kind):
 
 
 async def _execute_job(job_id, work):
-    # Issue #11 #2+#3: 最外层 try/finally 保证取消时也能写终态和释放锁
+    # Issue #12 #3+#4: 最外层 try/finally 保证取消时也能写终态和释放锁
     task = asyncio.current_task()
     _background_tasks.add(task)
     status, result, error = "completed", None, None
@@ -734,11 +734,17 @@ async def _execute_job(job_id, work):
                 status = "partial"
         except asyncio.CancelledError as exc:
             status, error = "interrupted", "Task cancelled"
-            cancelled_exc = exc  # 保存，不立即raise
+            cancelled_exc = exc
         except Exception as exc:
             status, error = "failed", str(exc)[:1000]
 
-        # Issue #11 #2: 终态写入——在finally之前，保证不被取消跳过
+        # Issue #12 #3: 先注册 pending failure（含完整结果），写入成功后才移除
+        # 这样即使取消发生在写入期间，health 也能正确告警
+        _pending_job_failures[job_id] = {
+            "status": status, "result": result, "error": error, "time": _utcnow()
+        }
+
+        # Issue #12 #3: 终态写入——catch BaseException 覆盖 CancelledError
         for _attempt in range(3):
             try:
                 async with async_session() as session:
@@ -746,21 +752,22 @@ async def _execute_job(job_id, work):
                     job.status, job.result, job.error_message = status, result, error
                     job.finished_at = _utcnow()
                     await session.commit()
-                # Issue #11 #3: 成功只清除自己的失败标记
                 _pending_job_failures.pop(job_id, None)
                 break
-            except Exception as e:
+            except BaseException as e:
                 if _attempt < 2:
                     logger.warning(f"[execute_job] 状态提交失败(尝试{_attempt+1}/3): {e}")
-                    await asyncio.sleep(1)
+                    try:
+                        await asyncio.sleep(1)
+                    except asyncio.CancelledError:
+                        break  # 取消时不重试sleep
                 else:
                     logger.error(f"[execute_job] 状态提交最终失败: {job_id} (DEGRADED)")
-                    _pending_job_failures[job_id] = {"status": status, "time": _utcnow()}
+                    # 已注册，无需重复设置
     finally:
         _job_lock.release()
         _background_tasks.discard(task)
 
-    # Issue #11 #2: 清理完成后才传播取消
     if cancelled_exc is not None:
         raise cancelled_exc
 
@@ -855,12 +862,14 @@ async def _backfill_work(mid, since):
             visited += 1
     # Issue #6: 补偿阶段始终执行，不受博主异常影响
     digests = await regenerate_dirty_digests()
-    # Issue #11 #5: 精确截断报告——按实际访问计数
+    # Issue #12 #6: 精确截断报告——汇总博主未访问 + 单博主批次截断
     not_visited = len(bloggers) - visited
     budget_exhausted = remaining <= 0 or page_budget["remaining"] <= 0
-    truncated = not_visited > 0
+    # 任一博主 has_more 也算 truncated
+    any_has_more = any(r.get("has_more") for r in results)
+    truncated = not_visited > 0 or any_has_more
     if truncated:
-        logger.warning(f"[backfill] {not_visited} bloggers skipped (budget exhausted)")
+        logger.warning(f"[backfill] truncated: {not_visited} bloggers skipped, any_has_more={any_has_more}")
     return {
         "bloggers": results,
         "failed": sum(r.get("failed", 0) for r in results) + digests["failed"],
@@ -893,7 +902,9 @@ async def _retry_work():
         retryable.append(v)
         if len(retryable) >= 50:
             break
-    result = {"processed": 0, "skipped": len(videos) - len(retryable), "failed": 0}
+    # Issue #12 #6: 检测是否还有更多候选
+    result = {"processed": 0, "skipped": len(videos) - len(retryable), "failed": 0,
+              "has_more": len(videos) > 50}
     async with _bili_client() as client:
         for video in retryable:
             try:

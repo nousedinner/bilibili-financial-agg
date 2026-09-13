@@ -95,6 +95,10 @@ async def run_fetch_only() -> dict:
             if not blogger.get("enabled", True):
                 continue
 
+            # Issue #12 #5: 预算耗尽时停止，不把剩余博主计为失败
+            if budget["pages"] <= 0:
+                break
+
             mid = blogger["mid"]
             name = blogger.get("name", str(mid))
             logger.info(f"[fetcher] 处理博主: {name} (mid={mid})")
@@ -179,6 +183,7 @@ async def run_backfill(mid: int, since: str, cap: int = 20, page_budget: dict = 
                             if not should_retry(old.retry_count or 0, err_type):
                                 continue
                     if result["attempted"] >= cap:
+                        result["has_more"] = True  # Issue #12 #6: 批次上限达到
                         return result
                     result["attempted"] += 1
                     try:
@@ -240,6 +245,10 @@ async def run_retry_failed(batch_limit: int = 50) -> dict:
         if is_permanent(err_type) or not should_retry(v.retry_count or 0, err_type):
             continue
         failed.append(v)
+
+    # Issue #12 #6: 检测是否还有更多候选
+    if len(candidates) > batch_limit:
+        result["has_more"] = True
 
     for v in failed:
         err_type = v.error_type or "unknown"  # 已在上面分类并持久化
@@ -331,9 +340,10 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str, budget: dict =
     max_scan_pages = budget["pages"]  # Issue #11 #1: 使用共享页面预算
     seen, videos, complete = set(), [], False
     watermark_found = not last_bvid  # 无水位线时视为"已找到"
+    budget_truncated_scan = False  # Issue #12 #1: 预算截断时不推进水位线
     for page in range(1, max_scan_pages + 1):
+        budget["pages"] -= 1  # Issue #12 #2: 请求前扣减——失败也消耗预算
         data = await client.get_video_list(mid, page=page, page_size=30)
-        budget["pages"] -= 1  # Issue #11 #1: 每次列表请求扣减共享页面预算
         batch = data.get("list", {}).get("vlist", [])
         if not batch:
             complete = True
@@ -357,16 +367,17 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str, budget: dict =
                 continue
             if not stop:
                 videos.append(v)
-        # Issue #11 #1: 首次和增量统一使用 new_videos 预算 cap
+        # Issue #12 #1: 预算截断——标记为截断而非完成，不推进水位线
         if len(videos) >= cap:
             videos = videos[:cap]
             complete = True
+            budget_truncated_scan = True
             break
         if stop:
             complete = True
             break
-    if not complete:
-        # Issue #5: 水位线失效时给出明确提示
+    # Issue #12 #5: 页面预算为0时跳过扫描，不视为业务异常
+    if not complete and max_scan_pages > 0:
         hint = "watermark not found; use backfill" if last_bvid and not watermark_found else "use backfill"
         raise ValueError(f"Video scan limit exceeded ({max_scan_pages} pages); {hint}")
     last_processed = None
@@ -392,8 +403,8 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str, budget: dict =
                 if await session.get(Video, v["bvid"]) is None:
                     raise  # A DB failure must not move the boundary past an unqueued item.
         await asyncio.sleep(interval)
-    # Issue #3: 水位线只推进到最后成功处理的位置，不跳过未处理项
-    if last_processed:
+    # Issue #12 #1: 水位线只在扫描真正完成时推进；预算截断时不推进
+    if last_processed and not budget_truncated_scan:
         async with async_session() as session:
             wm = await session.get(FetchWatermark, mid) or FetchWatermark(mid=mid)
             wm.last_bvid = last_processed["bvid"]

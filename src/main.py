@@ -704,6 +704,7 @@ async def _reserve_job(kind):
 
 
 async def _execute_job(job_id, work):
+    global _last_job_write_failure
     task = asyncio.current_task()
     _background_tasks.add(task)
     status, result, error = "completed", None, None
@@ -716,8 +717,8 @@ async def _execute_job(job_id, work):
         raise
     except Exception as exc:
         status, error = "failed", str(exc)[:1000]
-    finally:
-        # #7: 最终状态提交——有界重试，防止DB临时故障导致永久running
+    # #7: 最终状态提交——有界重试，防止DB临时故障导致永久running
+    try:
         for _attempt in range(3):
             try:
                 async with async_session() as session:
@@ -725,15 +726,16 @@ async def _execute_job(job_id, work):
                     job.status, job.result, job.error_message = status, result, error
                     job.finished_at = _utcnow()
                     await session.commit()
-                break  # 成功
+                _last_job_write_failure = None  # DB恢复正常，清除降级标记
+                break
             except Exception as e:
                 if _attempt < 2:
                     print(f"[execute_job] 状态提交失败(尝试{_attempt+1}/3): {e}")
                     await asyncio.sleep(1)
                 else:
-                    print(f"[execute_job] ⚠️ 状态提交最终失败: {job_id} 将保持running直到重启 (DEGRADED)")
-                    # 标记服务降级——health端点应反映此状态
+                    print(f"[execute_job] [WARN] 状态提交最终失败: {job_id} 将保持running直到重启 (DEGRADED)")
                     _last_job_write_failure = {"job_id": job_id, "status": status, "time": _utcnow()}
+    finally:
         _job_lock.release()
         _background_tasks.discard(task)
     return {"id": job_id, "status": status, "result": result, "error": error}
@@ -811,7 +813,7 @@ async def _backfill_work(mid, since):
     # #5: 共享页面预算——所有博主共用，防止单博主异常放大请求量
     page_budget = {"remaining": 50}
     for b in bloggers:
-        if remaining <= 0:
+        if remaining <= 0 or page_budget["remaining"] <= 0:
             break
         try:
             r = await run_backfill(b["mid"], since, remaining, page_budget=page_budget)
@@ -824,12 +826,15 @@ async def _backfill_work(mid, since):
                             "processed": 0, "failed": 0, "attempted": 0, "error": str(exc)[:200]})
     # Issue #6: 补偿阶段始终执行，不受博主异常影响
     digests = await regenerate_dirty_digests()
+    not_visited = sum(r.get("not_visited", 0) for r in results)
+    if not_visited:
+        print(f"[backfill] {not_visited} bloggers skipped (page budget exhausted)")
     return {"bloggers": results, "failed": sum(r.get("failed", 0) for r in results) + digests["failed"], "digests": digests}
 
 
 async def _retry_work():
-    from src.fetcher import _bili_client
-    from src.retry_strategy import classify_error, is_permanent, should_retry
+    from src.fetcher import _bili_client, _resolve_error_type
+    from src.retry_strategy import is_permanent, should_retry
     async with async_session() as session:
         videos = (await session.execute(select(Video).outerjoin(Transcript, Video.bvid == Transcript.bvid)
             .outerjoin(Summary, Video.bvid == Summary.bvid).where(Video.mid.in_(select(Blogger.mid).where(Blogger.enabled == True)),
@@ -839,7 +844,7 @@ async def _retry_work():
     # Issue #3: 统一重试资格检查——与 run_retry_failed() 一致
     retryable = []
     for v in videos:
-        err_type = classify_error(v.error_message or "", v.duration or 0)
+        err_type = await _resolve_error_type(v)
         if is_permanent(err_type):
             print(f"[retry_work] {v.bvid}: 永久失败({err_type})，跳过")
             continue

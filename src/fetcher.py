@@ -13,6 +13,24 @@ from src.bilibili import BiliClient
 from src.transcript import fetch_transcript
 from src.analyzer import analyze_video, analyze_dynamic, generate_daily_digest, _validate_analysis, _validate_digest
 from src.retry_strategy import classify_error, should_retry, is_permanent, max_retries_for
+
+
+async def _resolve_error_type(v) -> str:
+    """统一错误类型解析：优先用持久化值，无则分类一次并持久化。所有入口统一调用。"""
+    err_type = getattr(v, 'error_type', None)
+    if err_type:
+        return err_type
+    err_type = classify_error(getattr(v, 'error_message', '') or '', getattr(v, 'duration', 0) or 0)
+    # 持久化
+    try:
+        async with async_session() as session:
+            video = await session.get(Video, v.bvid)
+            if video and not video.error_type:
+                video.error_type = err_type
+                await session.commit()
+    except Exception as e:
+        print(f"[fetcher] {v.bvid}: 持久化error_type失败({e})")
+    return err_type
 from src.models import (
     Blogger, Video, Transcript, Summary,
     CommentAnalysis, DanmakuAnalysis, Dynamic,
@@ -96,7 +114,12 @@ async def run_daily_fetch() -> dict:
 async def run_backfill(mid: int, since: str, cap: int = 20, page_budget: dict = None) -> dict:
     if page_budget is None:
         page_budget = {"remaining": 50}
-    result = {"mid": mid, "name": "unknown", "processed": 0, "failed": 0, "attempted": 0}
+    result = {"mid": mid, "name": "unknown", "processed": 0, "failed": 0, "attempted": 0,
+              "not_visited": 0}  # #3: 页面预算耗尽导致未访问的博主数量
+    if page_budget["remaining"] <= 0:
+        result["not_visited"] = 1
+        print(f"[backfill] {mid}: 页面预算已耗尽，跳过")
+        return result
     try:
         since_dt = datetime.combine(date.fromisoformat(since), dt_time())
         async with async_session() as session:
@@ -132,7 +155,7 @@ async def run_backfill(mid: int, since: str, cap: int = 20, page_budget: dict = 
                             continue
                         # Issue #6: 回填也检查重试策略——永久失败和次数耗尽不重试
                         if old:
-                            err_type = classify_error(old.error_message or "", old.duration or 0)
+                            err_type = await _resolve_error_type(old)
                             if is_permanent(err_type):
                                 continue
                             if not should_retry(old.retry_count or 0, err_type):
@@ -195,13 +218,13 @@ async def run_retry_failed(batch_limit: int = 50) -> dict:
     for v in candidates:
         if len(failed) >= batch_limit:
             break
-        err_type = classify_error(v.error_message or "", v.duration or 0)
+        err_type = await _resolve_error_type(v)
         if is_permanent(err_type) or not should_retry(v.retry_count or 0, err_type):
             continue
         failed.append(v)
 
     for v in failed:
-        err_type = classify_error(v.error_message or "", v.duration or 0)
+        err_type = v.error_type or "unknown"  # 已在上面分类并持久化
         # 针对性重试
         print(f"[retry] {v.bvid}: {err_type}，重试中...")
         async with _bili_client() as client:
@@ -209,11 +232,11 @@ async def run_retry_failed(batch_limit: int = 50) -> dict:
                 await _process_video(client, v.mid, _video_info(v), is_retry=True)
                 result["processed"] += 1
                 result["details"].append({"bvid": v.bvid, "status": "ok"})
-                print(f"[retry] {v.bvid}: ✅ 成功")
+                print(f"[retry] {v.bvid}: [OK] 成功")
             except Exception as e:
                 result["failed"] += 1
                 result["details"].append({"bvid": v.bvid, "status": "failed", "error": str(e)[:100]})
-                print(f"[retry] {v.bvid}: ❌ {e}")
+                print(f"[retry] {v.bvid}: [FAIL] {e}")
         await asyncio.sleep(interval)
     
     return result
@@ -247,7 +270,7 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str, budget: dict =
         # 按错误类型分级过滤重试，使用任务级预算
         retryable = []
         for v in failed:
-            err_type = classify_error(v.error_message or "", v.duration or 0)
+            err_type = await _resolve_error_type(v)
             if is_permanent(err_type):
                 print(f"[fetcher] {v.bvid}: 永久失败({err_type})，跳过")
                 continue
@@ -438,8 +461,8 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
             if not aid:
                 aid = getattr(db_video, 'aid', None) or 0
 
-        # 已有完整转写
-        if existing_transcript and existing_transcript.full_text and len(existing_transcript.full_text) > 100:
+        # 已有转写——已持久化的字幕一律复用，不再用长度阈值区分
+        if existing_transcript and existing_transcript.full_text:
             transcript_text = existing_transcript.full_text
             transcript_result = {"source": existing_transcript.source, "text": transcript_text,
                 "segments": existing_transcript.segment_count or 1}
@@ -687,7 +710,7 @@ async def _process_dynamic_core(client: BiliClient, mid: int, dyn_data: dict):
         await _mark_digest_dirty(session, pub_dt)
         await session.commit()
 
-    print(f"[fetcher] ✅ dynamic {dyn_id} — {analysis.get('sentiment', 'neutral')}")
+    print(f"[fetcher] [OK] dynamic {dyn_id} -- {analysis.get('sentiment', 'neutral')}")
 
 
 async def _generate_digest(bloggers: list, results: dict, target_date: date = None):

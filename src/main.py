@@ -33,6 +33,7 @@ _background_tasks = set()
 _scheduler = None
 _cookie_cache = (0.0, {})
 _cookie_lock = asyncio.Lock()
+_last_job_write_failure = None  # #7: 状态提交失败标记
 
 
 # ------------------------------------------------------------------
@@ -576,6 +577,9 @@ async def health():
         return JSONResponse(status_code=503, content={"status": "degraded", "db": "disconnected"})
     if _scheduler is not None and not _scheduler.running:
         return JSONResponse(status_code=503, content={"status": "degraded", "scheduler": "stopped"})
+    if _last_job_write_failure is not None:
+        return JSONResponse(status_code=503, content={"status": "degraded",
+            "reason": "job status write failed", "job_id": _last_job_write_failure["job_id"]})
     return {"status": "ok", "db": "connected"}
 
 
@@ -585,14 +589,18 @@ async def status():
         bloggers = (await session.execute(select(func.count()).select_from(Blogger).where(Blogger.enabled == True))).scalar()
         videos = (await session.execute(select(func.count()).select_from(Video))).scalar()
         failed = (await session.execute(select(func.count()).select_from(Video).where(Video.fetch_status == "failed"))).scalar()
-        # #6: 过滤skipped记录——跳过的任务不代表实际完成
-        job = (await session.execute(select(FetchJob).where(
-            FetchJob.status != "skipped"
-        ).order_by(FetchJob.started_at.desc()).limit(1))).scalar_one_or_none()
+        # #6: last_job包含所有状态（含skipped），last_fetch只取实际完成的
+        job = (await session.execute(select(FetchJob).order_by(
+            FetchJob.started_at.desc()).limit(1))).scalar_one_or_none()
+        last_fetch_job = (await session.execute(select(FetchJob).where(
+            FetchJob.status.in_(["completed", "partial"]),
+            FetchJob.finished_at.isnot(None)
+        ).order_by(FetchJob.finished_at.desc()).limit(1))).scalar_one_or_none()
         last_job = _job_json(job) if job else None
+        last_fetch_time = last_fetch_job.finished_at.isoformat() if last_fetch_job and last_fetch_job.finished_at else None
     cookie = await _cached_cookie_status()
     return {"code": 0, "data": {"bloggers": bloggers, "videos": videos, "failed": failed,
-        "last_fetch": last_job["finished_at"] if last_job else None, "last_job": last_job,
+        "last_fetch": last_fetch_time, "last_job": last_job,
         "task_running": _job_lock.locked(), "cookie_valid": cookie.get("valid", False),
         "cookie_expire": cookie.get("expire_date", "")}}
 
@@ -670,8 +678,7 @@ async def _recover_interrupted():
                     ELSE error_message
                 END,
                 error_type = CASE
-                    WHEN (fetch_status = 'pending' OR analysis_status = 'processing')
-                         AND error_type IS NULL
+                    WHEN fetch_status = 'pending' OR analysis_status = 'processing'
                     THEN 'unknown'
                     ELSE error_type
                 END,
@@ -724,7 +731,9 @@ async def _execute_job(job_id, work):
                     print(f"[execute_job] 状态提交失败(尝试{_attempt+1}/3): {e}")
                     await asyncio.sleep(1)
                 else:
-                    print(f"[execute_job] 状态提交最终失败: {job_id} 将保持running直到重启")
+                    print(f"[execute_job] ⚠️ 状态提交最终失败: {job_id} 将保持running直到重启 (DEGRADED)")
+                    # 标记服务降级——health端点应反映此状态
+                    _last_job_write_failure = {"job_id": job_id, "status": status, "time": _utcnow()}
         _job_lock.release()
         _background_tasks.discard(task)
     return {"id": job_id, "status": status, "result": result, "error": error}
@@ -799,11 +808,13 @@ async def _backfill_work(mid, since):
     results = []
     # Issue #6: 共享预算——所有博主共用 backfill_cap
     remaining = get_config().get("data", {}).get("backfill_cap", 20)
+    # #5: 共享页面预算——所有博主共用，防止单博主异常放大请求量
+    page_budget = {"remaining": 50}
     for b in bloggers:
         if remaining <= 0:
             break
         try:
-            r = await run_backfill(b["mid"], since, remaining)
+            r = await run_backfill(b["mid"], since, remaining, page_budget=page_budget)
             results.append(r)
             remaining -= r.get("attempted", 0)
         except Exception as exc:

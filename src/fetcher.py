@@ -93,7 +93,9 @@ async def run_daily_fetch() -> dict:
     return results
 
 
-async def run_backfill(mid: int, since: str, cap: int = 20) -> dict:
+async def run_backfill(mid: int, since: str, cap: int = 20, page_budget: dict = None) -> dict:
+    if page_budget is None:
+        page_budget = {"remaining": 50}
     result = {"mid": mid, "name": "unknown", "processed": 0, "failed": 0, "attempted": 0}
     try:
         since_dt = datetime.combine(date.fromisoformat(since), dt_time())
@@ -103,9 +105,10 @@ async def run_backfill(mid: int, since: str, cap: int = 20) -> dict:
                 raise ValueError(f"Enabled blogger {mid} not found")
             result["name"] = blogger.name
         seen = set()
-        max_pages = 50  # #4: 页面请求预算——防止单次回填占用过多资源
+        max_pages = page_budget["remaining"]  # #5: 使用共享页面预算
         async with _bili_client() as client:
             for page in range(1, max_pages + 1):
+                page_budget["remaining"] -= 1  # #5: 每次列表请求扣减共享预算
                 data = await client.get_video_list(mid, page=page, page_size=30)
                 batch = data.get("list", {}).get("vlist", [])
                 if not batch:
@@ -138,7 +141,8 @@ async def run_backfill(mid: int, since: str, cap: int = 20) -> dict:
                         return result
                     result["attempted"] += 1
                     try:
-                        await _process_video(client, mid, v)
+                        # #2: 已有记录走恢复模式，复用本地字幕/互动数据
+                        await _process_video(client, mid, v, is_retry=bool(old))
                         result["processed"] += 1
                     except Exception:
                         result["failed"] += 1
@@ -539,8 +543,8 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
             comments = comment_data["replies"]
 
         if has_danmaku:
-            # #3: 弹幕已有分析结果，但无原始文本——传关键词作为上下文
-            danmakus = [{"content": k} for k in (existing_danmaku.keywords or [])]
+            # #3: 弹幕已有分析结果——传关键词字符串列表（analyze_video期望str列表）
+            danmakus = list(existing_danmaku.keywords or [])
             danmaku_data["total"] = existing_danmaku.total_count or 0
         else:
             # #3: 获取弹幕前确保有CID

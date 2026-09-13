@@ -1,7 +1,9 @@
 """FastAPI 应用 — REST API + 定时调度。"""
 
 import asyncio
+import logging
 import secrets
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
@@ -24,6 +26,8 @@ from src.models import (
 )
 from src.fetcher import run_daily_fetch, run_fetch_only, run_backfill, run_retry_failed, _get_enabled_bloggers, _generate_digest, regenerate_dirty_digests, _process_video, _video_info, _utcnow, _HARD_SINCE
 
+logger = logging.getLogger(__name__)
+
 
 # ------------------------------------------------------------------
 # Task mutex flags — prevent overlapping background tasks
@@ -33,7 +37,7 @@ _background_tasks = set()
 _scheduler = None
 _cookie_cache = (0.0, {})
 _cookie_lock = asyncio.Lock()
-_last_job_write_failure = None  # #7: 状态提交失败标记
+_pending_job_failures: dict = {}  # Issue #11 #3: 按job_id追踪终态写入失败
 
 
 # ------------------------------------------------------------------
@@ -42,6 +46,15 @@ _last_job_write_failure = None  # #7: 状态提交失败标记
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Issue #6: 结构化日志替代print()，UTF-8安全编码
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="backslashreplace")
     await init_db()
     # One scheduler/writer per database. A second worker fails startup rather
     # than running competing jobs; the connection keeps the MySQL lock alive.
@@ -577,9 +590,11 @@ async def health():
         return JSONResponse(status_code=503, content={"status": "degraded", "db": "disconnected"})
     if _scheduler is not None and not _scheduler.running:
         return JSONResponse(status_code=503, content={"status": "degraded", "scheduler": "stopped"})
-    if _last_job_write_failure is not None:
+    # Issue #11 #3: 按job_id检查多个待确认终态
+    if _pending_job_failures:
         return JSONResponse(status_code=503, content={"status": "degraded",
-            "reason": "job status write failed", "job_id": _last_job_write_failure["job_id"]})
+            "reason": "job status write failed",
+            "pending_jobs": list(_pending_job_failures.keys())})
     return {"status": "ok", "db": "connected"}
 
 
@@ -704,21 +719,26 @@ async def _reserve_job(kind):
 
 
 async def _execute_job(job_id, work):
-    global _last_job_write_failure
+    # Issue #11 #2+#3: 最外层 try/finally 保证取消时也能写终态和释放锁
     task = asyncio.current_task()
     _background_tasks.add(task)
     status, result, error = "completed", None, None
+    cancelled_exc = None
+
     try:
-        result = await work()
-        if result and (result.get("total_failed", 0) or result.get("failed", 0)):
-            status = "partial"
-    except asyncio.CancelledError:
-        status, error = "interrupted", "Task cancelled"
-        raise
-    except Exception as exc:
-        status, error = "failed", str(exc)[:1000]
-    # #7: 最终状态提交——有界重试，防止DB临时故障导致永久running
-    try:
+        # 业务执行
+        try:
+            result = await work()
+            if result and (result.get("total_failed", 0) or result.get("failed", 0)
+                           or result.get("truncated")):
+                status = "partial"
+        except asyncio.CancelledError as exc:
+            status, error = "interrupted", "Task cancelled"
+            cancelled_exc = exc  # 保存，不立即raise
+        except Exception as exc:
+            status, error = "failed", str(exc)[:1000]
+
+        # Issue #11 #2: 终态写入——在finally之前，保证不被取消跳过
         for _attempt in range(3):
             try:
                 async with async_session() as session:
@@ -726,18 +746,24 @@ async def _execute_job(job_id, work):
                     job.status, job.result, job.error_message = status, result, error
                     job.finished_at = _utcnow()
                     await session.commit()
-                _last_job_write_failure = None  # DB恢复正常，清除降级标记
+                # Issue #11 #3: 成功只清除自己的失败标记
+                _pending_job_failures.pop(job_id, None)
                 break
             except Exception as e:
                 if _attempt < 2:
-                    print(f"[execute_job] 状态提交失败(尝试{_attempt+1}/3): {e}")
+                    logger.warning(f"[execute_job] 状态提交失败(尝试{_attempt+1}/3): {e}")
                     await asyncio.sleep(1)
                 else:
-                    print(f"[execute_job] [WARN] 状态提交最终失败: {job_id} 将保持running直到重启 (DEGRADED)")
-                    _last_job_write_failure = {"job_id": job_id, "status": status, "time": _utcnow()}
+                    logger.error(f"[execute_job] 状态提交最终失败: {job_id} (DEGRADED)")
+                    _pending_job_failures[job_id] = {"status": status, "time": _utcnow()}
     finally:
         _job_lock.release()
         _background_tasks.discard(task)
+
+    # Issue #11 #2: 清理完成后才传播取消
+    if cancelled_exc is not None:
+        raise cancelled_exc
+
     return {"id": job_id, "status": status, "result": result, "error": error}
 
 
@@ -754,7 +780,7 @@ async def _run_job(kind, work):
                     error_message="Busy: another task holds the lock")
                 session.add(skipped)
                 await session.commit()
-            print(f"[scheduler] {kind}: busy, recorded as skipped")
+            logger.info(f"[scheduler] {kind}: busy, recorded as skipped")
             return {"status": "busy"}
         else:
             raise
@@ -812,6 +838,7 @@ async def _backfill_work(mid, since):
     remaining = get_config().get("data", {}).get("backfill_cap", 20)
     # #5: 共享页面预算——所有博主共用，防止单博主异常放大请求量
     page_budget = {"remaining": 50}
+    visited = 0
     for b in bloggers:
         if remaining <= 0 or page_budget["remaining"] <= 0:
             break
@@ -819,17 +846,29 @@ async def _backfill_work(mid, since):
             r = await run_backfill(b["mid"], since, remaining, page_budget=page_budget)
             results.append(r)
             remaining -= r.get("attempted", 0)
+            visited += 1
         except Exception as exc:
             # Issue #6: 单博主异常不阻塞后续博主
-            print(f"[backfill] blogger {b['mid']} failed: {exc}")
+            logger.error(f"[backfill] blogger {b['mid']} failed: {exc}")
             results.append({"mid": b["mid"], "name": b.get("name", str(b["mid"])),
                             "processed": 0, "failed": 0, "attempted": 0, "error": str(exc)[:200]})
+            visited += 1
     # Issue #6: 补偿阶段始终执行，不受博主异常影响
     digests = await regenerate_dirty_digests()
-    not_visited = sum(r.get("not_visited", 0) for r in results)
-    if not_visited:
-        print(f"[backfill] {not_visited} bloggers skipped (page budget exhausted)")
-    return {"bloggers": results, "failed": sum(r.get("failed", 0) for r in results) + digests["failed"], "digests": digests}
+    # Issue #11 #5: 精确截断报告——按实际访问计数
+    not_visited = len(bloggers) - visited
+    budget_exhausted = remaining <= 0 or page_budget["remaining"] <= 0
+    truncated = not_visited > 0
+    if truncated:
+        logger.warning(f"[backfill] {not_visited} bloggers skipped (budget exhausted)")
+    return {
+        "bloggers": results,
+        "failed": sum(r.get("failed", 0) for r in results) + digests["failed"],
+        "digests": digests,
+        "truncated": truncated,
+        "not_visited": not_visited,
+        "budget_exhausted": budget_exhausted,
+    }
 
 
 async def _retry_work():
@@ -846,10 +885,10 @@ async def _retry_work():
     for v in videos:
         err_type = await _resolve_error_type(v)
         if is_permanent(err_type):
-            print(f"[retry_work] {v.bvid}: 永久失败({err_type})，跳过")
+            logger.info(f"[retry_work] {v.bvid}: 永久失败({err_type})，跳过")
             continue
         if not should_retry(v.retry_count or 0, err_type):
-            print(f"[retry_work] {v.bvid}: {err_type} 达上限({v.retry_count})，跳过")
+            logger.info(f"[retry_work] {v.bvid}: {err_type} 达上限({v.retry_count})，跳过")
             continue
         retryable.append(v)
         if len(retryable) >= 50:

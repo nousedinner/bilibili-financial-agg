@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
 from tests import test_acceptance as baseline
-from src import main, fetcher, analyzer, bilibili, transcript, migrations, db
+from src import main, fetcher, analyzer, bilibili, transcript, migrations, db, config
 from src.models import *
 from sqlalchemy import select, text
 from sqlalchemy.dialects import mysql
@@ -158,8 +158,14 @@ class Regressions(unittest.IsolatedAsyncioTestCase):
         pages = [{'list': {'vlist': [{'bvid': f'BV{i}', 'created': 1788912000}]}} for i in range(11)]
         pages.append({'list': {'vlist': [{'bvid': 'BVold', 'created': 1788912000}]}})
         c = SimpleNamespace(get_video_list=AsyncMock(side_effect=pages), get_dynamics=AsyncMock(return_value={'items': []}))
-        with patch.object(fetcher, '_process_video', AsyncMock()) as process:
-            await fetcher._fetch_blogger(c, 1, 'Test')
+        # Issue #11 #1: cap now applies to incremental scans too; raise cap for this test
+        original = config._CONFIG
+        try:
+            config._CONFIG = {**original, 'data': {**original.get('data', {}), 'first_run_cap': 20}}
+            with patch.object(fetcher, '_process_video', AsyncMock()) as process:
+                await fetcher._fetch_blogger(c, 1, 'Test')
+        finally:
+            config._CONFIG = original
         self.assertEqual(process.await_count, 11)
         self.assertEqual(c.get_video_list.await_count, 12)
 

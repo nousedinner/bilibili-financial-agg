@@ -1,6 +1,7 @@
 """抓取调度器 — 单视频管线 + 全量抓取 + 历史补抓。"""
 
 import asyncio
+import logging
 import time
 from datetime import datetime, date, timezone, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
@@ -29,7 +30,7 @@ async def _resolve_error_type(v) -> str:
                 video.error_type = err_type
                 await session.commit()
     except Exception as e:
-        print(f"[fetcher] {v.bvid}: 持久化error_type失败({e})")
+        logger.warning(f"[fetcher] {v.bvid}: 持久化error_type失败({e})")
     return err_type
 from src.models import (
     Blogger, Video, Transcript, Summary,
@@ -38,6 +39,8 @@ from src.models import (
 )
 from src.db import async_session
 from src.config import get_config, get_env
+
+logger = logging.getLogger(__name__)
 
 # ── 硬性时间下限：绝对业务边界，不可由配置修改 ──
 _HARD_SINCE = datetime(2026, 7, 1)  # 绝对常量，backfill_since 只能 >= 此值
@@ -69,18 +72,24 @@ async def run_fetch_only() -> dict:
     bloggers = await _get_enabled_bloggers()
 
     if not bloggers:
-        print("[fetcher] 没有启用的博主，跳过抓取")
+        logger.info("[fetcher] 没有启用的博主，跳过抓取")
         return {"total_new": 0, "total_failed": 0, "bloggers": {}}
 
+    cfg = get_config().get("data", {})
+    # Issue #11 #1: 任务级共享预算——pages/new_videos/retries 三项独立扣减
+    budget = {
+        "pages": cfg.get("task_page_budget", 50),
+        "new_videos": cfg.get("task_video_budget", cfg.get("first_run_cap", 50)),
+        "retries": cfg.get("task_retry_budget", 50),
+    }
     results = {"total_new": 0, "total_failed": 0, "bloggers": {}}
-    # #2: 任务级重试预算——可变对象，所有博主共享，原子扣减
-    budget = {"remaining": 50}
+    visited = 0
 
     async with _bili_client() as client:
         # Validate cookie
         cookie_status = await client.validate_sessdata()
         if not cookie_status["valid"]:
-            print("[fetcher] SESSDATA无效，仅使用不需要cookie的接口")
+            logger.warning("[fetcher] SESSDATA无效，仅使用不需要cookie的接口")
 
         for blogger in bloggers:
             if not blogger.get("enabled", True):
@@ -88,18 +97,27 @@ async def run_fetch_only() -> dict:
 
             mid = blogger["mid"]
             name = blogger.get("name", str(mid))
-            print(f"[fetcher] 处理博主: {name} (mid={mid})")
+            logger.info(f"[fetcher] 处理博主: {name} (mid={mid})")
 
             try:
                 b_result = await _fetch_blogger(client, mid, name, budget=budget)
                 results["bloggers"][mid] = b_result
                 results["total_new"] += b_result.get("new_count", 0)
                 results["total_failed"] += b_result.get("failed_count", 0)
+                visited += 1
             except Exception as e:
-                print(f"[fetcher] 博主 {name} 抓取失败: {e}")
+                logger.error(f"[fetcher] 博主 {name} 抓取失败: {e}")
                 results["bloggers"][mid] = {"error": str(e)}
                 results["total_failed"] += 1
+                visited += 1
 
+    # Issue #11 #1: 报告预算截断状态
+    not_visited = len(bloggers) - visited
+    budget_exhausted = (budget["pages"] <= 0 or budget["new_videos"] <= 0
+                        or budget["retries"] <= 0)
+    results["truncated"] = not_visited > 0 or budget_exhausted
+    results["not_visited"] = not_visited
+    results["budget_exhausted"] = budget_exhausted
     return results
 
 
@@ -118,7 +136,7 @@ async def run_backfill(mid: int, since: str, cap: int = 20, page_budget: dict = 
               "not_visited": 0}  # #3: 页面预算耗尽导致未访问的博主数量
     if page_budget["remaining"] <= 0:
         result["not_visited"] = 1
-        print(f"[backfill] {mid}: 页面预算已耗尽，跳过")
+        logger.info(f"[backfill] {mid}: 页面预算已耗尽，跳过")
         return result
     try:
         since_dt = datetime.combine(date.fromisoformat(since), dt_time())
@@ -226,17 +244,17 @@ async def run_retry_failed(batch_limit: int = 50) -> dict:
     for v in failed:
         err_type = v.error_type or "unknown"  # 已在上面分类并持久化
         # 针对性重试
-        print(f"[retry] {v.bvid}: {err_type}，重试中...")
+        logger.info(f"[retry] {v.bvid}: {err_type}，重试中...")
         async with _bili_client() as client:
             try:
                 await _process_video(client, v.mid, _video_info(v), is_retry=True)
                 result["processed"] += 1
                 result["details"].append({"bvid": v.bvid, "status": "ok"})
-                print(f"[retry] {v.bvid}: [OK] 成功")
+                logger.info(f"[retry] {v.bvid}: [OK] 成功")
             except Exception as e:
                 result["failed"] += 1
                 result["details"].append({"bvid": v.bvid, "status": "failed", "error": str(e)[:100]})
-                print(f"[retry] {v.bvid}: [FAIL] {e}")
+                logger.warning(f"[retry] {v.bvid}: [FAIL] {e}")
         await asyncio.sleep(interval)
     
     return result
@@ -247,7 +265,7 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str, budget: dict =
     retries = cfg.get("retry", {}).get("max_retries", 3)
     interval = cfg.get("limits", {}).get("video_interval_seconds", 5)
     if budget is None:
-        budget = {"remaining": 50}
+        budget = {"pages": 50, "new_videos": 50, "retries": 50}
     result = {"name": name, "new_count": 0, "failed_count": 0, "retried_count": 0, "dynamics_count": 0}
     async with async_session() as session:
         # #1: 精确SQL重试资格过滤——用持久化的error_type匹配各类型上限
@@ -272,23 +290,23 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str, budget: dict =
         for v in failed:
             err_type = await _resolve_error_type(v)
             if is_permanent(err_type):
-                print(f"[fetcher] {v.bvid}: 永久失败({err_type})，跳过")
+                logger.info(f"[fetcher] {v.bvid}: 永久失败({err_type})，跳过")
                 continue
             if should_retry(v.retry_count or 0, err_type):
                 retryable.append(v)
             else:
-                print(f"[fetcher] {v.bvid}: {err_type} 已达重试上限({v.retry_count}/{max_retries_for(err_type)})")
+                logger.info(f"[fetcher] {v.bvid}: {err_type} 已达重试上限({v.retry_count}/{max_retries_for(err_type)})")
         failed = retryable
         # #12: 动态抓取已停用，不查询 PendingDynamic
         wm = await session.get(FetchWatermark, mid)
         last_bvid, last_dyn = (wm.last_bvid, wm.last_dyn_id) if wm else (None, None)
     attempted = set()
     for v in failed:
-        # #2: 原子扣减——每次重试前检查并扣减预算
-        if budget["remaining"] <= 0:
-            print(f"[fetcher] 重试预算耗尽，停止博主 {name} 的重试")
+        # Issue #11 #1: 使用任务级重试预算
+        if budget["retries"] <= 0:
+            logger.info(f"[fetcher] 重试预算耗尽，停止博主 {name} 的重试")
             break
-        budget["remaining"] -= 1
+        budget["retries"] -= 1
         attempted.add(v.bvid)
         try:
             await _process_video(client, mid, _video_info(v), is_retry=True)
@@ -303,16 +321,19 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str, budget: dict =
     #     except Exception:
     #         result["failed_count"] += 1
 
-    # Persist every discovered video before moving the watermark. A bounded scan
-    # never advances it until it reaches the prior boundary; queued rows survive crashes.
-    cap = max(1, int(cfg.get("data", {}).get("first_run_cap", 20)))
+    # Issue #11 #1: 统一预算——首次和增量共用 new_videos 预算
+    cap = max(1, min(
+        int(cfg.get("data", {}).get("first_run_cap", 20)),
+        budget["new_videos"],
+    ))
     since = cfg.get("data", {}).get("backfill_since")
     since_dt = datetime.combine(date.fromisoformat(since), dt_time()) if since else None
-    max_scan_pages = 50  # Issue #5: 无论水位线状态，每轮最多扫描50页
+    max_scan_pages = budget["pages"]  # Issue #11 #1: 使用共享页面预算
     seen, videos, complete = set(), [], False
     watermark_found = not last_bvid  # 无水位线时视为"已找到"
     for page in range(1, max_scan_pages + 1):
         data = await client.get_video_list(mid, page=page, page_size=30)
+        budget["pages"] -= 1  # Issue #11 #1: 每次列表请求扣减共享页面预算
         batch = data.get("list", {}).get("vlist", [])
         if not batch:
             complete = True
@@ -336,8 +357,8 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str, budget: dict =
                 continue
             if not stop:
                 videos.append(v)
-        # 首次运行（无水位线）时限制新视频数量；增量运行不受此限
-        if not last_bvid and len(videos) >= cap:
+        # Issue #11 #1: 首次和增量统一使用 new_videos 预算 cap
+        if len(videos) >= cap:
             videos = videos[:cap]
             complete = True
             break
@@ -352,10 +373,14 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str, budget: dict =
     for v in videos:
         if v["bvid"] in attempted:
             continue
+        # Issue #11 #1: new_videos 预算耗尽时停止处理
+        if budget["new_videos"] <= 0:
+            break
         async with async_session() as session:
             old = await session.get(Video, v["bvid"])
         if old:  # Failed/pending rows are handled by the retry queue above.
             continue
+        budget["new_videos"] -= 1  # Issue #11 #1: 每条新视频扣减共享预算
         try:
             await _process_video(client, mid, v)
             result["new_count"] += 1
@@ -467,7 +492,7 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
             transcript_result = {"source": existing_transcript.source, "text": transcript_text,
                 "segments": existing_transcript.segment_count or 1}
             use_existing_transcript = True
-            print(f"[fetcher] {bvid}: 使用已有转写({len(transcript_text)}字)")
+            logger.info(f"[fetcher] {bvid}: 使用已有转写({len(transcript_text)}字)")
 
         # #3: 所有数据完整 → 跳过get_video_info和所有远程调用
         has_all = (use_existing_transcript
@@ -476,7 +501,7 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
             and existing_summary and existing_summary.summary)
         if has_all:
             reuse_existing_analysis = True
-            print(f"[fetcher] {bvid}: 所有数据完整，跳过远程调用（复用已有分析）")
+            logger.info(f"[fetcher] {bvid}: 所有数据完整，跳过远程调用（复用已有分析）")
             # 无需cid/aid/远程字幕——直接构建分析结果
             analysis = {
                 "summary": existing_summary.summary,
@@ -510,7 +535,7 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
                     video.aid = aid
                 await _mark_digest_dirty(session, pub_dt)
                 await session.commit()
-            print(f"[fetcher] Saved {bvid}: {analysis['sentiment']} (复用)")
+            logger.info(f"[fetcher] Saved {bvid}: {analysis['sentiment']} (复用)")
             return
 
     # 非重试或数据不完整——需要远程获取
@@ -533,7 +558,7 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
         try:
             aid = await client.get_video_aid(bvid)
         except Exception as e:
-            print(f"[fetcher] {bvid}: 获取aid失败({e})")
+            logger.warning(f"[fetcher] {bvid}: 获取aid失败({e})")
 
     # 标记分析阶段开始——拿到字幕，即将调LLM
     async with async_session() as session:
@@ -562,7 +587,7 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
             try:
                 comment_data = await client.get_comments(oid=aid, oid_type=1, count=20)
             except Exception as e:
-                print(f"[fetcher] {bvid}: 评论获取失败({e})，跳过")
+                logger.warning(f"[fetcher] {bvid}: 评论获取失败({e})，跳过")
             comments = comment_data["replies"]
 
         if has_danmaku:
@@ -575,7 +600,7 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
                 info = await client.get_video_info(bvid)
                 cid = info.get("cid") or (info.get("pages") or [{}])[0].get("cid")
                 if not cid:
-                    print(f"[fetcher] {bvid}: 无法获取CID，跳过弹幕")
+                    logger.warning(f"[fetcher] {bvid}: 无法获取CID，跳过弹幕")
                 else:
                     danmaku_data = await client.get_danmaku(cid, max_count=2000)
                     danmakus = danmaku_data["items"]
@@ -587,7 +612,7 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
             try:
                 comment_data = await client.get_comments(oid=aid, oid_type=1, count=20)
             except Exception as e:
-                print(f"[fetcher] {bvid}: 评论获取失败({e})，跳过")
+                logger.warning(f"[fetcher] {bvid}: 评论获取失败({e})，跳过")
         comments = comment_data["replies"]
         danmaku_data = await client.get_danmaku(cid, max_count=2000)
         danmakus = danmaku_data["items"]
@@ -625,7 +650,7 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
             video.aid = aid
         await _mark_digest_dirty(session, pub_dt)
         await session.commit()
-    print(f"[fetcher] Saved {bvid}: {analysis['sentiment']}")
+    logger.info(f"[fetcher] Saved {bvid}: {analysis['sentiment']}")
 
 
 async def _process_dynamic_core(client: BiliClient, mid: int, dyn_data: dict):
@@ -710,7 +735,7 @@ async def _process_dynamic_core(client: BiliClient, mid: int, dyn_data: dict):
         await _mark_digest_dirty(session, pub_dt)
         await session.commit()
 
-    print(f"[fetcher] [OK] dynamic {dyn_id} -- {analysis.get('sentiment', 'neutral')}")
+    logger.info(f"[fetcher] dynamic {dyn_id} -- {analysis.get('sentiment', 'neutral')}")
 
 
 async def _generate_digest(bloggers: list, results: dict, target_date: date = None):
@@ -725,30 +750,33 @@ async def _generate_digest(bloggers: list, results: dict, target_date: date = No
             rows = (await session.execute(select(Video, Summary).join(Summary, Video.bvid == Summary.bvid)
                 .where(Video.mid == b["mid"], Video.fetch_status == "ok", Video.publish_time >= start,
                     Video.publish_time < end,
-                    Video.publish_time >= _HARD_SINCE))).all()  # Issue #2: 绝对日期下限
+                    Video.publish_time >= _HARD_SINCE))).all()
             videos = [{"bvid": v.bvid, "title": v.title or "", "summary": s.summary or "",
                 "sentiment": s.sentiment or "neutral", "key_points": s.key_points or []} for v, s in rows]
             scores.extend(s.sentiment_score for _, s in rows if s.sentiment_score is not None)
             dyns = (await session.execute(select(Dynamic).where(Dynamic.mid == b["mid"],
                 Dynamic.publish_time >= start, Dynamic.publish_time < end,
-                Dynamic.publish_time >= _HARD_SINCE))).scalars().all()  # Issue #2: 绝对日期下限
+                Dynamic.publish_time >= _HARD_SINCE))).scalars().all()
             if videos or dyns:
                 analyses.append({"mid": b["mid"], "name": b.get("name", str(b["mid"])), "videos": videos,
                     "dynamics": [{"summary": d.summary or "", "sentiment": d.sentiment or "neutral"} for d in dyns]})
+
+    digest_content = None
     if analyses:
-        digest = await generate_daily_digest(analyses)
-        if digest.get("analysis_failed") or _validate_digest(digest).get("analysis_failed"):
+        digest_content = await generate_daily_digest(analyses)
+        if digest_content.get("analysis_failed") or _validate_digest(digest_content).get("analysis_failed"):
             raise ValueError(f"Daily digest {target_date} analysis failed; existing content preserved")
-        digest["bloggers"] = [b["name"] for b in analyses]
-        digest["sentiment_score"] = round(sum(scores) / len(scores), 2) if scores else 0.0
-        async with async_session() as session:
-            await session.merge(DailyDigest(digest_date=target_date, content=digest))
-            await session.commit()
+        digest_content["bloggers"] = [b["name"] for b in analyses]
+        digest_content["sentiment_score"] = round(sum(scores) / len(scores), 2) if scores else 0.0
+
+    # Issue #11 #4: DailyDigest 保存 + DirtyDigest 删除合并为单一事务
     async with async_session() as session:
+        if digest_content:
+            await session.merge(DailyDigest(digest_date=target_date, content=digest_content))
         dirty = await session.get(DirtyDigest, target_date)
         if dirty:
             await session.delete(dirty)
-            await session.commit()
+        await session.commit()
     return {"date": str(target_date), "generated": bool(analyses)}
 
 

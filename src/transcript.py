@@ -84,6 +84,19 @@ async def _download_subtitle(url: str) -> str:
         return ""
 
 
+async def _probe_duration(audio_path: str) -> float:
+    """用ffprobe获取实际音频时长（秒）。失败返回0。"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", audio_path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        return float(stdout.decode().strip())
+    except Exception:
+        return 0.0
+
+
 async def _asr_transcribe(client: BiliClient, bvid: str, cid: int, duration: int) -> Optional[dict]:
     cfg = get_config().get("asr", {})
     key = get_env("XIAOMI_API_KEY")
@@ -99,7 +112,27 @@ async def _asr_transcribe(client: BiliClient, bvid: str, cid: int, duration: int
     mp3_path = None
     try:
         mp3_path = await _to_mp3_path(audio_path)
-        chunks = await _split_audio_from_file(mp3_path, int(cfg.get("chunk_seconds", 180)))
+        # #7: 用ffprobe验证实际时长，防止B站元数据虚报
+        actual_duration = await _probe_duration(mp3_path)
+        if actual_duration <= 0:
+            actual_duration = duration
+        # #7: 硬上限——实际时长超60分钟拒绝ASR
+        if actual_duration > 3600:
+            print(f"[transcript] {bvid}: 实际时长{actual_duration}s (>{60}min)，跳过ASR")
+            return None
+        chunk_seconds = int(cfg.get("chunk_seconds", 180))
+        chunks = await _split_audio_from_file(mp3_path, chunk_seconds)
+        # #7: 最大分片数限制——防止单条异常内容产生大量ASR调用
+        max_chunks = int(cfg.get("max_chunks", 40))  # 40片 × 3分钟 = 120分钟理论上限
+        if len(chunks) > max_chunks:
+            print(f"[transcript] {bvid}: 分片数{len(chunks)}超过上限{max_chunks}，截断")
+            # 清理多余分片
+            for excess in chunks[max_chunks:]:
+                try:
+                    os.unlink(excess)
+                except OSError:
+                    pass
+            chunks = chunks[:max_chunks]
         texts = []
         for index, chunk_path in enumerate(chunks):
             try:

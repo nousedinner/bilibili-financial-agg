@@ -660,15 +660,22 @@ async def _recover_interrupted():
     async with async_session() as session:
         await session.execute(update(FetchJob).where(FetchJob.status == "running").values(
             status="interrupted", finished_at=_utcnow(), error_message="Service restarted"))
-        # #2: 合并为单条UPDATE，每行最多递增一次
+        # #3: 重试计数和错误信息先于状态修改，确保MySQL单语句语义正确
+        # MySQL的CASE在UPDATE中使用原始值评估，但为安全起见先写计数再改状态
         await session.execute(text("""
             UPDATE videos SET
-                fetch_status = CASE WHEN fetch_status='pending' THEN 'failed' ELSE fetch_status END,
-                analysis_status = CASE WHEN analysis_status='processing' THEN 'failed' ELSE analysis_status END,
-                error_message = CASE WHEN fetch_status='pending' OR analysis_status='processing'
-                    THEN 'Service restarted' ELSE error_message END,
-                retry_count = CASE WHEN fetch_status='pending' OR analysis_status='processing'
-                    THEN COALESCE(retry_count, 0) + 1 ELSE COALESCE(retry_count, 0) END
+                retry_count = CASE
+                    WHEN fetch_status = 'pending' OR analysis_status = 'processing'
+                    THEN COALESCE(retry_count, 0) + 1
+                    ELSE COALESCE(retry_count, 0)
+                END,
+                error_message = CASE
+                    WHEN fetch_status = 'pending' OR analysis_status = 'processing'
+                    THEN 'Service restarted'
+                    ELSE error_message
+                END,
+                fetch_status = CASE WHEN fetch_status = 'pending' THEN 'failed' ELSE fetch_status END,
+                analysis_status = CASE WHEN analysis_status = 'processing' THEN 'failed' ELSE analysis_status END
             WHERE fetch_status = 'pending' OR analysis_status = 'processing'
         """))
         await session.commit()
@@ -682,18 +689,10 @@ def _job_json(job):
 
 
 async def _reserve_job(kind):
+    """只获取任务锁，不创建记录。记录由 _run_job 或 _submit_job 创建。"""
     if _job_lock.locked():
         raise HTTPException(409, "已有采集或补算任务正在运行")
     await _job_lock.acquire()
-    try:
-        async with async_session() as session:
-            job = FetchJob(id=str(uuid4()), kind=kind, status="running")
-            session.add(job)
-            await session.commit()
-            return job.id
-    except BaseException:
-        _job_lock.release()
-        raise
 
 
 async def _execute_job(job_id, work):
@@ -731,13 +730,13 @@ async def _run_job(kind, work):
         await session.commit()
         queued_id = queued.id
     try:
-        job_id = await _reserve_job(kind)
+        await _reserve_job(kind)
     except HTTPException as exc:
         if exc.status_code == 409:
             print(f"[scheduler] {kind}: busy, queued {queued_id}, waiting 60s...")
             await asyncio.sleep(60)
             try:
-                job_id = await _reserve_job(kind)
+                await _reserve_job(kind)
             except HTTPException:
                 print(f"[scheduler] {kind}: still busy, {queued_id} pending next cycle")
                 return {"status": "busy", "queued_id": queued_id}
@@ -754,7 +753,13 @@ async def _run_job(kind, work):
 
 
 async def _submit_job(kind, work):
-    job_id = await _reserve_job(kind)
+    await _reserve_job(kind)
+    # 创建任务记录
+    async with async_session() as session:
+        job = FetchJob(id=str(uuid4()), kind=kind, status="running", started_at=_utcnow())
+        session.add(job)
+        await session.commit()
+        job_id = job.id
     task = asyncio.create_task(_execute_job(job_id, work))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)

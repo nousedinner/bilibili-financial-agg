@@ -35,6 +35,7 @@ class Video(Base):
     mid = Column(BigInteger, nullable=False, index=True)
     title = Column(String(500))
     duration = Column(Integer)
+    aid = Column(BigInteger)  # #5: B站avid，重试时恢复评论抓取
     publish_time = Column(DateTime, index=True)
     view_count = Column(Integer, default=0)
     content_type = Column(Enum("video", "dynamic", name="content_type"), default="video")

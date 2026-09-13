@@ -6,7 +6,7 @@ from datetime import datetime, date, timezone, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 from typing import Optional
 
-from sqlalchemy import select, update, or_
+from sqlalchemy import select, update, or_, and_, case, literal_column
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.bilibili import BiliClient
@@ -160,14 +160,24 @@ async def run_retry_failed() -> dict:
     interval = get_config().get("limits", {}).get("video_interval_seconds", 5)
     
     async with async_session() as session:
-        # #1: SQL排序——retry_count ASC优先处理可重试记录，permanent记录沉底
+        # #1: MySQL兼容排序——NULL排最后用CASE表达式（NULLS LAST在MySQL不支持）
+        # #2: 筛选条件直接在SQL WHERE中——永久失败记录不进候选集
         candidates = (await session.execute(select(Video).where(
             Video.fetch_status.in_(["failed", "pending"]),
             Video.mid.in_([b["mid"] for b in bloggers]),
             Video.publish_time >= _HARD_SINCE,
             Video.publish_time.isnot(None),
-        ).order_by(Video.retry_count.asc().nullslast()).limit(200))).scalars().all()
-    # 筛资格后取前50条
+            # 永久失败（404/视频已删除）直接排除——NULL也保留（未出过错）
+            or_(Video.error_message.is_(None),
+                and_(~Video.error_message.icontains("404"),
+                     ~Video.error_message.icontains("啥都木有"))),
+        ).order_by(
+            case((Video.retry_count.is_(None), 1), else_=0),
+            Video.retry_count.asc(),
+            Video.fetched_at.asc(),
+            Video.bvid.asc(),
+        ).limit(200))).scalars().all()
+    # #2: 筛资格后取前50条——重试次数上限在Python中检查
     batch_limit = 50
     failed = []
     for v in candidates:
@@ -378,22 +388,14 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
     if not cid:
         raise ValueError(f"Cannot get CID for {bvid}")
     dur_sec = info.get("duration") or dur_sec
-    transcript_result = await fetch_transcript(client, bvid, cid, dur_sec)
-    transcript_text = transcript_result.get("text", "")
-    if not transcript_text or transcript_result.get("partial"):
-        raise ValueError("Transcript unavailable or incomplete")
-    # 标记分析阶段开始——拿到字幕，即将调LLM
-    async with async_session() as session:
-        video = await session.get(Video, bvid)
-        video.analysis_status = "processing"
-        await session.commit()
-    # #3: 重试时——先读已有数据，按需远程获取，恢复aid
-    comment_data = {"replies": [], "total": 0}
-    danmaku_data = {"items": [], "total": 0}
-    comments, danmakus = [], []
+
+    # #5: 获取aid——优先从vinfo，其次从DB，最后远程获取
+    aid = vinfo.get("aid", 0) or 0
     existing_comments = existing_danmaku = None
     use_existing_transcript = False
-    aid = vinfo.get("aid", 0)
+    existing_transcript = None
+
+    # #4: 重试模式——先查DB，避免无意义的远程调用
     if is_retry:
         print(f"[fetcher] {bvid}: 重试模式——优先读已有数据，缺失时远程获取")
         async with async_session() as session:
@@ -404,19 +406,51 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
             existing_danmaku = (await session.execute(
                 select(DanmakuAnalysis).where(DanmakuAnalysis.bvid == bvid)
             )).scalar_one_or_none()
-            # #3: 恢复aid——vinfo可能没有
+            # #5: 恢复aid
             if not aid:
                 db_video = await session.get(Video, bvid)
-                aid = getattr(db_video, 'aid', 0) or 0
+                aid = getattr(db_video, 'aid', None) or 0
+
         # 已有完整转写直接使用，不走远程
         if existing_transcript and existing_transcript.full_text and len(existing_transcript.full_text) > 100:
             transcript_text = existing_transcript.full_text
+            transcript_result = {"source": existing_transcript.source, "text": transcript_text,
+                "segments": existing_transcript.segment_count or 1}
             use_existing_transcript = True
             print(f"[fetcher] {bvid}: 使用已有转写({len(transcript_text)}字)")
         else:
-            # 远程获取字幕
+            # #4: 仅在DB无有效转写时才远程获取
             transcript_result = await fetch_transcript(client, bvid, cid, dur_sec)
             transcript_text = transcript_result.get("text", "")
+    else:
+        # 非重试模式——直接远程获取
+        transcript_result = await fetch_transcript(client, bvid, cid, dur_sec)
+        transcript_text = transcript_result.get("text", "")
+
+    if not transcript_text or (transcript_result.get("partial") and not use_existing_transcript):
+        raise ValueError("Transcript unavailable or incomplete")
+
+    # #5: aid仍为0时远程获取
+    if not aid:
+        try:
+            aid = await client.get_video_aid(bvid)
+        except Exception as e:
+            print(f"[fetcher] {bvid}: 获取aid失败({e})")
+
+    # 标记分析阶段开始——拿到字幕，即将调LLM
+    async with async_session() as session:
+        video = await session.get(Video, bvid)
+        video.analysis_status = "processing"
+        # #5: 持久化aid
+        if aid and not video.aid:
+            video.aid = aid
+        await session.commit()
+
+    comment_data = {"replies": [], "total": 0}
+    danmaku_data = {"items": [], "total": 0}
+    comments, danmakus = [], []
+
+    if is_retry:
         # 已有完整评论/弹幕保留，缺失时重新抓取
         has_comments = existing_comments and (existing_comments.total_count or 0) > 0
         has_danmaku = existing_danmaku and (existing_danmaku.total_count or 0) > 0
@@ -442,6 +476,7 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
         comments = comment_data["replies"]
         danmaku_data = await client.get_danmaku(cid, max_count=2000)
         danmakus = danmaku_data["items"]
+
     analysis = await analyze_video(title, transcript_text, comments, danmakus, dur_sec)
     if analysis.get("analysis_failed") or not _validate_analysis(analysis):
         raise ValueError(f"LLM analysis failed for {bvid}")
@@ -469,6 +504,9 @@ async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retr
         video.fetch_status, video.retry_count, video.error_message = "ok", 0, None
         video.analysis_status = "completed"
         video.fetched_at = _utcnow()
+        # #5: 持久化aid
+        if aid:
+            video.aid = aid
         await _mark_digest_dirty(session, pub_dt)
         await session.commit()
     print(f"[fetcher] Saved {bvid}: {analysis['sentiment']}")
@@ -608,7 +646,7 @@ def _publish_time(timestamp):
 def _video_info(video):
     return {"bvid": video.bvid, "title": video.title, "length": video.duration or 0,
         "created": video.publish_time.replace(tzinfo=ZoneInfo("Asia/Shanghai")).timestamp() if video.publish_time else 0,
-        "play": video.view_count or 0}
+        "play": video.view_count or 0, "aid": getattr(video, 'aid', None) or 0}
 
 
 async def _process_video(client, mid, vinfo, is_retry=False):

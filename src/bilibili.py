@@ -351,6 +351,18 @@ class BiliClient:
             "pages": pages,
         }
 
+    async def get_video_aid(self, bvid: str) -> int:
+        """获取视频的aid（用于评论接口）。使用view端点。"""
+        url = f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
+        try:
+            body, _ = await _run_curl(_bili_curl_args(url), timeout=10)
+            data = _json.loads(body)
+            if data.get("code") == 0:
+                return data.get("data", {}).get("aid", 0) or 0
+        except Exception as e:
+            print(f"[bilibili] get_video_aid({bvid}) failed: {e}")
+        return 0
+
     # ------------------------------------------------------------------
     # 音频下载（ASR用）
     # ------------------------------------------------------------------

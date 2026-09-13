@@ -2,7 +2,7 @@
 from sqlalchemy import inspect, text
 from src.models import Base
 
-VERSION = 3
+VERSION = 4
 
 
 def upgrade(connection):
@@ -27,6 +27,9 @@ def upgrade(connection):
             connection.execute(text("ALTER TABLE videos ADD COLUMN analysis_status ENUM('pending','processing','completed','failed') NOT NULL DEFAULT 'pending'"))
         else:
             connection.execute(text("ALTER TABLE videos ADD COLUMN analysis_status VARCHAR(20) NOT NULL DEFAULT 'pending'"))
+    # #5: B站avid列——重试时恢复评论抓取所需
+    if "aid" not in columns:
+        connection.execute(text("ALTER TABLE videos ADD COLUMN aid BIGINT"))
 
     # #2: analysis_status 数据修复——独立执行，不受分支条件限制
     connection.execute(text("""
@@ -73,5 +76,6 @@ def verify(connection):
     if (version != VERSION
         or "retry_count" not in videos_cols
         or "analysis_status" not in videos_cols
+        or "aid" not in videos_cols
         or "retry_count" not in dirty_cols):
         raise RuntimeError("Unsupported schema; run python -m scripts.manage_db upgrade")

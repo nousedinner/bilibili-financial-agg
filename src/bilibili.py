@@ -8,7 +8,7 @@ import subprocess
 import time
 import urllib.parse
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
 import httpx
 from curl_cffi.requests import AsyncSession as CurlSession
@@ -188,7 +188,13 @@ class BiliClient:
     # 通用请求（带退避）
     # ------------------------------------------------------------------
 
-    async def _get(self, url: str, params: dict = None, signed: bool = True) -> dict:
+    async def _get(
+        self,
+        url: str,
+        params: dict = None,
+        signed: bool = True,
+        consume_retry_attempt: Optional[Callable[[], bool]] = None,
+    ) -> dict:
         if signed and params is not None:
             params = await self.sign_params(dict(params))
         if params:
@@ -208,9 +214,13 @@ class BiliClient:
             except BiliAPIError as exc:
                 if exc.code not in (-1, -412, -352, 412, 429, 500, 502, 503, 504) or attempt == 3:
                     raise
+                if consume_retry_attempt is not None and not consume_retry_attempt():
+                    raise BiliAPIError(-1, "Request retry budget exhausted") from exc
             except (TimeoutError, OSError, ValueError) as exc:
                 if attempt == 3:
                     raise BiliAPIError(-1, f"Request failed: {type(exc).__name__}") from exc
+                if consume_retry_attempt is not None and not consume_retry_attempt():
+                    raise BiliAPIError(-1, "Request retry budget exhausted") from exc
             await asyncio.sleep(backoff * 2 ** attempt)
         raise BiliAPIError(-1, "Request retries exhausted")
 
@@ -218,7 +228,13 @@ class BiliClient:
     # 视频列表
     # ------------------------------------------------------------------
 
-    async def get_video_list(self, mid: int, page: int = 1, page_size: int = 30) -> dict:
+    async def get_video_list(
+        self,
+        mid: int,
+        page: int = 1,
+        page_size: int = 30,
+        consume_retry_attempt: Optional[Callable[[], bool]] = None,
+    ) -> dict:
         """获取用户视频列表 (WBI signed)。
 
         Returns: {"list": {"vlist": [...]}, "page": {...}}
@@ -235,6 +251,7 @@ class BiliClient:
             "https://api.bilibili.com/x/space/wbi/arc/search",
             params=params,
             signed=True,
+            consume_retry_attempt=consume_retry_attempt,
         )
         data = result.get("data")
         if not isinstance(data, dict):

@@ -113,12 +113,16 @@ async def run_fetch_only() -> dict:
                 results["total_failed"] += 1
                 visited += 1
 
-    # Issue #13 #7: 只在实际拒绝工作时才设 truncated/budget_exhausted
+    # 页面预算在某个博主内部耗尽时，该博主仍然算“已访问”，但任务并未完成。
     not_visited = len(bloggers) - visited
-    # 有博主因预算被跳过才算 truncated
-    results["truncated"] = not_visited > 0
+    has_more = any(
+        item.get("has_more", False)
+        for item in results["bloggers"].values()
+        if isinstance(item, dict)
+    )
+    results["truncated"] = not_visited > 0 or has_more
     results["not_visited"] = not_visited
-    results["budget_exhausted"] = not_visited > 0
+    results["budget_exhausted"] = (not_visited > 0 or has_more) and budget["pages"] <= 0
     return results
 
 
@@ -148,10 +152,25 @@ async def run_backfill(mid: int, since: str, cap: int = 20, page_budget: dict = 
             result["name"] = blogger.name
         seen = set()
         max_pages = page_budget["remaining"]  # #5: 使用共享页面预算
+
+        def consume_page_retry() -> bool:
+            if page_budget["remaining"] <= 0:
+                return False
+            page_budget["remaining"] -= 1
+            return True
+
         async with _bili_client() as client:
             for page in range(1, max_pages + 1):
-                page_budget["remaining"] -= 1  # #5: 每次列表请求扣减共享预算
-                data = await client.get_video_list(mid, page=page, page_size=30)
+                if page_budget["remaining"] <= 0:
+                    result["has_more"] = True
+                    break
+                page_budget["remaining"] -= 1
+                data = await client.get_video_list(
+                    mid,
+                    page=page,
+                    page_size=30,
+                    consume_retry_attempt=consume_page_retry,
+                )
                 batch = data.get("list", {}).get("vlist", [])
                 if not batch:
                     break
@@ -337,12 +356,27 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str, budget: dict =
     # Issue #13 #1: cap 仅用于处理循环，扫描收集所有视频
     since = cfg.get("data", {}).get("backfill_since")
     since_dt = datetime.combine(date.fromisoformat(since), dt_time()) if since else None
+
+    def consume_page_retry() -> bool:
+        if budget["pages"] <= 0:
+            return False
+        budget["pages"] -= 1
+        return True
+
     max_scan_pages = budget["pages"]  # Issue #11 #1: 使用共享页面预算
     seen, videos, complete = set(), [], False
     watermark_found = not last_bvid  # 无水位线时视为"已找到"
     for page in range(1, max_scan_pages + 1):
-        budget["pages"] -= 1  # Issue #12 #2: 请求前扣减——失败也消耗预算
-        data = await client.get_video_list(mid, page=page, page_size=30)
+        if budget["pages"] <= 0:
+            result["has_more"] = True
+            break
+        budget["pages"] -= 1
+        data = await client.get_video_list(
+            mid,
+            page=page,
+            page_size=30,
+            consume_retry_attempt=consume_page_retry,
+        )
         batch = data.get("list", {}).get("vlist", [])
         if not batch:
             complete = True
@@ -371,8 +405,10 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str, budget: dict =
         if stop:
             complete = True
             break
-    # Issue #12 #5: 页面预算为0时跳过扫描，不视为业务异常
-    if not complete and max_scan_pages > 0:
+    # 共享预算耗尽是可续跑状态，不应伪装为本次已完整扫描。
+    if not complete and budget["pages"] <= 0:
+        result["has_more"] = True
+    elif not complete and max_scan_pages > 0:
         hint = "watermark not found; use backfill" if last_bvid and not watermark_found else "use backfill"
         raise ValueError(f"Video scan limit exceeded ({max_scan_pages} pages); {hint}")
     last_processed = None

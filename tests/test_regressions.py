@@ -269,6 +269,63 @@ class Regressions(unittest.IsolatedAsyncioTestCase):
                 params = await client.sign_params({'keyword': "a'b(c)*!"})
             self.assertEqual(params['keyword'], 'abc')
 
+    async def test_video_list_internal_retries_cannot_exceed_page_budget(self):
+        budget = {'pages': 1, 'new_videos': 0, 'retries': 0}
+        async with bilibili.BiliClient() as client:
+            with patch.object(client, 'sign_params', AsyncMock(side_effect=lambda params: params)), \
+                    patch.object(bilibili, '_run_curl', AsyncMock(side_effect=bilibili.BiliAPIError(-1, 'outage'))) as request, \
+                    patch.object(bilibili.asyncio, 'sleep', AsyncMock()):
+                with self.assertRaisesRegex(bilibili.BiliAPIError, 'budget exhausted'):
+                    await fetcher._fetch_blogger(client, 1, 'Test', budget=budget)
+        self.assertEqual(request.await_count, 1)
+        self.assertEqual(budget['pages'], 0)
+
+    async def test_video_list_retries_consume_each_remaining_page_token(self):
+        budget = {'pages': 3, 'new_videos': 0, 'retries': 0}
+        response = json.dumps({
+            'code': 0,
+            'data': {'list': {'vlist': []}, 'page': {}},
+        }).encode()
+        async with bilibili.BiliClient() as client:
+            with patch.object(client, 'sign_params', AsyncMock(side_effect=lambda params: params)), \
+                    patch.object(bilibili, '_run_curl', AsyncMock(side_effect=[
+                        bilibili.BiliAPIError(-1, 'first'),
+                        bilibili.BiliAPIError(-1, 'second'),
+                        (response, 200),
+                    ])) as request, patch.object(bilibili.asyncio, 'sleep', AsyncMock()):
+                result = await fetcher._fetch_blogger(client, 1, 'Test', budget=budget)
+        self.assertEqual(request.await_count, 3)
+        self.assertEqual(budget['pages'], 0)
+        self.assertFalse(result.get('has_more', False))
+
+    async def test_exhausted_page_budget_marks_fetch_as_truncated(self):
+        client = SimpleNamespace(
+            validate_sessdata=AsyncMock(return_value={'valid': True}),
+            get_video_list=AsyncMock(),
+        )
+
+        @asynccontextmanager
+        async def client_context():
+            yield client
+
+        original = config._CONFIG
+        try:
+            config._CONFIG = {**original, 'data': {
+                **original.get('data', {}),
+                'task_page_budget': 0,
+                'task_video_budget': 10,
+                'task_retry_budget': 10,
+            }}
+            with patch.object(fetcher, '_get_enabled_bloggers', AsyncMock(return_value=[
+                    {'mid': 1, 'name': 'Test', 'enabled': True},
+            ])), patch.object(fetcher, '_bili_client', client_context):
+                result = await fetcher.run_fetch_only()
+        finally:
+            config._CONFIG = original
+        client.get_video_list.assert_not_awaited()
+        self.assertTrue(result['truncated'])
+        self.assertTrue(result['budget_exhausted'])
+
     async def test_curl_exit_failure_raises_and_cancellation_reaps(self):
         proc = SimpleNamespace(returncode=7, communicate=AsyncMock(return_value=(b'\n000', b'')))
         with patch.object(bilibili.asyncio, 'create_subprocess_exec', AsyncMock(return_value=proc)):

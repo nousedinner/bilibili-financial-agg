@@ -317,6 +317,7 @@ async def run_backfill(mid: int, since: str, cap: int = 20, page_budget: dict = 
                                 continue
                     if result["attempted"] >= cap:
                         cap_exhausted = True
+                        result["has_more"] = True  # Issue #16: 批次上限达到时报告仍有数据
                         break
                     result["attempted"] += 1
                     try:

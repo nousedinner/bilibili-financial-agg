@@ -25,6 +25,7 @@ data class SystemStatus(
     val videos: Int,
     val failed: Int,
     @SerializedName("last_fetch") val lastFetch: String?,
+    @SerializedName("task_running") val taskRunning: Boolean = false,
     @SerializedName("cookie_valid") val cookieValid: Boolean,
     @SerializedName("cookie_expire") val cookieExpire: String,
     @SerializedName("last_job") val lastJob: TaskStatus? = null
@@ -79,11 +80,11 @@ data class VideoItem(
     val mid: Long,
     val title: String,
     val duration: Int,
-    @SerializedName("publish_time") val publishTime: String,
-    @SerializedName("view_count") val viewCount: Int,
-    val sentiment: String,
-    @SerializedName("sentiment_score") val sentimentScore: Double,
-    val summary: String
+    @SerializedName("publish_time") val publishTime: String?,
+    @SerializedName("view_count") val viewCount: Int?,
+    val sentiment: String?,
+    @SerializedName("sentiment_score") val sentimentScore: Double?,
+    val summary: String?
 )
 
 // ── Video Detail ──

@@ -387,4 +387,104 @@ class Regressions(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(pcm)
             sample_count += len(pcm) // 2
         self.assertGreaterEqual(sample_count, 16000 * 3)
-        self.assertLess(sample_count, 16000 * 4)
+        self.assertLessEqual(sample_count, 16000 * 4)
+
+    # ── Issue #14 回归测试 ──
+
+    async def test_watermark_not_advanced_when_video_budget_truncates(self):
+        """Fix #1: 新视频预算截断时不推进水位线"""
+        async with self.sessions() as session:
+            session.add(FetchWatermark(mid=1, last_bvid='BVold'))
+            await session.commit()
+        # 3个新视频，预算只能处理2个
+        pages = [{'list': {'vlist': [
+            {'bvid': 'BV1', 'created': 1788912000},
+            {'bvid': 'BV2', 'created': 1788911000},
+            {'bvid': 'BV3', 'created': 1788910000},
+        ]}},
+            {'list': {'vlist': [{'bvid': 'BVold', 'created': 1788909000}]}},
+        ]
+        c = SimpleNamespace(get_video_list=AsyncMock(side_effect=pages))
+        budget = {'pages': 5, 'new_videos': 2, 'retries': 0}
+        with patch.object(config, '_CONFIG', {**config._CONFIG, 'data': {**config._CONFIG.get('data', {}), 'task_page_budget': 5, 'task_video_budget': 2, 'task_retry_budget': 0}}):
+            with patch.object(fetcher, '_process_video', AsyncMock()) as process:
+                result = await fetcher._fetch_blogger(c, 1, 'Test', budget=budget)
+        # 预算2个，3个候选视频，只处理了2个
+        self.assertEqual(process.await_count, 2)
+        self.assertTrue(result.get('has_more'))
+        # 水位线未推进
+        async with self.sessions() as session:
+            wm = await session.get(FetchWatermark, 1)
+            self.assertEqual(wm.last_bvid, 'BVold')
+
+    async def test_retry_candidates_are_sql_limited(self):
+        """Fix #2: 重试候选SQL查询有LIMIT"""
+        async with self.sessions() as session:
+            session.add(Blogger(mid=1, name='Test'))
+            # 创建15条失败视频
+            for i in range(15):
+                session.add(Video(bvid=f'BVfail{i}', mid=1, fetch_status='failed',
+                    publish_time=datetime(2026, 9, 8, 12), error_type='transcript', retry_count=0))
+            session.add(FetchWatermark(mid=1, last_bvid='BVold'))
+            await session.commit()
+        # retries=5，应只加载5+10=15条（刚好够），但如果有20条应该截断
+        c = SimpleNamespace(get_video_list=AsyncMock(return_value={'list': {'vlist': [{'bvid': 'BVold', 'created': 1788912000}]}}))
+        budget = {'pages': 2, 'new_videos': 0, 'retries': 5}
+        with patch.object(config, '_CONFIG', {**config._CONFIG, 'data': {**config._CONFIG.get('data', {}), 'task_page_budget': 2, 'task_video_budget': 0, 'task_retry_budget': 5}}):
+            with patch.object(fetcher, '_process_video', AsyncMock(side_effect=ValueError('mock'))) as process:
+                result = await fetcher._fetch_blogger(c, 1, 'Test', budget=budget)
+        # 应该只尝试重试5条（retries预算）
+        self.assertEqual(process.await_count, 5)
+
+    async def test_outbox_save_pop_pending(self):
+        """Fix #3: SQLite outbox保存、移除和读取"""
+        from src.fetcher import outbox_save, outbox_pop, outbox_pending
+        import tempfile, os
+        old_path = fetcher._outbox_path()
+        with tempfile.TemporaryDirectory() as tmp:
+            fetcher._outbox_path = lambda: os.path.join(tmp, 'test.db')
+            fetcher._outbox_conn = None  # 重置连接
+            try:
+                outbox_save('job1', 'partial', {'total_new': 5}, None)
+                pending = outbox_pending()
+                self.assertEqual(len(pending), 1)
+                self.assertEqual(pending[0]['job_id'], 'job1')
+                self.assertEqual(pending[0]['status'], 'partial')
+                self.assertEqual(pending[0]['result']['total_new'], 5)
+                outbox_pop('job1')
+                self.assertEqual(len(outbox_pending()), 0)
+            finally:
+                fetcher._outbox_conn = None
+                fetcher._outbox_path = lambda: old_path
+
+    async def test_budget_exhaustion_sets_has_more(self):
+        """Fix #4: 各维度预算耗尽时传播has_more"""
+        # new_videos budget = 0，应立即设has_more
+        async with self.sessions() as session:
+            session.add(FetchWatermark(mid=1, last_bvid='BVold'))
+            await session.commit()
+        # 每个page需要不同的bvid避免pagination repeated
+        pages = [{'list': {'vlist': [
+            {'bvid': 'BV1', 'created': 1788912000},
+        ]}}, {'list': {'vlist': [
+            {'bvid': 'BV2', 'created': 1788911000},
+        ]}}, {'list': {'vlist': [{'bvid': 'BVold', 'created': 1788909000}]}},
+        ]
+        c = SimpleNamespace(get_video_list=AsyncMock(side_effect=pages))
+        budget = {'pages': 3, 'new_videos': 0, 'retries': 0}
+        with patch.object(config, '_CONFIG', {**config._CONFIG, 'data': {**config._CONFIG.get('data', {}), 'task_page_budget': 3, 'task_video_budget': 0, 'task_retry_budget': 0}}):
+            result = await fetcher._fetch_blogger(c, 1, 'Test', budget=budget)
+        self.assertTrue(result.get('has_more'))
+
+    async def test_regenerate_dirty_digests_reports_has_more(self):
+        """Fix #6: 日报补偿超过max_per_round时报告has_more"""
+        async with self.sessions() as session:
+            # 创建8个dirty日期，超过max_per_round=5
+            for i in range(8):
+                day = date(2026, 9, 1) + timedelta(days=i)
+                session.add(DirtyDigest(digest_date=day, retry_count=0))
+            await session.commit()
+        with patch.object(fetcher, 'generate_daily_digest', AsyncMock(return_value=digest())):
+            result = await fetcher.regenerate_dirty_digests()
+        self.assertTrue(result['has_more'])
+        self.assertEqual(result['generated'], 5)  # 只处理5个

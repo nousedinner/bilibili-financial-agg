@@ -66,6 +66,9 @@ async def lifespan(app: FastAPI):
                 raise RuntimeError("Another fin-agg worker is active; run uvicorn with --workers 1")
         try:
             await _recover_interrupted()
+            # Issue #14 #3: 启动时重放outbox终态
+            from src.fetcher import outbox_replay_on_startup
+            await outbox_replay_on_startup()
             _start_scheduler()
             yield
         finally:
@@ -79,6 +82,9 @@ async def lifespan(app: FastAPI):
             if is_mysql:
                 await owner.execute(text("SELECT RELEASE_LOCK('fin_agg_scheduler')"))
     await engine.dispose()
+    # Issue #14 #3: 关闭outbox SQLite连接
+    from src.fetcher import outbox_close
+    outbox_close()
 
 
 def _start_scheduler():
@@ -590,11 +596,13 @@ async def health():
         return JSONResponse(status_code=503, content={"status": "degraded", "db": "disconnected"})
     if _scheduler is not None and not _scheduler.running:
         return JSONResponse(status_code=503, content={"status": "degraded", "scheduler": "stopped"})
-    # Issue #11 #3: 按job_id检查多个待确认终态
-    if _pending_job_failures:
+    # Issue #14 #3: 检查outbox中是否有待重放的终态
+    from src.fetcher import outbox_pending
+    pending = outbox_pending()
+    if pending:
         return JSONResponse(status_code=503, content={"status": "degraded",
             "reason": "job status write failed",
-            "pending_jobs": list(_pending_job_failures.keys())})
+            "pending_jobs": [p["job_id"] for p in pending]})
     return {"status": "ok", "db": "connected"}
 
 
@@ -720,6 +728,7 @@ async def _reserve_job(kind):
 
 async def _execute_job(job_id, work):
     # Issue #13 #3: 最外层 try/finally 保证取消时也能写终态和释放锁
+    from src.fetcher import outbox_save, outbox_pop
     task = asyncio.current_task()
     _background_tasks.add(task)
     status, result, error = "completed", None, None
@@ -738,10 +747,8 @@ async def _execute_job(job_id, work):
         except Exception as exc:
             status, error = "failed", str(exc)[:1000]
 
-        # Issue #13 #3: 先注册 pending failure（含完整结果），写入成功后才移除
-        _pending_job_failures[job_id] = {
-            "status": status, "result": result, "error": error, "time": _utcnow()
-        }
+        # Issue #14 #3: 先写入独立SQLite outbox，再尝试MySQL
+        outbox_save(job_id, status, result, error)
 
         # Issue #13 #3: 终态写入——catch BaseException 覆盖 CancelledError
         for _attempt in range(3):
@@ -751,7 +758,8 @@ async def _execute_job(job_id, work):
                     job.status, job.result, job.error_message = status, result, error
                     job.finished_at = _utcnow()
                     await session.commit()
-                _pending_job_failures.pop(job_id, None)
+                # Issue #14 #3: MySQL写入成功，从outbox移除
+                outbox_pop(job_id)
                 break
             except BaseException as e:
                 if isinstance(e, asyncio.CancelledError):
@@ -767,7 +775,8 @@ async def _execute_job(job_id, work):
                         cancelled_exc = ce
                         break
                 else:
-                    logger.error(f"[execute_job] 状态提交最终失败: {job_id} (DEGRADED)")
+                    # Issue #14 #3: MySQL最终失败，outbox已保存，启动时会重放
+                    logger.error(f"[execute_job] 状态提交最终失败: {job_id}, 已持久化到outbox (DEGRADED)")
     finally:
         _job_lock.release()
         _background_tasks.discard(task)
@@ -831,6 +840,9 @@ async def _fetch_work():
     digests = await regenerate_dirty_digests()
     result["digests"] = digests
     result["total_failed"] = result.get("total_failed", 0) + digests["failed"]
+    # Issue #14 #6: 日报补偿有更多待处理日期时传播has_more
+    if digests.get("has_more"):
+        result["has_more"] = True
     return result
 
 
@@ -839,6 +851,9 @@ async def _digest_work():
     digests = await regenerate_dirty_digests(include_latest=True)
     result["digests"] = digests
     result["total_failed"] = result.get("total_failed", 0) + digests["failed"]
+    # Issue #14 #6: 日报补偿有更多待处理日期时传播has_more
+    if digests.get("has_more"):
+        result["has_more"] = True
     return result
 
 

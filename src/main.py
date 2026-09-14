@@ -65,10 +65,10 @@ async def lifespan(app: FastAPI):
             if acquired != 1:
                 raise RuntimeError("Another fin-agg worker is active; run uvicorn with --workers 1")
         try:
-            await _recover_interrupted()
-            # Issue #14 #3: 启动时重放outbox终态
+            # Issue #14 #3: 启动时重放outbox终态（必须在 _recover_interrupted 之前）
             from src.fetcher import outbox_replay_on_startup
             await outbox_replay_on_startup()
+            await _recover_interrupted()
             _start_scheduler()
             yield
         finally:
@@ -748,7 +748,9 @@ async def _execute_job(job_id, work):
             status, error = "failed", str(exc)[:1000]
 
         # Issue #14 #3: 先写入独立SQLite outbox，再尝试MySQL
-        outbox_save(job_id, status, result, error)
+        saved = outbox_save(job_id, status, result, error)
+        if not saved:
+            logger.warning(f"[execute_job] outbox保存失败: {job_id}")
 
         # Issue #13 #3: 终态写入——catch BaseException 覆盖 CancelledError
         for _attempt in range(3):
@@ -887,6 +889,9 @@ async def _backfill_work(mid, since):
     # 任一博主 has_more 也算 truncated
     any_has_more = any(r.get("has_more") for r in results)
     truncated = not_visited > 0 or any_has_more
+    # Issue #15 #7: 日报补偿 has_more 传播到 truncated
+    if digests.get("has_more"):
+        truncated = True
     if truncated:
         logger.warning(f"[backfill] truncated: {not_visited} bloggers skipped, any_has_more={any_has_more}")
     return {
@@ -907,7 +912,8 @@ async def _retry_work():
             .outerjoin(Summary, Video.bvid == Summary.bvid).where(Video.mid.in_(select(Blogger.mid).where(Blogger.enabled == True)),
                 Video.publish_time >= _HARD_SINCE,  # Issue #2: 日期下限
                 Video.publish_time.isnot(None),
-                or_(Video.fetch_status != "ok", Transcript.bvid.is_(None), Transcript.full_text == "", Summary.bvid.is_(None))))).scalars().all()
+                or_(Video.fetch_status != "ok", Transcript.bvid.is_(None), Transcript.full_text == "", Summary.bvid.is_(None)))
+            .limit(60))).scalars().all()
     # Issue #3: 统一重试资格检查——与 run_retry_failed() 一致
     retryable = []
     for v in videos:
@@ -934,6 +940,9 @@ async def _retry_work():
             await asyncio.sleep(get_config().get("limits", {}).get("video_interval_seconds", 5))
     digests = await regenerate_dirty_digests()
     result["failed"] += digests["failed"]
+    # Issue #15 #7: 日报补偿 has_more 传播到 result
+    if digests.get("has_more"):
+        result["has_more"] = True
     return result
 
 

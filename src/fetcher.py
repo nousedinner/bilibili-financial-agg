@@ -39,6 +39,7 @@ from src.models import (
     Blogger, Video, Transcript, Summary,
     CommentAnalysis, DanmakuAnalysis, Dynamic,
     FetchWatermark, DailyDigest, PendingDynamic, DirtyDigest,
+    FetchJob,
 )
 from src.db import async_session
 from src.config import get_config, get_env
@@ -50,14 +51,24 @@ _outbox_conn: Optional[sqlite3.Connection] = None
 
 def _outbox_path() -> str:
     return get_config().get("data", {}).get("outbox_path",
-        os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "job_outbox.db"))
+        "/app/config/job_outbox.db")
 
 def _get_outbox_conn() -> sqlite3.Connection:
     global _outbox_conn
     if _outbox_conn is not None:
         return _outbox_conn
     path = _outbox_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Issue #15 #8: 路径校验——目录不存在或不可写时 fallback 到 /tmp
+    outbox_dir = os.path.dirname(path)
+    try:
+        os.makedirs(outbox_dir, exist_ok=True)
+    except (OSError, PermissionError) as e:
+        logger.warning(f"[outbox] 无法创建目录 {outbox_dir}: {e}，fallback 到 /tmp")
+        path = os.path.join("/tmp", "job_outbox.db")
+    if not os.access(os.path.dirname(path), os.W_OK):
+        logger.warning(f"[outbox] 目录 {os.path.dirname(path)} 不可写，fallback 到 /tmp")
+        path = os.path.join("/tmp", "job_outbox.db")
+        os.makedirs("/tmp", exist_ok=True)
     _outbox_conn = sqlite3.connect(path, timeout=5)
     _outbox_conn.execute("PRAGMA journal_mode=WAL")
     _outbox_conn.execute("""CREATE TABLE IF NOT EXISTS job_outbox (
@@ -72,8 +83,8 @@ def _get_outbox_conn() -> sqlite3.Connection:
     _outbox_conn.commit()
     return _outbox_conn
 
-def outbox_save(job_id: str, status: str, result: Optional[dict] = None, error: Optional[str] = None):
-    """保存任务终态到独立SQLite文件。"""
+def outbox_save(job_id: str, status: str, result: Optional[dict] = None, error: Optional[str] = None) -> bool:
+    """保存任务终态到独立SQLite文件。返回是否成功。"""
     try:
         conn = _get_outbox_conn()
         conn.execute(
@@ -81,8 +92,10 @@ def outbox_save(job_id: str, status: str, result: Optional[dict] = None, error: 
             (job_id, status, json.dumps(result) if result else None, error,
              datetime.now(ZoneInfo("Asia/Shanghai")).isoformat()))
         conn.commit()
+        return True
     except Exception as e:
         logger.error(f"[outbox] save failed for {job_id}: {e}")
+        return False
 
 def outbox_pop(job_id: str):
     """MySQL终态写入成功后，从outbox移除。"""
@@ -104,46 +117,35 @@ def outbox_pending() -> list:
         logger.error(f"[outbox] load failed: {e}")
         return []
 
-def outbox_replay_on_startup():
+async def outbox_replay_on_startup():
     """启动时重放outbox：将MySQL中仍为running的job更新为outbox中的终态。"""
-    import asyncio
     pending = outbox_pending()
     if not pending:
         return
     logger.info(f"[outbox] replaying {len(pending)} pending job states")
 
-    async def _replay():
-        for entry in pending:
+    for entry in pending:
+        try:
+            async with async_session() as session:
+                job = await session.get(FetchJob, entry["job_id"])
+                if job and job.status in ("running", "queued"):
+                    job.status = entry["status"]
+                    job.result = entry["result"]
+                    job.error_message = entry["error"]
+                    job.finished_at = _utcnow()
+                    await session.commit()
+                outbox_pop(entry["job_id"])
+                logger.info(f"[outbox] replayed {entry['job_id']}: {entry['status']}")
+        except Exception as e:
+            logger.error(f"[outbox] replay failed for {entry['job_id']}: {e}")
             try:
-                async with async_session() as session:
-                    job = await session.get(FetchJob, entry["job_id"])
-                    if job and job.status in ("running", "queued"):
-                        job.status = entry["status"]
-                        job.result = entry["result"]
-                        job.error_message = entry["error"]
-                        job.finished_at = _utcnow()
-                        await session.commit()
-                    outbox_pop(entry["job_id"])
-                    logger.info(f"[outbox] replayed {entry['job_id']}: {entry['status']}")
-            except Exception as e:
-                logger.error(f"[outbox] replay failed for {entry['job_id']}: {e}")
-                try:
-                    conn = _get_outbox_conn()
-                    conn.execute(
-                        "UPDATE job_outbox SET retry_count = retry_count + 1, last_retry_at = ? WHERE job_id = ?",
-                        (_utcnow().isoformat(), entry["job_id"]))
-                    conn.commit()
-                except Exception:
-                    pass
-
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.create_task(_replay())
-        else:
-            loop.run_until_complete(_replay())
-    except RuntimeError:
-        asyncio.run(_replay())
+                conn = _get_outbox_conn()
+                conn.execute(
+                    "UPDATE job_outbox SET retry_count = retry_count + 1, last_retry_at = ? WHERE job_id = ?",
+                    (_utcnow().isoformat(), entry["job_id"]))
+                conn.commit()
+            except Exception:
+                pass
 
 def outbox_close():
     """关闭SQLite连接。"""
@@ -273,9 +275,11 @@ async def run_backfill(mid: int, since: str, cap: int = 20, page_budget: dict = 
             return True
 
         async with _bili_client() as client:
+            scan_complete = False
+            reached_date = False
+            cap_exhausted = False
             for page in range(1, max_pages + 1):
                 if page_budget["remaining"] <= 0:
-                    result["has_more"] = True
                     break
                 page_budget["remaining"] -= 1
                 data = await client.get_video_list(
@@ -286,11 +290,11 @@ async def run_backfill(mid: int, since: str, cap: int = 20, page_budget: dict = 
                 )
                 batch = data.get("list", {}).get("vlist", [])
                 if not batch:
+                    scan_complete = True
                     break
                 fresh = [v for v in batch if v.get("bvid") and v["bvid"] not in seen]
                 if not fresh:
                     raise ValueError("Video pagination repeated")
-                reached_date = False
                 for v in fresh:
                     seen.add(v["bvid"])
                     pub = _publish_time(v.get("created", 0))
@@ -312,8 +316,8 @@ async def run_backfill(mid: int, since: str, cap: int = 20, page_budget: dict = 
                             if not should_retry(old.retry_count or 0, err_type):
                                 continue
                     if result["attempted"] >= cap:
-                        result["has_more"] = True  # Issue #12 #6: 批次上限达到
-                        return result
+                        cap_exhausted = True
+                        break
                     result["attempted"] += 1
                     try:
                         # #2: 已有记录走恢复模式，复用本地字幕/互动数据
@@ -322,13 +326,12 @@ async def run_backfill(mid: int, since: str, cap: int = 20, page_budget: dict = 
                     except Exception:
                         result["failed"] += 1
                     await asyncio.sleep(get_config().get("limits", {}).get("video_interval_seconds", 5))
-                if reached_date or result["attempted"] >= cap:
+                if reached_date or cap_exhausted:
                     break
-            # Issue #14 #5: cap用尽且页面预算耗尽时，报告仍有数据
-            if not reached_date and result["attempted"] >= cap and page_budget is not None and page_budget["remaining"] <= 0:
-                result["has_more"] = True
-            else:
-                raise ValueError("Backfill pagination limit exceeded")
+            # Issue #15 #4: 显式状态替代 for-else，页面预算耗尽时报告仍有数据
+            if not scan_complete and not reached_date and not cap_exhausted:
+                if page_budget is not None and page_budget["remaining"] <= 0:
+                    result["has_more"] = True
     except Exception as exc:
         result["error"] = str(exc)[:200]
         result["failed"] = max(result["failed"], 1)  # #11: 上游异常算至少1个失败
@@ -493,9 +496,11 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str, budget: dict =
     max_scan_pages = budget["pages"]  # Issue #11 #1: 使用共享页面预算
     seen, videos, complete = set(), [], False
     watermark_found = not last_bvid  # 无水位线时视为"已找到"
+    all_processed = True  # Issue #14 #1: 跟踪是否所有候选都已处理
     for page in range(1, max_scan_pages + 1):
         if budget["pages"] <= 0:
             result["has_more"] = True
+            all_processed = False  # Issue #15 #5: 页面预算耗尽时阻止水位线推进
             break
         budget["pages"] -= 1
         data = await client.get_video_list(
@@ -535,11 +540,11 @@ async def _fetch_blogger(client: BiliClient, mid: int, name: str, budget: dict =
     # 共享预算耗尽是可续跑状态，不应伪装为本次已完整扫描。
     if not complete and budget["pages"] <= 0:
         result["has_more"] = True
+        all_processed = False  # Issue #15 #5: 页面预算耗尽时阻止水位线推进
     elif not complete and max_scan_pages > 0:
         hint = "watermark not found; use backfill" if last_bvid and not watermark_found else "use backfill"
         raise ValueError(f"Video scan limit exceeded ({max_scan_pages} pages); {hint}")
     last_processed = None
-    all_processed = True  # Issue #14 #1: 跟踪是否所有候选都已处理
     for v in videos:
         if v["bvid"] in attempted:
             continue

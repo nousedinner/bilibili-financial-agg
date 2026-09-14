@@ -51,7 +51,7 @@ _outbox_conn: Optional[sqlite3.Connection] = None
 
 def _outbox_path() -> str:
     return get_config().get("data", {}).get("outbox_path",
-        "/app/config/job_outbox.db")
+        "/app/data/job_outbox.db")
 
 def _get_outbox_conn() -> sqlite3.Connection:
     global _outbox_conn

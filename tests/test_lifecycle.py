@@ -360,7 +360,10 @@ class Lifecycle(unittest.IsolatedAsyncioTestCase):
                 return httpx.Response(200,json={'access_token':'TEST_ACCESS','expires_in':3600})
             self.assertEqual(request.headers['authorization'],'Bearer TEST_ACCESS')
             message=json.loads(request.content)['message']
-            self.assertEqual(message['android']['notification']['channel_id'],'server_auth')
+            self.assertEqual(message['android']['priority'],'high')
+            self.assertNotIn('notification',message)
+            self.assertNotIn('notification',message['android'])
+            self.assertEqual(message['data']['event_id'],'test:1')
             self.assertNotIn('SESSDATA',request.content.decode())
             return httpx.Response(200,json={'name':'projects/test-project/messages/test'})
         sender=authorization.FcmSender();sender.path=str(account)

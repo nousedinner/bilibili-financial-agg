@@ -156,19 +156,14 @@ class FcmSender:
         project = account.get("project_id", "")
         if not re.fullmatch(r"[a-z][a-z0-9-]{4,62}", project):
             raise ValueError("invalid_project_id")
-        kind = payload["kind"]
-        title = "服务器 B 站授权已恢复" if kind == "recovered" else "服务器 B 站授权需要处理"
-        body = "授权已恢复，可继续采集。" if kind == "recovered" else "点击查看授权状态并重新授权。"
-        if kind == "test":
-            title, body = "财经聚合通知测试", "点击此通知确认手机已收到服务器推送。"
         async with httpx.AsyncClient(timeout=15, follow_redirects=False) as http:
             access = await self._access(http)
             response = await http.post(f"https://fcm.googleapis.com/v1/projects/{project}/messages:send",
                 headers={"Authorization": "Bearer " + access}, json={"message": {
                     "token": token, "data": {k: str(v) for k, v in payload.items()},
-                    "notification": {"title": title, "body": body},
-                    "android": {"priority": "high", "ttl": "3600s", "collapse_key": "bili_auth",
-                        "notification": {"channel_id": "server_auth", "tag": "bili_auth"}}}})
+                    # Data-only delivery lets Android discard superseded events
+                    # before displaying a system notification, including in background.
+                    "android": {"priority": "high", "ttl": "3600s", "collapse_key": "bili_auth"}}})
             if response.status_code >= 400:
                 try:
                     details = response.json().get("error", {}).get("details", [])

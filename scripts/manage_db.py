@@ -2,6 +2,8 @@
 import argparse
 import asyncio
 import secrets
+import os
+from pathlib import Path
 from sqlalchemy import select
 from src.db import engine, async_session
 from src.migrations import upgrade, verify
@@ -23,6 +25,15 @@ async def run(args):
                 session.add(ApiUser(username=username, api_key=key, enabled=True))
                 await session.commit()
                 print(f"Created {username}. Store this API key securely: {key}")
+        elif args.command == "create-management-key":
+            path = Path(os.environ.get("FIN_AGG_MANAGEMENT_KEY_FILE", "/app/data/management-key"))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.exists():
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    stream.write(secrets.token_urlsafe(48) + "\n")
+            os.chmod(path, 0o600)
+            print("Management credential is stored in the owner-only configured key file; no value is printed.")
         else:
             print("Database upgrade completed")
     finally:
@@ -33,6 +44,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("upgrade")
+    commands.add_parser("create-management-key")
     user = commands.add_parser("create-user")
     user.add_argument("username")
     asyncio.run(run(parser.parse_args()))

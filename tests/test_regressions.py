@@ -35,6 +35,7 @@ class Regressions(unittest.IsolatedAsyncioTestCase):
     asyncTearDown = baseline.Acceptance.asyncTearDown
     client = baseline.Acceptance.client
     seed_videos = baseline.Acceptance.seed_videos
+    process = baseline.Acceptance.process
 
     async def test_mixed_same_second_pages_have_no_duplicates_or_gaps(self):
         await self.seed_videos(tied=True)
@@ -94,7 +95,7 @@ class Regressions(unittest.IsolatedAsyncioTestCase):
         c.get_comments.return_value = {'replies': [{'content': {'message': 'hello'}}], 'total': 99}
         c.get_danmaku.return_value = {'items': ['one'], 'total': 501}
         with patch.object(fetcher, 'fetch_transcript', AsyncMock(return_value={'text': 'complete transcript', 'source': 'asr', 'segments': 2})), patch.object(fetcher, 'analyze_video', AsyncMock(return_value=analysis())):
-            await fetcher._process_video(c, 1, {'bvid': 'BVsuccess', 'created': 1788912000, 'length': 10, 'aid': 123})
+            await self.process(c, 1, {'bvid': 'BVsuccess', 'created': 1788912000, 'length': 10, 'aid': 123})
         async with self.sessions() as session:
             self.assertEqual((await session.get(Video, 'BVsuccess')).fetch_status, 'ok')
             self.assertEqual((await session.get(Transcript, 'BVsuccess')).segment_count, 2)
@@ -104,12 +105,19 @@ class Regressions(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await session.get(DanmakuAnalysis, 'BVsuccess')).sampled_count, 1)
             self.assertTrue((await session.execute(select(DirtyDigest))).scalars().all())
 
-    async def test_retry_failure_does_not_commit_transcript_without_analysis(self):
+    async def test_retry_failure_keeps_unpublished_checkpoint_and_old_summary(self):
         async with self.sessions() as session:
             session.add(Blogger(mid=1, name='Enabled'))
             session.add(Video(bvid='BVretry', mid=1, fetch_status='ok', publish_time=datetime(2026, 9, 8, 12)))
             session.add(Summary(bvid='BVretry', summary='old'))
             await session.commit()
+        from src import workflow
+        batch=await workflow.create_batch(self.sessions,origin='manual_backfill',since=fetcher._HARD_SINCE,
+            until=self.at,max_videos=1,max_pages=1,mid=1)
+        async with self.sessions() as session:
+            video=await session.get(Video,'BVretry')
+        await workflow.admit(self.sessions,batch,1,fetcher._video_info(video),allow_legacy=True)
+        await workflow.freeze_batch(self.sessions,batch)
         @asynccontextmanager
         async def client(): yield self.client()
         with patch.object(fetcher, '_bili_client', client), patch.object(fetcher, 'fetch_transcript', AsyncMock(return_value={'text': 'new transcript', 'source': 'asr', 'segments': 1})), patch.object(fetcher, 'analyze_video', AsyncMock(return_value=analyzer._empty_analysis(True))):
@@ -119,12 +127,13 @@ class Regressions(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await session.get(Transcript, 'BVretry'))
             self.assertEqual((await session.get(Summary, 'BVretry')).summary, 'old')
             self.assertEqual((await session.get(Video, 'BVretry')).fetch_status, 'failed')
+            self.assertIsNotNone((await session.execute(select(TranscriptCheckpoint))).scalar_one_or_none())
 
     async def test_cancellation_is_persisted_and_retryable(self):
         c = self.client()
         c.get_video_info.side_effect = asyncio.CancelledError()
         with self.assertRaises(asyncio.CancelledError):
-            await fetcher._process_video(c, 1, {'bvid': 'BVcancel', 'created': 1785513600})
+            await self.process(c, 1, {'bvid': 'BVcancel', 'created': 1785513600})
         async with self.sessions() as session:
             self.assertEqual((await session.get(Video, 'BVcancel')).fetch_status, 'failed')
 
@@ -138,25 +147,26 @@ class Regressions(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await session.get(Dynamic, '456')).summary, 'Good')
             self.assertTrue((await session.execute(select(DirtyDigest))).scalars().all())
 
-    async def test_dynamic_pagination_uses_offset_and_keeps_failed_payload(self):
+    async def test_paused_dynamic_collection_never_calls_upstream(self):
         def item(id): return {'id_str': id, 'modules': {'module_dynamic': {'desc': {'text': id}}}}
         c = SimpleNamespace(get_video_list=AsyncMock(return_value={'list': {'vlist': []}}),
             get_dynamics=AsyncMock(side_effect=[{'items': [item('20')], 'has_more': True, 'offset': 'next'},
                 {'items': [item('19')], 'has_more': False}]))
         with patch.object(fetcher, 'analyze_dynamic', AsyncMock(return_value={'analysis_failed': True})):
             result = await fetcher._fetch_blogger(c, 1, 'Test')
-        self.assertEqual(result['failed_count'], 2)
-        self.assertEqual(c.get_dynamics.await_args_list[1].kwargs['offset'], 'next')
+        self.assertEqual(result['failed_count'], 0)
+        c.get_dynamics.assert_not_awaited()
         async with self.sessions() as session:
-            self.assertIsNotNone(await session.get(PendingDynamic, '19'))
-            self.assertEqual((await session.get(FetchWatermark, 1)).last_dyn_id, '20')
+            self.assertIsNone(await session.get(PendingDynamic, '19'))
 
     async def test_incremental_scan_continues_beyond_ten_pages(self):
         async with self.sessions() as session:
+            session.add(Blogger(mid=1, name='Test', enabled=True))
             session.add(FetchWatermark(mid=1, last_bvid='BVold'))
             await session.commit()
         pages = [{'list': {'vlist': [{'bvid': f'BV{i}', 'created': 1788912000}]}} for i in range(11)]
         pages.append({'list': {'vlist': [{'bvid': 'BVold', 'created': 1788912000}]}})
+        pages.append({'list': {'vlist': []}})  # Close all entries tied with the anchor's timestamp.
         c = SimpleNamespace(get_video_list=AsyncMock(side_effect=pages), get_dynamics=AsyncMock(return_value={'items': []}))
         # Issue #11 #1: cap now applies to incremental scans too; raise cap for this test
         original = config._CONFIG
@@ -167,15 +177,17 @@ class Regressions(unittest.IsolatedAsyncioTestCase):
         finally:
             config._CONFIG = original
         self.assertEqual(process.await_count, 11)
-        self.assertEqual(c.get_video_list.await_count, 12)
+        self.assertEqual(c.get_video_list.await_count, 13)
 
     async def test_repeated_video_page_does_not_move_watermark(self):
         async with self.sessions() as session:
+            session.add(Blogger(mid=1, name='Test', enabled=True))
             session.add(FetchWatermark(mid=1, last_bvid='BVold'))
             await session.commit()
         c = SimpleNamespace(get_video_list=AsyncMock(return_value={'list': {'vlist': [{'bvid': 'BVnew', 'created': 1788912000}]}}))
-        with self.assertRaisesRegex(ValueError, 'repeated'):
-            await fetcher._fetch_blogger(c, 1, 'Test')
+        with patch.object(fetcher, '_process_video', AsyncMock()):
+            result = await fetcher._fetch_blogger(c, 1, 'Test')
+        self.assertIn('pagination_repeated', result['error'])
         async with self.sessions() as session:
             self.assertEqual((await session.get(FetchWatermark, 1)).last_bvid, 'BVold')
 
@@ -185,7 +197,7 @@ class Regressions(unittest.IsolatedAsyncioTestCase):
             await session.commit()
         pages = {'list': {'vlist': [{'bvid': f'BV{i}', 'created': 1788912000} for i in range(5)]}}
         with patch.object(bilibili.BiliClient, 'get_video_list', AsyncMock(return_value=pages)), patch.object(fetcher, '_process_video', AsyncMock(side_effect=ValueError('failure'))) as process:
-            result = await fetcher.run_backfill(42, '2026-01-01', cap=2)
+            result = await fetcher.run_backfill(42, '2026-09-01', cap=2)
         self.assertEqual(result['failed'], 2)
         self.assertEqual(process.await_count, 2)
 
@@ -238,7 +250,7 @@ class Regressions(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(finished['status'], 'partial')
         self.assertIsNotNone(finished['finished_at'])
 
-    async def test_startup_recovers_interrupted_jobs_and_pending_videos(self):
+    async def test_startup_recovers_jobs_but_never_reactivates_legacy_video(self):
         async with self.sessions() as session:
             session.add(FetchJob(id='old', kind='fetch', status='running'))
             session.add(Video(bvid='BVold', mid=1, fetch_status='pending'))
@@ -246,7 +258,7 @@ class Regressions(unittest.IsolatedAsyncioTestCase):
         await main._recover_interrupted()
         async with self.sessions() as session:
             self.assertEqual((await session.get(FetchJob, 'old')).status, 'interrupted')
-            self.assertEqual((await session.get(Video, 'BVold')).fetch_status, 'failed')
+            self.assertEqual((await session.get(Video, 'BVold')).fetch_status, 'pending')
 
     async def test_followings_failure_never_returns_partial_success(self):
         async with bilibili.BiliClient() as client:
@@ -326,14 +338,11 @@ class Regressions(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result['truncated'])
         self.assertTrue(result['budget_exhausted'])
 
-    async def test_curl_exit_failure_raises_and_cancellation_reaps(self):
-        proc = SimpleNamespace(returncode=7, communicate=AsyncMock(return_value=(b'\n000', b'')))
-        with patch.object(bilibili.asyncio, 'create_subprocess_exec', AsyncMock(return_value=proc)):
+    async def test_curl_failure_is_typed_and_cancellation_propagates(self):
+        with patch.object(bilibili._curl_session, 'get', AsyncMock(side_effect=OSError('synthetic transport failure'))):
             with self.assertRaises(bilibili.BiliAPIError): await bilibili._run_curl(['curl', 'mock://failure'])
-        proc = SimpleNamespace(communicate=AsyncMock(side_effect=asyncio.CancelledError()), kill=lambda: None, wait=AsyncMock())
-        with patch.object(bilibili.asyncio, 'create_subprocess_exec', AsyncMock(return_value=proc)):
+        with patch.object(bilibili._curl_session, 'get', AsyncMock(side_effect=asyncio.CancelledError())):
             with self.assertRaises(asyncio.CancelledError): await bilibili._run_curl(['curl', 'mock://cancel'])
-        proc.wait.assert_awaited_once()
 
     async def test_llm_rejects_arrays_and_invalid_each_field(self):
         self.assertIsNone(analyzer._try_parse_json(json.dumps([analysis()])))
@@ -394,6 +403,7 @@ class Regressions(unittest.IsolatedAsyncioTestCase):
     async def test_watermark_not_advanced_when_video_budget_truncates(self):
         """Fix #1: 新视频预算截断时不推进水位线"""
         async with self.sessions() as session:
+            session.add(Blogger(mid=1, name='Test', enabled=True))
             session.add(FetchWatermark(mid=1, last_bvid='BVold'))
             await session.commit()
         # 3个新视频，预算只能处理2个
@@ -427,8 +437,16 @@ class Regressions(unittest.IsolatedAsyncioTestCase):
                     publish_time=datetime(2026, 9, 8, 12), error_type='transcript', retry_count=0))
             session.add(FetchWatermark(mid=1, last_bvid='BVold'))
             await session.commit()
+        from src import workflow
+        batch = await workflow.create_batch(self.sessions, origin='manual_backfill', since=fetcher._HARD_SINCE,
+            until=self.at, max_videos=20, max_pages=1, mid=1)
+        async with self.sessions() as session:
+            selected = list((await session.execute(select(Video).where(Video.bvid.like('BVfail%')))).scalars())
+        for video in selected:
+            await workflow.admit(self.sessions, batch, 1, fetcher._video_info(video), allow_legacy=True)
+        await workflow.freeze_batch(self.sessions, batch)
         # retries=5，应只加载5+10=15条（刚好够），但如果有20条应该截断
-        c = SimpleNamespace(get_video_list=AsyncMock(return_value={'list': {'vlist': [{'bvid': 'BVold', 'created': 1788912000}]}}))
+        c = SimpleNamespace(get_video_list=AsyncMock(side_effect=[{'list': {'vlist': [{'bvid': 'BVold', 'created': 1788912000}]}}, {'list': {'vlist': []}}]))
         budget = {'pages': 2, 'new_videos': 0, 'retries': 5}
         with patch.object(config, '_CONFIG', {**config._CONFIG, 'data': {**config._CONFIG.get('data', {}), 'task_page_budget': 2, 'task_video_budget': 0, 'task_retry_budget': 5}}):
             with patch.object(fetcher, '_process_video', AsyncMock(side_effect=ValueError('mock'))) as process:
@@ -454,7 +472,7 @@ class Regressions(unittest.IsolatedAsyncioTestCase):
                 outbox_pop('job1')
                 self.assertEqual(len(outbox_pending()), 0)
             finally:
-                fetcher._outbox_conn = None
+                fetcher.outbox_close()
                 fetcher._outbox_path = lambda: old_path
 
     async def test_budget_exhaustion_sets_has_more(self):

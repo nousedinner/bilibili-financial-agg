@@ -1,4 +1,4 @@
-"""B站 API 客户端 — WBI签名、视频列表、动态列表、反限速。"""
+"""B站 API 客户端：请求签名、独立会话、错误分类与有限退避。"""
 
 import asyncio
 import hashlib
@@ -14,19 +14,23 @@ import httpx
 from curl_cffi.requests import AsyncSession as CurlSession
 
 from src.config import get_config, get_env
+from src.lifecycle import WorkflowError, failure_reason
+from src.request_policy import TransportRouter, active_transport, request_policy
 
-# curl_cffi 会话复用，伪装 Chrome TLS 指纹绕过 412
-_curl_session = CurlSession(impersonate="chrome")
+# The selected transport profile does not guarantee acceptance by the upstream.
+_curl_session = TransportRouter()
 
 
 class BiliAPIError(Exception):
     """B站 API 返回错误码时抛出（code != 0）。"""
 
-    def __init__(self, code: int, message: str, result: dict | None = None):
+    def __init__(self, code: int, message: str, result: dict | None = None, retry_after: float = 0):
         super().__init__(f"BiliAPIError(code={code}, msg={message})")
         self.code = code
         self.message = message
         self.result = result or {}
+        self.reason = failure_reason(self)
+        self.retry_after = retry_after
 
 
 # ------------------------------------------------------------------
@@ -34,7 +38,7 @@ class BiliAPIError(Exception):
 # ------------------------------------------------------------------
 
 async def _run_curl(args: list[str], timeout: float = 20, sep_body_status: bool = False) -> tuple[bytes, int]:
-    """用 curl_cffi 伪装 Chrome TLS 指纹发送请求，绕过 B 站 412 风控。"""
+    """统一发送请求；访问拦截保持为显式错误，不能解释成无字幕。"""
     # 从 curl 参数中解析出 url / headers / cookies
     url = ""
     headers = dict(_HEADERS)
@@ -65,17 +69,22 @@ async def _run_curl(args: list[str], timeout: float = 20, sep_body_status: bool 
         i += 1
 
     try:
+        await request_policy().before(url)
         resp = await _curl_session.get(
             url, headers=headers, cookies=cookies,
-            timeout=timeout, allow_redirects=True,
+            timeout=timeout, allow_redirects=not bool(cookies),
         )
         if not 200 <= resp.status_code < 300:
+            request_policy().observe(url, resp.status_code)
             raise BiliAPIError(resp.status_code, f"HTTP {resp.status_code}")
         return resp.content, resp.status_code
     except BiliAPIError:
         raise
+    except WorkflowError as exc:
+        raise BiliAPIError(-352 if exc.reason == "risk_blocked" else 412,
+                           "Upstream cooldown active", retry_after=exc.delay) from None
     except Exception as e:
-        raise BiliAPIError(-1, f"curl_cffi request failed: {e}") from e
+        raise BiliAPIError(-1, f"Transport failed ({type(e).__name__})") from None
 
 
 def _bili_curl_args(url: str, sessdata: str = "", cookie_extra: str = "", sep: bool = False) -> list[str]:
@@ -105,16 +114,21 @@ _MIXIN_KEY_ENC_TAB = [
 ]
 
 _HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Referer": "https://www.bilibili.com",
+    # Let curl_cffi use the User-Agent matching its selected transport profile.
+    "Referer": "https://www.bilibili.com/",
 }
 
 
 class BiliClient:
     """B站 API 客户端，自带WBI签名和反限速。"""
 
-    def __init__(self, sessdata: str = ""):
+    def __init__(self, sessdata: str = "", *, credential_version: int = 1, cookie_extra: str = "", auth_observer=None):
         self._sessdata = sessdata
+        self.credential_version = credential_version
+        self._cookie_extra = cookie_extra
+        self._auth_observer = auth_observer
+        self._transport = CurlSession(impersonate="chrome")
+        self._transport_token = None
         self._client = httpx.AsyncClient(
             headers={**_HEADERS},
             timeout=30,
@@ -124,15 +138,30 @@ class BiliClient:
         self._sub_key: str = ""
         self._wbi_ts: float = 0  # last refresh timestamp
         self._buvid3: str = ""
+        self._subtitle_cache = {}
 
     async def __aenter__(self):
+        self._transport_token = active_transport.set(self._transport)
         return self
 
     async def __aexit__(self, *args):
-        await self.close()
+        try:
+            await self.close()
+        finally:
+            if self._transport_token is not None:
+                active_transport.reset(self._transport_token)
 
     async def close(self):
         await self._client.aclose()
+        await self._transport.close()
+
+    def _args(self, url, *, authenticated=True, extra=""):
+        cookies = "; ".join(value for value in (self._cookie_extra if authenticated else "", extra) if value)
+        return _bili_curl_args(url, self._sessdata if authenticated else "", cookie_extra=cookies)
+
+    async def _observe(self, state, reason=None):
+        if self._auth_observer is not None:
+            await self._auth_observer(self.credential_version, state, reason)
 
     # ------------------------------------------------------------------
     # WBI 签名
@@ -202,17 +231,20 @@ class BiliClient:
         backoff = get_config().get("limits", {}).get("backoff_base_seconds", 10)
         for attempt in range(4):
             try:
-                body, _ = await _run_curl(_bili_curl_args(url, self._sessdata,
-                    cookie_extra=f"buvid3={self._buvid3}" if self._buvid3 else ""), timeout=25)
+                body, _ = await _run_curl(self._args(url,
+                    extra=f"buvid3={self._buvid3}" if self._buvid3 else ""), timeout=25)
                 result = _json.loads(body)
                 if not isinstance(result, dict) or "code" not in result:
                     raise BiliAPIError(-1, "Malformed API response")
                 code = result["code"]
                 if code == 0:
                     return result
+                request_policy().observe(url, code)
+                if code == -101:
+                    await self._observe("invalid", "auth_required")
                 raise BiliAPIError(code, str(result.get("message", "API failure")))
             except BiliAPIError as exc:
-                if exc.code not in (-1, -412, -352, 412, 429, 500, 502, 503, 504) or attempt == 3:
+                if exc.code not in (-1, 408, 500, 502, 503, 504) or attempt == 3:
                     raise
                 if consume_retry_attempt is not None and not consume_retry_attempt():
                     raise BiliAPIError(-1, "Request retry budget exhausted") from exc
@@ -292,56 +324,46 @@ class BiliClient:
     # ------------------------------------------------------------------
 
     async def get_subtitle_url(self, bvid: str, cid: int) -> Optional[str]:
-        """获取AI中文字幕URL（需SESSDATA + WBI签名）。使用 curl 获取。
-
-        Returns subtitle URL or None.
-        """
-        if not self._sessdata:
-            return None
-
-        # 需要WBI签名
-        params = {"bvid": bvid, "cid": cid}
-        signed_params = await self.sign_params(params)
-        query = urllib.parse.urlencode(signed_params)
-        url = f"https://api.bilibili.com/x/player/wbi/v2?{query}"
-        
-        try:
-            body, _ = await _run_curl(
-                _bili_curl_args(url, self._sessdata), timeout=10,
-            )
-            data = _json.loads(body).get("data", {})
-        except Exception as e:
-            print(f"[bili] AI字幕 curl error {bvid}: {e}")
-            return None
-        subtitles = data.get("subtitle", {}).get("subtitles", [])
-
-        # Prefer ai-zh, then any Chinese
-        for sub in subtitles:
+        """Return an AI Chinese track; propagate auth/risk/transport failures."""
+        for sub in await self._subtitle_tracks(bvid, cid):
             if sub.get("lan") == "ai-zh":
-                return urllib.parse.urljoin("https://www.bilibili.com", sub["subtitle_url"])
-        for sub in subtitles:
-            if sub.get("lan", "").startswith("zh"):
-                return urllib.parse.urljoin("https://www.bilibili.com", sub["subtitle_url"])
+                return self._subtitle_url(sub)
         return None
 
     async def get_cc_subtitle(self, bvid: str, cid: int) -> Optional[str]:
-        """获取CC字幕URL（不需要cookie）。使用 curl 获取。
-
-        Returns subtitle URL or None.
-        """
-        url = f"https://api.bilibili.com/x/player/v2?bvid={bvid}&cid={cid}"
-        try:
-            body, _ = await _run_curl(_bili_curl_args(url), timeout=10)
-            data = _json.loads(body).get("data", {})
-        except Exception as e:
-            print(f"[bili] CC字幕 curl error {bvid}: {e}")
-            return None
-        subtitles = data.get("subtitle", {}).get("subtitles", [])
-
-        for sub in subtitles:
+        """Human and AI tracks share one authenticated metadata request."""
+        for sub in await self._subtitle_tracks(bvid, cid):
             if sub.get("lan", "").startswith("zh"):
-                return urllib.parse.urljoin("https://www.bilibili.com", sub["subtitle_url"])
+                return self._subtitle_url(sub)
         return None
+
+    async def _subtitle_tracks(self, bvid, cid):
+        key = (bvid, cid)
+        if key not in self._subtitle_cache:
+            result = await self._get("https://api.bilibili.com/x/player/wbi/v2",
+                                     {"bvid": bvid, "cid": cid}, signed=True)
+            data = result.get("data")
+            if not isinstance(data, dict):
+                raise BiliAPIError(-1, "Malformed subtitle metadata")
+            if data.get("need_login_subtitle") is True:
+                # This means access requires authentication, not proof of session expiry.
+                raise BiliAPIError(-101, "Subtitle requires authentication")
+            tracks = data.get("subtitle", {}).get("subtitles")
+            if not isinstance(tracks, list):
+                raise BiliAPIError(-1, "Malformed subtitle tracks")
+            self._subtitle_cache[key] = tracks
+        return self._subtitle_cache[key]
+
+    @staticmethod
+    def _subtitle_url(sub):
+        url = urllib.parse.urljoin("https://www.bilibili.com", str(sub.get("subtitle_url") or ""))
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme != "https" or not parsed.hostname or not any(
+            parsed.hostname == host or parsed.hostname.endswith("." + host)
+            for host in ("hdslb.com", "bilibili.com", "bilivideo.com")
+        ) or parsed.username or parsed.password:
+            raise BiliAPIError(-1, "Invalid subtitle URL")
+        return url
 
     # ------------------------------------------------------------------
     # 视频详情
@@ -473,35 +495,38 @@ class BiliClient:
         Returns: {"valid": bool, "username": str, "expire_date": str}
         """
         if not self._sessdata:
-            return {"valid": False, "username": "", "expire_date": ""}
+            return {"valid": False, "state": "invalid", "reason": "missing_credential", "username": "", "expire_date": ""}
 
         try:
             body, _ = await _run_curl(
-                _bili_curl_args(
-                    "https://api.bilibili.com/x/web-interface/nav",
-                    self._sessdata,
-                ),
+                self._args("https://api.bilibili.com/x/web-interface/nav"),
                 timeout=10,
             )
-            data = _json.loads(body).get("data", {})
+            result = _json.loads(body)
+            data = result.get("data") or {}
+            code = result.get("code")
         except Exception as e:
-            print(f"[bili] validate_sessdata curl error: {e}")
-            return {"valid": False, "username": "", "expire_date": ""}
-        is_login = data.get("isLogin", False)
+            return {"valid": None, "state": "unknown", "reason": failure_reason(e), "username": "", "expire_date": ""}
+        if code == -101 or (code == 0 and data.get("isLogin") is False):
+            state, is_login = "invalid", False
+        elif code == 0 and data.get("isLogin") is True:
+            state, is_login = "valid", True
+        else:
+            return {"valid": None, "state": "unknown", "reason": "unexpected_response", "username": "", "expire_date": ""}
         uname = data.get("uname", "")
 
         # Parse expire from SESSDATA timestamp
         # SESSDATA format: xxx,timestamp,xxx
         expire_date = ""
         try:
-            parts = self._sessdata.split(",")
+            parts = urllib.parse.unquote(self._sessdata).split(",")
             if len(parts) >= 2:
                 ts = int(parts[1])
                 expire_date = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
         except (ValueError, IndexError):
             pass
 
-        return {"valid": is_login, "username": uname, "expire_date": expire_date}
+        return {"valid": is_login, "state": state, "reason": None if is_login else "auth_required", "username": uname, "expire_date": expire_date}
 
     # ------------------------------------------------------------------
     # 用户搜索

@@ -38,6 +38,7 @@ _scheduler = None
 _cookie_cache = (0.0, {})
 _cookie_lock = asyncio.Lock()
 _pending_job_failures: dict = {}  # Issue #11 #3: 按job_id追踪终态写入失败
+_owner_guard = None
 
 
 # ------------------------------------------------------------------
@@ -46,6 +47,7 @@ _pending_job_failures: dict = {}  # Issue #11 #3: 按job_id追踪终态写入失
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _owner_guard
     # Issue #6: 结构化日志替代print()，UTF-8安全编码
     logging.basicConfig(
         level=logging.INFO,
@@ -56,31 +58,32 @@ async def lifespan(app: FastAPI):
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="backslashreplace")
     await init_db()
-    # One scheduler/writer per database. A second worker fails startup rather
-    # than running competing jobs; the connection keeps the MySQL lock alive.
-    async with engine.connect() as owner:
-        is_mysql = owner.dialect.name == "mysql"
-        if is_mysql:
-            acquired = (await owner.execute(text("SELECT GET_LOCK('fin_agg_scheduler', 0)"))).scalar()
-            if acquired != 1:
-                raise RuntimeError("Another fin-agg worker is active; run uvicorn with --workers 1")
+    from src.ownership import OwnerGuard
+    from src.lifecycle import owner_context
+    _owner_guard = OwnerGuard(engine, async_session)
+    await _owner_guard.start()
+    try:
+        startup_ticket = owner_context.set(_owner_guard.ticket())
         try:
-            # Issue #14 #3: 启动时重放outbox终态（必须在 _recover_interrupted 之前）
             from src.fetcher import outbox_replay_on_startup
             await outbox_replay_on_startup()
             await _recover_interrupted()
             _start_scheduler()
-            yield
+            await _authorization_maintenance()
+            await _deliver_notification_outbox()
         finally:
-            if _scheduler:
-                _scheduler.shutdown(wait=False)
-            tasks = list(_background_tasks)
-            for task in tasks:
-                task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            if is_mysql:
-                await owner.execute(text("SELECT RELEASE_LOCK('fin_agg_scheduler')"))
+            owner_context.reset(startup_ticket)
+        yield
+    finally:
+        if _scheduler:
+            _scheduler.shutdown(wait=False)
+        tasks = list(_background_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await _owner_guard.close()
+        _owner_guard = None
     await engine.dispose()
     # Issue #14 #3: 关闭outbox SQLite连接
     from src.fetcher import outbox_close
@@ -103,7 +106,41 @@ def _start_scheduler():
     for job_id, cron, callback in schedules:
         _scheduler.add_job(callback, CronTrigger.from_crontab(cron, timezone="Asia/Shanghai"),
             id=job_id, coalesce=True, max_instances=1, misfire_grace_time=3600)
+    _scheduler.add_job(_authorization_maintenance, "interval", minutes=30,
+        id="authorization_health", max_instances=1, coalesce=True)
+    _scheduler.add_job(_deliver_notification_outbox, "interval", seconds=60,
+        id="notification_delivery", max_instances=1, coalesce=True)
     _scheduler.start()
+
+
+async def _authorization_maintenance():
+    from src.authorization import check_authorization
+    from src.lifecycle import owner_context
+    if _owner_guard is None or _owner_guard.lost:
+        return
+    ticket = _owner_guard.ticket()
+    token = owner_context.set(ticket)
+    try:
+        await ticket.check()
+        await check_authorization(async_session)
+    except Exception as exc:
+        logger.warning("Authorization check deferred (%s)", type(exc).__name__)
+    finally:
+        owner_context.reset(token)
+
+
+async def _deliver_notification_outbox():
+    from src.authorization import deliver_alerts
+    from src.lifecycle import owner_context
+    if _owner_guard is None or _owner_guard.lost:
+        return
+    token = owner_context.set(_owner_guard.ticket())
+    try:
+        await deliver_alerts(async_session)
+    except Exception as exc:
+        logger.warning("Notification delivery deferred (%s)", type(exc).__name__)
+    finally:
+        owner_context.reset(token)
 
 
 async def _scheduled_fetch():
@@ -116,7 +153,7 @@ async def _scheduled_digest():
 
 app = FastAPI(
     title="B站财经博主聚合服务",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -374,6 +411,7 @@ async def list_videos(
 @app.get("/api/videos/{bvid}", dependencies=[Depends(require_api_key)])
 async def get_video_detail(bvid: str):
     async with async_session() as session:
+        from src.models import VideoWork, WorkStage
         video = await session.get(Video, bvid)
         if not video:
             raise HTTPException(404, "视频不存在")
@@ -382,6 +420,9 @@ async def get_video_detail(bvid: str):
         transcript = await session.get(Transcript, bvid)
         comment = await session.get(CommentAnalysis, (bvid, "video"))
         danmaku = await session.get(DanmakuAnalysis, bvid)
+        work = await session.get(VideoWork, bvid)
+        comment_stage = await session.get(WorkStage, (bvid, "comments"))
+        danmaku_stage = await session.get(WorkStage, (bvid, "danmaku"))
 
         return {
             "code": 0,
@@ -394,6 +435,10 @@ async def get_video_detail(bvid: str):
                 "view_count": video.view_count,
                 "fetch_status": video.fetch_status,
                 "analysis_status": video.analysis_status,
+                "work_status": work.state if work else "legacy",
+                "published_version": work.published_version if work else None,
+                "comments_status": comment_stage.state if comment_stage else "legacy" if comment else "unknown",
+                "danmaku_status": danmaku_stage.state if danmaku_stage else "legacy" if danmaku else "unknown",
                 "summary": {
                     "text": summary.summary if summary else None,
                     "key_points": summary.key_points if summary else [],
@@ -596,6 +641,8 @@ async def health():
         return JSONResponse(status_code=503, content={"status": "degraded", "db": "disconnected"})
     if _scheduler is not None and not _scheduler.running:
         return JSONResponse(status_code=503, content={"status": "degraded", "scheduler": "stopped"})
+    if _owner_guard is not None and _owner_guard.lost:
+        return JSONResponse(status_code=503, content={"status": "degraded", "reason": "worker ownership lost"})
     # Issue #14 #3: 检查outbox中是否有待重放的终态
     from src.fetcher import outbox_pending
     pending = outbox_pending()
@@ -603,7 +650,7 @@ async def health():
         return JSONResponse(status_code=503, content={"status": "degraded",
             "reason": "job status write failed",
             "pending_jobs": [p["job_id"] for p in pending]})
-    return {"status": "ok", "db": "connected"}
+    return {"status": "ok", "db": "connected", "version": "1.1.0"}
 
 
 @app.get("/api/status", dependencies=[Depends(require_api_key)])
@@ -622,10 +669,12 @@ async def status():
         last_job = _job_json(job) if job else None
         last_fetch_time = last_fetch_job.finished_at.isoformat() if last_fetch_job and last_fetch_job.finished_at else None
     cookie = await _cached_cookie_status()
+    from src.authorization import public_auth_status
+    authorization = await public_auth_status(async_session)
     return {"code": 0, "data": {"bloggers": bloggers, "videos": videos, "failed": failed,
         "last_fetch": last_fetch_time, "last_job": last_job,
         "task_running": _job_lock.locked(), "cookie_valid": cookie.get("valid", False),
-        "cookie_expire": cookie.get("expire_date", "")}}
+        "cookie_expire": cookie.get("expire_date", ""), "authorization": authorization}}
 
 
 @app.post("/api/fetch/trigger", dependencies=[Depends(require_api_key)])
@@ -639,6 +688,7 @@ async def _run_fetch_task():
 
 class BackfillRequest(BaseModel):
     since: date
+    until: Optional[date] = None
     mid: Optional[int] = Field(None, gt=0, le=9223372036854775807)
 
 
@@ -649,12 +699,15 @@ async def trigger_backfill(req: BackfillRequest):
     # Issue #1: API 层拒绝早于硬性下限的日期
     if req.since < _HARD_SINCE.date():
         raise HTTPException(400, f"since 不能早于 {_HARD_SINCE.date()}")
+    if req.until and (req.until < req.since or req.until > _utcnow().date()):
+        raise HTTPException(400, "until 必须在 since 与今天之间")
     if req.mid:
         async with async_session() as session:
             b = await session.get(Blogger, req.mid)
             if not b or not b.enabled:
                 raise HTTPException(404, "博主不存在或已禁用")
-    return await _submit_job("backfill", lambda: _backfill_work(req.mid, req.since.isoformat()))
+    frozen_until = min(_utcnow(), datetime.combine(req.until, datetime.max.time())) if req.until else _utcnow()
+    return await _submit_job("backfill", lambda: _backfill_work(req.mid, req.since.isoformat(), until=frozen_until))
 
 
 async def _run_backfill_task(mid: int = None, since: str = "2026-07-01"):
@@ -686,29 +739,17 @@ async def _recover_interrupted():
         await session.execute(update(FetchJob).where(
             FetchJob.status.in_(["running", "queued"])).values(
             status="interrupted", finished_at=_utcnow(), error_message="Service restarted"))
-        # #3: 重试计数和错误信息先于状态修改，确保MySQL单语句语义正确
-        # #1: 同步写入error_type——恢复记录也必须有分类
-        await session.execute(text("""
-            UPDATE videos SET
-                retry_count = CASE
-                    WHEN fetch_status = 'pending' OR analysis_status = 'processing'
-                    THEN COALESCE(retry_count, 0) + 1
-                    ELSE COALESCE(retry_count, 0)
-                END,
-                error_message = CASE
-                    WHEN fetch_status = 'pending' OR analysis_status = 'processing'
-                    THEN 'Service restarted'
-                    ELSE error_message
-                END,
-                error_type = CASE
-                    WHEN fetch_status = 'pending' OR analysis_status = 'processing'
-                    THEN 'unknown'
-                    ELSE error_type
-                END,
-                fetch_status = CASE WHEN fetch_status = 'pending' THEN 'failed' ELSE fetch_status END,
-                analysis_status = CASE WHEN analysis_status = 'processing' THEN 'failed' ELSE analysis_status END
-            WHERE fetch_status = 'pending' OR analysis_status = 'processing'
-        """))
+        from src.models import VideoWork, WorkStage, AlertDelivery
+        from src.lifecycle import fence
+        await fence(session)
+        # Restart recovery is restricted to explicitly admitted new work. Legacy
+        # videos and their retry counters remain untouched.
+        await session.execute(update(VideoWork).where(VideoWork.state == "running").values(
+            state="interrupted", reason="interrupted"))
+        await session.execute(update(WorkStage).where(WorkStage.state == "running").values(
+            state="failed", reason="interrupted", next_attempt_at=_utcnow()))
+        await session.execute(update(AlertDelivery).where(AlertDelivery.state == "sending").values(
+            state="retry", next_attempt_at=_utcnow()))
         await session.commit()
 
 
@@ -721,6 +762,8 @@ def _job_json(job):
 
 async def _reserve_job(kind):
     """只获取任务锁，不创建记录。记录由 _run_job 或 _submit_job 创建。"""
+    if _owner_guard is not None:
+        await _owner_guard.check()
     if _job_lock.locked():
         raise HTTPException(409, "已有采集或补算任务正在运行")
     await _job_lock.acquire()
@@ -733,6 +776,11 @@ async def _execute_job(job_id, work):
     _background_tasks.add(task)
     status, result, error = "completed", None, None
     cancelled_exc = None
+    from src.lifecycle import owner_context, fence, OwnershipLost
+    owner_ticket = _owner_guard.ticket() if _owner_guard is not None else None
+    owner_token = owner_context.set(owner_ticket)
+    if _owner_guard is not None:
+        _owner_guard.tasks.add(task)
 
     try:
         # 业务执行
@@ -756,12 +804,16 @@ async def _execute_job(job_id, work):
         for _attempt in range(3):
             try:
                 async with async_session() as session:
+                    await fence(session)
                     job = await session.get(FetchJob, job_id)
                     job.status, job.result, job.error_message = status, result, error
                     job.finished_at = _utcnow()
                     await session.commit()
                 # Issue #14 #3: MySQL写入成功，从outbox移除
                 outbox_pop(job_id)
+                break
+            except OwnershipLost:
+                # Persisted outbox intent can be replayed by the next legitimate owner.
                 break
             except BaseException as e:
                 if isinstance(e, asyncio.CancelledError):
@@ -782,6 +834,9 @@ async def _execute_job(job_id, work):
     finally:
         _job_lock.release()
         _background_tasks.discard(task)
+        if _owner_guard is not None:
+            _owner_guard.tasks.discard(task)
+        owner_context.reset(owner_token)
 
     if cancelled_exc is not None:
         raise cancelled_exc
@@ -859,7 +914,8 @@ async def _digest_work():
     return result
 
 
-async def _backfill_work(mid, since):
+async def _backfill_work(mid, since, until=None):
+    until = until or _utcnow()
     bloggers = [{"mid": mid}] if mid else await _get_enabled_bloggers()
     results = []
     # Issue #6: 共享预算——所有博主共用 backfill_cap
@@ -871,7 +927,7 @@ async def _backfill_work(mid, since):
         if remaining <= 0 or page_budget["remaining"] <= 0:
             break
         try:
-            r = await run_backfill(b["mid"], since, remaining, page_budget=page_budget)
+            r = await run_backfill(b["mid"], since, remaining, page_budget=page_budget, until=until)
             results.append(r)
             remaining -= r.get("attempted", 0)
             visited += 1
@@ -905,59 +961,19 @@ async def _backfill_work(mid, since):
 
 
 async def _retry_work():
-    from src.fetcher import _bili_client, _resolve_error_type
-    from src.retry_strategy import is_permanent, should_retry
-    async with async_session() as session:
-        videos = (await session.execute(select(Video).outerjoin(Transcript, Video.bvid == Transcript.bvid)
-            .outerjoin(Summary, Video.bvid == Summary.bvid).where(Video.mid.in_(select(Blogger.mid).where(Blogger.enabled == True)),
-                Video.publish_time >= _HARD_SINCE,  # Issue #2: 日期下限
-                Video.publish_time.isnot(None),
-                or_(Video.fetch_status != "ok", Transcript.bvid.is_(None), Transcript.full_text == "", Summary.bvid.is_(None)))
-            .limit(60))).scalars().all()
-    # Issue #3: 统一重试资格检查——与 run_retry_failed() 一致
-    retryable = []
-    for v in videos:
-        err_type = await _resolve_error_type(v)
-        if is_permanent(err_type):
-            logger.info(f"[retry_work] {v.bvid}: 永久失败({err_type})，跳过")
-            continue
-        if not should_retry(v.retry_count or 0, err_type):
-            logger.info(f"[retry_work] {v.bvid}: {err_type} 达上限({v.retry_count})，跳过")
-            continue
-        retryable.append(v)
-        if len(retryable) >= 50:
-            break
-    # Issue #12 #6: 检测是否还有更多候选
-    result = {"processed": 0, "skipped": len(videos) - len(retryable), "failed": 0,
-              "has_more": len(videos) > 50}
-    async with _bili_client() as client:
-        for video in retryable:
-            try:
-                await _process_video(client, video.mid, _video_info(video), is_retry=True)
-                result["processed"] += 1
-            except Exception:
-                result["failed"] += 1
-            await asyncio.sleep(get_config().get("limits", {}).get("video_interval_seconds", 5))
+    result = await run_retry_failed()
     digests = await regenerate_dirty_digests()
-    result["failed"] += digests["failed"]
-    # Issue #15 #7: 日报补偿 has_more 传播到 result
-    if digests.get("has_more"):
-        result["has_more"] = True
+    result["failed"] = result.get("failed", 0) + digests["failed"]
+    result["has_more"] = result.get("has_more", False) or digests.get("has_more", False)
     return result
 
 
 async def _cached_cookie_status():
-    import time
-    from src.bilibili import BiliClient
-    global _cookie_cache
-    async with _cookie_lock:
-        timestamp, data = _cookie_cache
-        if time.monotonic() - timestamp < 60:
-            return data
-        async with BiliClient(sessdata=get_env("SESSDATA")) as client:
-            data = await client.validate_sessdata()
-        _cookie_cache = (time.monotonic(), data)
-        return data
+    # Reading a settings page never initiates an upstream request. The independent
+    # health job and explicitly requested checks maintain the durable tri-state.
+    from src.authorization import public_auth_status
+    data = await public_auth_status(async_session)
+    return {"valid": data["state"] == "valid", "state": data["state"], "expire_date": ""}
 
 
 @app.get("/api/tasks/{job_id}", dependencies=[Depends(require_api_key)])
@@ -975,3 +991,13 @@ from src.bilibili import BiliAPIError
 @app.exception_handler(BiliAPIError)
 async def upstream_error(request, exc):
     return JSONResponse(status_code=502, content={"detail": "B站请求失败，请稍后重试", "upstream_code": exc.code})
+
+
+from src.auth_routes import build_router
+app.include_router(build_router(require_api_key, lambda: async_session, lambda: _owner_guard))
+
+from src.lifecycle import WorkflowError
+@app.exception_handler(WorkflowError)
+async def workflow_error(request, exc):
+    status = 409 if exc.reason in ("ownership_lost", "task_running", "scope_frozen") else 400
+    return JSONResponse(status_code=status, content={"detail": str(exc), "reason": exc.reason})

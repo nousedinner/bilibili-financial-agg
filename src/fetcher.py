@@ -171,7 +171,13 @@ def _utcnow() -> datetime:
 
 
 def _bili_client() -> BiliClient:
-    return BiliClient(sessdata=get_env("SESSDATA"))
+    from src.credentials import credential_store
+    from src.authorization import record_auth_check
+    credential = credential_store().current()
+    async def observe(version, state, reason):
+        await record_auth_check(async_session, version, state, reason)
+    return BiliClient(sessdata=credential.sessdata, credential_version=credential.version,
+        cookie_extra=credential.cookie_header(), auth_observer=observe)
 
 
 async def _get_enabled_bloggers() -> list:
@@ -203,8 +209,14 @@ async def run_fetch_only() -> dict:
     async with _bili_client() as client:
         # Validate cookie
         cookie_status = await client.validate_sessdata()
-        if not cookie_status["valid"]:
-            logger.warning("[fetcher] SESSDATA无效，仅使用不需要cookie的接口")
+        from src.authorization import record_auth_check
+        await record_auth_check(async_session, getattr(client, "credential_version", 1),
+            cookie_status.get("state", "valid" if cookie_status.get("valid") else "unknown"), cookie_status.get("reason"))
+        if cookie_status.get("state") == "invalid":
+            client._sessdata, client._cookie_extra = "", ""
+            if hasattr(client, "_transport"):
+                client._transport.cookies.clear()
+            logger.warning("[fetcher] B站授权无效，已记录告警并停止使用该会话进行普通请求")
 
         for blogger in bloggers:
             if not blogger.get("enabled", True):
@@ -249,588 +261,27 @@ async def run_daily_fetch() -> dict:
     return results
 
 
-async def run_backfill(mid: int, since: str, cap: int = 20, page_budget: dict = None) -> dict:
-    if page_budget is None:
-        page_budget = {"remaining": 50}
-    result = {"mid": mid, "name": "unknown", "processed": 0, "failed": 0, "attempted": 0,
-              "not_visited": 0}  # #3: 页面预算耗尽导致未访问的博主数量
-    if page_budget["remaining"] <= 0:
-        result["not_visited"] = 1
-        logger.info(f"[backfill] {mid}: 页面预算已耗尽，跳过")
-        return result
-    try:
-        since_dt = datetime.combine(date.fromisoformat(since), dt_time())
-        async with async_session() as session:
-            blogger = await session.get(Blogger, mid)
-            if not blogger or not blogger.enabled:
-                raise ValueError(f"Enabled blogger {mid} not found")
-            result["name"] = blogger.name
-        seen = set()
-        max_pages = page_budget["remaining"]  # #5: 使用共享页面预算
-
-        def consume_page_retry() -> bool:
-            if page_budget["remaining"] <= 0:
-                return False
-            page_budget["remaining"] -= 1
-            return True
-
-        async with _bili_client() as client:
-            scan_complete = False
-            reached_date = False
-            cap_exhausted = False
-            for page in range(1, max_pages + 1):
-                if page_budget["remaining"] <= 0:
-                    break
-                page_budget["remaining"] -= 1
-                data = await client.get_video_list(
-                    mid,
-                    page=page,
-                    page_size=30,
-                    consume_retry_attempt=consume_page_retry,
-                )
-                batch = data.get("list", {}).get("vlist", [])
-                if not batch:
-                    scan_complete = True
-                    break
-                fresh = [v for v in batch if v.get("bvid") and v["bvid"] not in seen]
-                if not fresh:
-                    raise ValueError("Video pagination repeated")
-                for v in fresh:
-                    seen.add(v["bvid"])
-                    pub = _publish_time(v.get("created", 0))
-                    if pub is None:
-                        # #10: 缺失时间跳过但不阻断翻页
-                        continue
-                    if pub < since_dt:
-                        reached_date = True
-                        continue
-                    async with async_session() as session:
-                        old = await session.get(Video, v["bvid"])
-                        if old and old.fetch_status == "ok":
-                            continue
-                        # Issue #6: 回填也检查重试策略——永久失败和次数耗尽不重试
-                        if old:
-                            err_type = await _resolve_error_type(old)
-                            if is_permanent(err_type):
-                                continue
-                            if not should_retry(old.retry_count or 0, err_type):
-                                continue
-                    if result["attempted"] >= cap:
-                        cap_exhausted = True
-                        result["has_more"] = True  # Issue #16: 批次上限达到时报告仍有数据
-                        break
-                    result["attempted"] += 1
-                    try:
-                        # #2: 已有记录走恢复模式，复用本地字幕/互动数据
-                        await _process_video(client, mid, v, is_retry=bool(old))
-                        result["processed"] += 1
-                    except Exception:
-                        result["failed"] += 1
-                    await asyncio.sleep(get_config().get("limits", {}).get("video_interval_seconds", 5))
-                if reached_date or cap_exhausted:
-                    break
-            # Issue #15 #4: 显式状态替代 for-else，页面预算耗尽时报告仍有数据
-            if not scan_complete and not reached_date and not cap_exhausted:
-                if page_budget is not None and page_budget["remaining"] <= 0:
-                    result["has_more"] = True
-    except Exception as exc:
-        result["error"] = str(exc)[:200]
-        result["failed"] = max(result["failed"], 1)  # #11: 上游异常算至少1个失败
-    return result
-
+async def run_backfill(mid: int, since: str, cap: int = 20, page_budget: dict = None, until=None) -> dict:
+    from src.collection import manual_backfill
+    async with _bili_client() as client:
+        return await manual_backfill(async_session, client, mid, since, _process_video,
+                                     cap=cap, page_budget=page_budget, until=until)
 
 async def run_retry_failed(batch_limit: int = 50) -> dict:
-    """独立重试：只从数据库捞失败视频，按错误类型分级处理，不扫描新视频。"""
-    bloggers = await _get_enabled_bloggers()
-    if not bloggers:
-        return {"processed": 0, "skipped": 0, "failed": 0}
-    
-    result = {"processed": 0, "skipped": 0, "failed": 0, "details": []}
-    interval = get_config().get("limits", {}).get("video_interval_seconds", 5)
-    
-    async with async_session() as session:
-        # #1: 精确SQL重试资格过滤——用持久化的error_type匹配各类型上限
-        # permanent(0次) / incomplete_info(2次) / llm_failed(2次) / transcript(3次) / unknown(3次)
-        candidates = (await session.execute(select(Video).where(
-            Video.fetch_status.in_(["failed", "pending"]),
-            Video.mid.in_([b["mid"] for b in bloggers]),
-            Video.publish_time >= _HARD_SINCE,
-            Video.publish_time.isnot(None),
-            # 永久失败直接排除（error_type IS NULL的也保留，由下面的or_处理）
-            or_(Video.error_type.is_(None), Video.error_type != "permanent"),
-            # #1: 精确重试上限——incomplete_info/llm_failed最多2次，其他最多3次
-            or_(
-                and_(Video.error_type.in_(["incomplete_info", "llm_failed"]),
-                     Video.retry_count < 2),
-                and_(Video.error_type.in_(["transcript", "unknown"]),
-                     Video.retry_count < 3),
-                Video.error_type.is_(None),  # 未分类的也保留（迁移回填可能未覆盖）
-            ),
-        ).order_by(
-            case((Video.retry_count.is_(None), 1), else_=0),
-            Video.retry_count.asc(),
-            Video.fetched_at.asc(),
-            Video.bvid.asc(),
-        ).limit(200))).scalars().all()
-    # #2: Python二次筛选（精确匹配错误类型的重试上限）+ 任务级预算
-    failed = []
-    for v in candidates:
-        if len(failed) >= batch_limit:
-            break
-        err_type = await _resolve_error_type(v)
-        if is_permanent(err_type) or not should_retry(v.retry_count or 0, err_type):
-            continue
-        failed.append(v)
-
-    # Issue #12 #6: 检测是否还有更多候选
-    if len(candidates) > batch_limit:
-        result["has_more"] = True
-
-    for v in failed:
-        err_type = v.error_type or "unknown"  # 已在上面分类并持久化
-        # 针对性重试
-        logger.info(f"[retry] {v.bvid}: {err_type}，重试中...")
-        async with _bili_client() as client:
-            try:
-                await _process_video(client, v.mid, _video_info(v), is_retry=True)
-                result["processed"] += 1
-                result["details"].append({"bvid": v.bvid, "status": "ok"})
-                logger.info(f"[retry] {v.bvid}: [OK] 成功")
-            except Exception as e:
-                result["failed"] += 1
-                result["details"].append({"bvid": v.bvid, "status": "failed", "error": str(e)[:100]})
-                logger.warning(f"[retry] {v.bvid}: [FAIL] {e}")
-        await asyncio.sleep(interval)
-    
-    return result
-
+    from src.collection import retry_ready
+    async with _bili_client() as client:
+        return await retry_ready(async_session, client, _process_video, limit=batch_limit)
 
 async def _fetch_blogger(client: BiliClient, mid: int, name: str, budget: dict = None) -> dict:
-    cfg = get_config()
-    retries = cfg.get("retry", {}).get("max_retries", 3)
-    interval = cfg.get("limits", {}).get("video_interval_seconds", 5)
-    if budget is None:
-        cfg_data = cfg.get("data", {})
-        budget = {
-            "pages": cfg_data.get("task_page_budget", 50),
-            "new_videos": cfg_data.get("task_video_budget", cfg_data.get("first_run_cap", 50)),
-            "retries": cfg_data.get("task_retry_budget", 50),
-        }
-    result = {"name": name, "new_count": 0, "failed_count": 0, "retried_count": 0, "dynamics_count": 0}
-    async with async_session() as session:
-        # Issue #14 #2: SQL LIMIT限制候选数量，避免无界数据库操作
-        _retries_limit = budget["retries"] + 10 if budget else 210
-        failed_rows = (await session.execute(select(Video).where(
-            Video.mid == mid,
-            Video.fetch_status.in_(["failed", "pending"]),
-            Video.publish_time >= _HARD_SINCE,
-            Video.publish_time.isnot(None),
-            # 排除永久失败
-            or_(Video.error_type.is_(None), Video.error_type != "permanent"),
-            # 精确重试上限
-            or_(
-                and_(Video.error_type.in_(["incomplete_info", "llm_failed"]),
-                     Video.retry_count < 2),
-                and_(Video.error_type.in_(["transcript", "unknown"]),
-                     Video.retry_count < 3),
-                Video.error_type.is_(None),
-            ),
-        ).order_by(
-            case((Video.retry_count.is_(None), 1), else_=0),
-            Video.retry_count.asc(),
-            Video.fetched_at.asc(),
-            Video.bvid.asc(),
-        ).limit(_retries_limit + 1))).scalars().all()
-        has_more_candidates = len(failed_rows) > _retries_limit
-        failed = list(failed_rows[:_retries_limit])
-        # 按错误类型分级过滤重试，使用任务级预算
-        retryable = []
-        for v in failed:
-            err_type = await _resolve_error_type(v)
-            if is_permanent(err_type):
-                logger.info(f"[fetcher] {v.bvid}: 永久失败({err_type})，跳过")
-                continue
-            if should_retry(v.retry_count or 0, err_type):
-                retryable.append(v)
-            else:
-                logger.info(f"[fetcher] {v.bvid}: {err_type} 已达重试上限({v.retry_count}/{max_retries_for(err_type)})")
-        failed = retryable
-        # #12: 动态抓取已停用，不查询 PendingDynamic
-        wm = await session.get(FetchWatermark, mid)
-        last_bvid, last_dyn = (wm.last_bvid, wm.last_dyn_id) if wm else (None, None)
-    # Issue #14 #2: 已在SQL LIMIT阶段截断候选
-    # Issue #14 #4: 重试候选耗尽传播has_more
-    if has_more_candidates:
-        result["has_more"] = True
-    attempted = set()
-    for v in failed:
-        # Issue #11 #1: 使用任务级重试预算
-        if budget["retries"] <= 0:
-            logger.info(f"[fetcher] 重试预算耗尽，停止博主 {name} 的重试")
-            result["has_more"] = True  # Issue #14 #4: 重试预算耗尽传播
-            break
-        budget["retries"] -= 1
-        attempted.add(v.bvid)
-        try:
-            await _process_video(client, mid, _video_info(v), is_retry=True)
-            result["retried_count"] += 1
-        except Exception:
-            result["failed_count"] += 1
-        await asyncio.sleep(interval)
-    # for d in pending:  # DISABLED: dynamics fetching paused
-    #     try:
-    #         await _process_dynamic(client, mid, d.payload)
-    #         result["retried_count"] += 1
-    #     except Exception:
-    #         result["failed_count"] += 1
-
-    # Issue #13 #1: cap 仅用于处理循环，扫描收集所有视频
-    since = cfg.get("data", {}).get("backfill_since")
-    since_dt = datetime.combine(date.fromisoformat(since), dt_time()) if since else None
-
-    def consume_page_retry() -> bool:
-        if budget["pages"] <= 0:
-            return False
-        budget["pages"] -= 1
-        return True
-
-    max_scan_pages = budget["pages"]  # Issue #11 #1: 使用共享页面预算
-    seen, videos, complete = set(), [], False
-    watermark_found = not last_bvid  # 无水位线时视为"已找到"
-    all_processed = True  # Issue #14 #1: 跟踪是否所有候选都已处理
-    for page in range(1, max_scan_pages + 1):
-        if budget["pages"] <= 0:
-            result["has_more"] = True
-            all_processed = False  # Issue #15 #5: 页面预算耗尽时阻止水位线推进
-            break
-        budget["pages"] -= 1
-        data = await client.get_video_list(
-            mid,
-            page=page,
-            page_size=30,
-            consume_retry_attempt=consume_page_retry,
-        )
-        batch = data.get("list", {}).get("vlist", [])
-        if not batch:
-            complete = True
-            break
-        fresh = [v for v in batch if v.get("bvid") and v["bvid"] not in seen]
-        if not fresh:
-            raise ValueError("Video pagination repeated; watermark retained")
-        stop = False
-        for v in fresh:
-            seen.add(v["bvid"])
-            if not watermark_found and v["bvid"] == last_bvid:
-                watermark_found = True
-                stop = True
-                continue
-            pub = _publish_time(v.get("created", 0))
-            if pub is None:
-                # Issue #4: 缺失时间跳过但不阻断后续视频
-                continue
-            if since_dt and pub < since_dt:
-                stop = True
-                continue
-            if not stop:
-                videos.append(v)
-        # Issue #13 #1: 扫描不截断——收集所有视频直到水位线/页面耗尽
-        # cap 仅在处理循环中限制 new_videos，避免活锁
-        if stop:
-            complete = True
-            break
-    # 共享预算耗尽是可续跑状态，不应伪装为本次已完整扫描。
-    if not complete and budget["pages"] <= 0:
-        result["has_more"] = True
-        all_processed = False  # Issue #15 #5: 页面预算耗尽时阻止水位线推进
-    elif not complete and max_scan_pages > 0:
-        hint = "watermark not found; use backfill" if last_bvid and not watermark_found else "use backfill"
-        raise ValueError(f"Video scan limit exceeded ({max_scan_pages} pages); {hint}")
-    last_processed = None
-    for v in videos:
-        if v["bvid"] in attempted:
-            continue
-        # Issue #11 #1: new_videos 预算耗尽时停止处理
-        if budget["new_videos"] <= 0:
-            result["has_more"] = True  # Issue #14 #4: 新视频预算耗尽传播
-            all_processed = False
-            break
-        async with async_session() as session:
-            old = await session.get(Video, v["bvid"])
-        if old:  # Failed/pending rows are handled by the retry queue above.
-            continue
-        budget["new_videos"] -= 1  # Issue #11 #1: 每条新视频扣减共享预算
-        try:
-            await _process_video(client, mid, v)
-            result["new_count"] += 1
-            # Issue #3: 记录最后成功处理的视频，用于安全推进水位线
-            last_processed = v
-        except Exception:
-            result["failed_count"] += 1
-            async with async_session() as session:
-                if await session.get(Video, v["bvid"]) is None:
-                    raise  # A DB failure must not move the boundary past an unqueued item.
-        await asyncio.sleep(interval)
-    # Issue #14 #1: 水位线仅在所有候选视频都已处理/有DB记录时推进
-    # 预算截断导致未处理候选时，保持水位线不动，下次扫描可重新发现
-    if last_processed and all_processed:
-        async with async_session() as session:
-            wm = await session.get(FetchWatermark, mid) or FetchWatermark(mid=mid)
-            wm.last_bvid = last_processed["bvid"]
-            wm.last_publish_time = _publish_time(last_processed.get("created", 0))
-            wm.updated_at = _utcnow()
-            session.add(wm)
-            await session.commit()
-
-    newest = None  # DISABLED: dynamics fetching paused; watermark block below preserves existing last_dyn_id
-    # for _ in range(1000):  # DISABLED: dynamics fetching paused
-    #     data = await client.get_dynamics(mid, offset=offset)
-    #     batch = data.get("items", [])
-    #     stop = False
-    #     for dyn in batch:
-    #         dyn_id = str(dyn.get("id_str", ""))
-    #         if not dyn_id:
-    #             continue
-    #         newest = newest or dyn_id
-    #         if dyn_id == last_dyn:
-    #             stop = True
-    #             continue
-    #         if dyn_id in tried_dyn:
-    #             continue
-    #         tried_dyn.add(dyn_id)
-    #         async with async_session() as session:
-    #             if await session.get(Dynamic, dyn_id) or await session.get(PendingDynamic, dyn_id):
-    #                 continue
-    #         try:
-    #             await _process_dynamic(client, mid, dyn)
-    #             result["dynamics_count"] += 1
-    #         except Exception:
-    #             result["failed_count"] += 1
-    #             async with async_session() as session:
-    #                 if await session.get(PendingDynamic, dyn_id) is None:
-    #                     raise
-    #         await asyncio.sleep(interval)
-    #     if stop or not data.get("has_more"):
-    #         break
-    #     offset = str(data.get("offset", ""))
-    #     if not offset or offset in offsets:
-    #         raise ValueError("Dynamic pagination repeated; watermark retained")
-    #     offsets.add(offset)
-    # else:
-    #     raise ValueError("Dynamic scan limit exceeded; watermark retained")
-    if newest:
-        async with async_session() as session:
-            wm = await session.get(FetchWatermark, mid) or FetchWatermark(mid=mid)
-            wm.last_dyn_id = newest
-            wm.updated_at = _utcnow()
-            session.add(wm)
-            await session.commit()
-    return result
-
+    from src.collection import scan_blogger
+    return await scan_blogger(async_session, client, mid, name, _process_video, budget=budget)
 
 async def _process_video_core(client: BiliClient, mid: int, vinfo: dict, is_retry: bool = False):
-    """Fetch and validate first; commit transcript and all analyses together."""
-    bvid = vinfo["bvid"]
-    title = str(vinfo.get("title") or "")[:500]
-    duration = vinfo.get("length", 0)
-    dur_sec = 0
-    if isinstance(duration, str):
-        for part in duration.split(":"):
-            dur_sec = dur_sec * 60 + int(part or 0)
-    else:
-        dur_sec = int(duration or 0)
-    pub_dt = _publish_time(vinfo.get("created", 0))
-
-    # #3: 重试模式——先检查本地数据完整性，完整则跳过所有远程调用
-    cid = None
-    aid = vinfo.get("aid", 0) or 0
-    existing_comments = existing_danmaku = None
-    existing_summary = None
-    use_existing_transcript = False
-    existing_transcript = None
-    reuse_existing_analysis = False
-
-    if is_retry:
-        async with async_session() as session:
-            existing_transcript = await session.get(Transcript, bvid)
-            existing_comments = (await session.execute(
-                select(CommentAnalysis).where(CommentAnalysis.ref_id == bvid)
-            )).scalar_one_or_none()
-            existing_danmaku = (await session.execute(
-                select(DanmakuAnalysis).where(DanmakuAnalysis.bvid == bvid)
-            )).scalar_one_or_none()
-            existing_summary = (await session.execute(
-                select(Summary).where(Summary.bvid == bvid)
-            )).scalar_one_or_none()
-            db_video = await session.get(Video, bvid)
-            if not aid:
-                aid = getattr(db_video, 'aid', None) or 0
-
-        # 已有转写——已持久化的字幕一律复用，不再用长度阈值区分
-        if existing_transcript and existing_transcript.full_text:
-            transcript_text = existing_transcript.full_text
-            transcript_result = {"source": existing_transcript.source, "text": transcript_text,
-                "segments": existing_transcript.segment_count or 1}
-            use_existing_transcript = True
-            logger.info(f"[fetcher] {bvid}: 使用已有转写({len(transcript_text)}字)")
-
-        # #3: 所有数据完整 → 跳过get_video_info和所有远程调用
-        has_all = (use_existing_transcript
-            and existing_comments and (existing_comments.total_count or 0) > 0
-            and existing_danmaku and (existing_danmaku.total_count or 0) > 0
-            and existing_summary and existing_summary.summary)
-        if has_all:
-            reuse_existing_analysis = True
-            logger.info(f"[fetcher] {bvid}: 所有数据完整，跳过远程调用（复用已有分析）")
-            # 无需cid/aid/远程字幕——直接构建分析结果
-            analysis = {
-                "summary": existing_summary.summary,
-                "key_points": existing_summary.key_points or [],
-                "sentiment": existing_summary.sentiment or "neutral",
-                "sentiment_score": existing_summary.sentiment_score or 0.0,
-                "risk_warnings": existing_summary.risk_warnings or [],
-                "data_citations": existing_summary.data_citations or [],
-                "tags": existing_summary.tags or [],
-                "comment_sentiment": {
-                    "bullish": existing_comments.sentiment_bullish if existing_comments else 0,
-                    "bearish": existing_comments.sentiment_bearish if existing_comments else 0,
-                    "neutral": existing_comments.sentiment_neutral if existing_comments else 0,
-                },
-                "danmaku_sentiment": {
-                    "bullish": existing_danmaku.sentiment_bullish if existing_danmaku else 0,
-                    "bearish": existing_danmaku.sentiment_bearish if existing_danmaku else 0,
-                    "neutral": existing_danmaku.sentiment_neutral if existing_danmaku else 0,
-                },
-                "comment_keywords": existing_comments.keywords if existing_comments else [],
-                "danmaku_keywords": existing_danmaku.keywords if existing_danmaku else [],
-            }
-            # 跳转到保存阶段
-            async with async_session() as session:
-                video = await session.get(Video, bvid)
-                video.fetch_status, video.retry_count, video.error_message = "ok", 0, None
-                video.error_type = None
-                video.analysis_status = "completed"
-                video.fetched_at = _utcnow()
-                if aid:
-                    video.aid = aid
-                await _mark_digest_dirty(session, pub_dt)
-                await session.commit()
-            logger.info(f"[fetcher] Saved {bvid}: {analysis['sentiment']} (复用)")
-            return
-
-    # 非重试或数据不完整——需要远程获取
-    if not use_existing_transcript:
-        # 远程获取字幕
-        if not cid:
-            info = await client.get_video_info(bvid)
-            cid = info.get("cid") or (info.get("pages") or [{}])[0].get("cid")
-            if not cid:
-                raise ValueError(f"Cannot get CID for {bvid}")
-            dur_sec = info.get("duration") or dur_sec
-        transcript_result = await fetch_transcript(client, bvid, cid, dur_sec)
-        transcript_text = transcript_result.get("text", "")
-
-    if not transcript_text or (transcript_result.get("partial") and not use_existing_transcript):
-        raise ValueError("Transcript unavailable or incomplete")
-
-    # #5: aid仍为0时远程获取
-    if not aid:
-        try:
-            aid = await client.get_video_aid(bvid)
-        except Exception as e:
-            logger.warning(f"[fetcher] {bvid}: 获取aid失败({e})")
-
-    # 标记分析阶段开始——拿到字幕，即将调LLM
-    async with async_session() as session:
-        video = await session.get(Video, bvid)
-        video.analysis_status = "processing"
-        # #5: 持久化aid
-        if aid and not video.aid:
-            video.aid = aid
-        await session.commit()
-
-    comment_data = {"replies": [], "total": 0}
-    danmaku_data = {"items": [], "total": 0}
-    comments, danmakus = [], []
-
-    if is_retry:
-        # 部分缺失 → 正常获取缺失部分（完整的已在上面早返回）
-        has_comments = existing_comments and (existing_comments.total_count or 0) > 0
-        has_danmaku = existing_danmaku and (existing_danmaku.total_count or 0) > 0
-
-        # #3: 用已有互动数据供AI分析，而非传空列表
-        if has_comments:
-            # 从CommentAnalysis重建comments供AI使用
-            comments = [{"content": {"message": c}} for c in (existing_comments.hot_comments or [])]
-            comment_data["total"] = existing_comments.total_count or 0
-        elif aid:
-            try:
-                comment_data = await client.get_comments(oid=aid, oid_type=1, count=20)
-            except Exception as e:
-                logger.warning(f"[fetcher] {bvid}: 评论获取失败({e})，跳过")
-            comments = comment_data["replies"]
-
-        if has_danmaku:
-            # #3: 弹幕已有分析结果——传关键词字符串列表（analyze_video期望str列表）
-            danmakus = list(existing_danmaku.keywords or [])
-            danmaku_data["total"] = existing_danmaku.total_count or 0
-        else:
-            # #3: 获取弹幕前确保有CID
-            if not cid:
-                info = await client.get_video_info(bvid)
-                cid = info.get("cid") or (info.get("pages") or [{}])[0].get("cid")
-                if not cid:
-                    logger.warning(f"[fetcher] {bvid}: 无法获取CID，跳过弹幕")
-                else:
-                    danmaku_data = await client.get_danmaku(cid, max_count=2000)
-                    danmakus = danmaku_data["items"]
-            else:
-                danmaku_data = await client.get_danmaku(cid, max_count=2000)
-                danmakus = danmaku_data["items"]
-    else:
-        if aid:
-            try:
-                comment_data = await client.get_comments(oid=aid, oid_type=1, count=20)
-            except Exception as e:
-                logger.warning(f"[fetcher] {bvid}: 评论获取失败({e})，跳过")
-        comments = comment_data["replies"]
-        danmaku_data = await client.get_danmaku(cid, max_count=2000)
-        danmakus = danmaku_data["items"]
-
-    analysis = await analyze_video(title, transcript_text, comments, danmakus, dur_sec)
-    if analysis.get("analysis_failed") or not _validate_analysis(analysis):
-        raise ValueError(f"LLM analysis failed for {bvid}")
-    async with async_session() as session:
-        # Issue #5: 使用已有转写时不覆盖
-        if not use_existing_transcript:
-            await session.merge(Transcript(bvid=bvid, source=transcript_result["source"],
-                full_text=transcript_text, segment_count=transcript_result["segments"]))
-        fields = ("summary", "key_points", "sentiment", "sentiment_score", "risk_warnings", "data_citations", "tags")
-        await session.merge(Summary(bvid=bvid, **{key: analysis[key] for key in fields}))
-        # Issue #4: 仅在有新抓取数据时覆盖 CommentAnalysis/DanmakuAnalysis
-        # retry 模式且已有完整数据时保留原值不覆盖
-        cs, ds = analysis["comment_sentiment"], analysis["danmaku_sentiment"]
-        if not (is_retry and existing_comments and (existing_comments.total_count or 0) > 0):
-            await session.merge(CommentAnalysis(ref_id=bvid, ref_type="video", total_count=comment_data["total"],
-                fetched_count=len(comments), sentiment_bullish=cs["bullish"], sentiment_bearish=cs["bearish"],
-                sentiment_neutral=cs["neutral"], hot_comments=[c.get("content", {}).get("message", "") for c in comments[:5]],
-                keywords=analysis["comment_keywords"]))
-        if not (is_retry and existing_danmaku and (existing_danmaku.total_count or 0) > 0):
-            await session.merge(DanmakuAnalysis(bvid=bvid, total_count=danmaku_data["total"], sampled_count=len(danmakus),
-                sentiment_bullish=ds["bullish"], sentiment_bearish=ds["bearish"], sentiment_neutral=ds["neutral"],
-                keywords=analysis["danmaku_keywords"]))
-        video = await session.get(Video, bvid)
-        video.title, video.duration, video.view_count = title, dur_sec, vinfo.get("play", 0)
-        video.fetch_status, video.retry_count, video.error_message = "ok", 0, None
-        video.error_type = None  # #1: 成功后清除错误类型
-        video.analysis_status = "completed"
-        video.fetched_at = _utcnow()
-        # #5: 持久化aid
-        if aid:
-            video.aid = aid
-        await _mark_digest_dirty(session, pub_dt)
-        await session.commit()
-    logger.info(f"[fetcher] Saved {bvid}: {analysis['sentiment']}")
-
+    from src.pipeline import process
+    from src.analyzer import analyze_interactions
+    return await process(async_session, client, vinfo["bvid"], fetch_transcript=fetch_transcript,
+        analyze_video=analyze_video, analyze_interactions=analyze_interactions,
+        validate_analysis=_validate_analysis, mark_digest=_mark_digest_dirty)
 
 async def _process_dynamic_core(client: BiliClient, mid: int, dyn_data: dict):
     """处理单条动态。兼容桌面端modules列表格式。"""
@@ -973,42 +424,16 @@ def _video_info(video):
 
 
 async def _process_video(client, mid, vinfo, is_retry=False):
+    from src.models import VideoWork
+    from src.lifecycle import WorkflowError
     bvid = vinfo.get("bvid")
-    if not bvid:
-        raise ValueError("Missing bvid")
-    # ── Issue #1 兜底：所有入口（扫描/回填/重试/补偿）最终都走这里 ──
-    pub_dt = _publish_time(vinfo.get("created", 0))
-    if _is_before_hard_since(pub_dt):
-        raise ValueError(
-            f"Rejected: publish_time {pub_dt} is before hard limit {_HARD_SINCE.date()}"
-        )
+    if not bvid or _is_before_hard_since(_publish_time(vinfo.get("created", 0))):
+        raise WorkflowError("outside_scope", "admission")
     async with async_session() as session:
-        video = await session.get(Video, bvid)
-        if not video:
-            video = Video(bvid=bvid, mid=mid, title=vinfo.get("title", ""),
-                publish_time=_publish_time(vinfo.get("created", 0)), retry_count=0)
-            session.add(video)
-        video.fetch_status = "pending"
-        video.analysis_status = "pending"
-        await session.commit()
-    try:
-        await _process_video_core(client, mid, vinfo, is_retry)
-    except (Exception, asyncio.CancelledError) as exc:
-        async with async_session() as session:
-            video = await session.get(Video, bvid)
-            video.fetch_status = "failed"
-            video.error_message = (str(exc) or "Task interrupted")[:500]
-            # #1: 持久化错误类型——SQL精确过滤重试资格
-            video.error_type = classify_error(video.error_message, vinfo.get("length", 0) or 0)
-            # 区分：LLM分析失败 vs 字幕/抓取失败
-            if "LLM analysis failed" in str(exc) or video.analysis_status == "processing":
-                video.analysis_status = "failed"
-            else:
-                video.analysis_status = "pending"
-            video.retry_count = (video.retry_count or 0) + 1
-            await session.commit()
-        raise
-
+        work = await session.get(VideoWork, bvid)
+        if work is None or work.mid != mid:
+            raise WorkflowError("not_admitted", "admission")
+    return await _process_video_core(client, mid, vinfo, is_retry)
 
 async def _process_dynamic(client, mid, data):
     dyn_id = str(data.get("id_str", ""))

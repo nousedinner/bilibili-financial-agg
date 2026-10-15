@@ -1,5 +1,6 @@
 # Environment variables (SENSITIVE - never commit)
 .env
+.env.*
 !.env.example
 config/.env
 
@@ -18,6 +19,12 @@ venv/
 
 # Data
 data/*.db
+data/*credential*.json
+data/*service-account*.json
+data/management-key
+artifacts/
+/backups/
+**/*service-account*.json
 
 # OS
 .DS_Store

@@ -6,6 +6,8 @@ import asyncio
 import json
 import os
 import unittest
+import copy
+import tempfile
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -18,18 +20,27 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from src import config
-config._CONFIG = {'bloggers': [], 'data': {'first_run_cap': 2, 'backfill_since': '2026-01-01'}, 'limits': {'video_interval_seconds': 0}}
+config._CONFIG = {'bloggers': [], 'data': {'first_run_cap': 2, 'backfill_since': '2026-01-01'}, 'limits': {'video_interval_seconds': 0, 'request_interval_seconds': 0}}
 from src import main, fetcher, analyzer, bilibili, transcript
 from src.models import Base, Blogger, Video, Summary, Dynamic, DailyDigest, Transcript, PendingDynamic, DirtyDigest, FetchJob, DanmakuAnalysis, CommentAnalysis, FetchWatermark
 
 
 class Acceptance(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        from src import workflow, collection, pipeline, authorization, ownership, lifecycle
+        self.previous_config = copy.deepcopy(config._CONFIG)
+        self.temp = tempfile.TemporaryDirectory(prefix='fin-workflow-tests-')
+        config._CONFIG = copy.deepcopy(config._CONFIG)
+        config._CONFIG.setdefault('data', {}).update(credential_path=str(Path(self.temp.name) / 'credential.json'),
+                                                    outbox_path=str(Path(self.temp.name) / 'outbox.db'))
+        self.at = datetime(2026, 9, 10, 12)
         self.engine = create_async_engine('sqlite+aiosqlite:///:memory:')
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
         self.patches = [patch.object(main, 'async_session', self.sessions), patch.object(fetcher, 'async_session', self.sessions)]
+        self.patches += [patch.object(module, 'now', lambda: self.at)
+                         for module in (workflow, collection, pipeline, authorization, ownership, lifecycle)]
         for p in self.patches:
             p.start()
         main.app.dependency_overrides[main.require_api_key] = lambda: None
@@ -41,6 +52,27 @@ class Acceptance(unittest.IsolatedAsyncioTestCase):
         for p in reversed(self.patches):
             p.stop()
         await self.engine.dispose()
+        fetcher.outbox_close()
+        self.temp.cleanup()
+        config._CONFIG = self.previous_config
+
+    async def process(self, client, mid, info, is_retry=False):
+        from src import workflow
+        from src.models import VideoWork
+        published = fetcher._publish_time(info.get('created', 0))
+        if published is None or published < fetcher._HARD_SINCE:
+            return await fetcher._process_video(client, mid, info, is_retry)
+        async with self.sessions() as session:
+            if await session.get(Blogger, mid) is None:
+                session.add(Blogger(mid=mid, name='fixture', enabled=True))
+                await session.commit()
+            work = await session.get(VideoWork, info['bvid'])
+        if work is None:
+            batch = await workflow.create_batch(self.sessions, origin='manual_backfill',
+                since=fetcher._HARD_SINCE, until=max(self.at, published), max_videos=1, max_pages=1, mid=mid)
+            await workflow.admit(self.sessions, batch, mid, info, allow_legacy=True)
+            await workflow.freeze_batch(self.sessions, batch)
+        return await fetcher._process_video(client, mid, info, is_retry)
 
     async def seed_videos(self, tied=False):
         t = datetime(2026, 9, 9, 12)
@@ -81,7 +113,7 @@ class Acceptance(unittest.IsolatedAsyncioTestCase):
         c = self.client()
         c.get_video_info.return_value = {}
         with self.assertRaises(ValueError):
-            await fetcher._process_video(c, 1, {'bvid': 'BVcid', 'created': 1785513600, 'length': 1})
+            await self.process(c, 1, {'bvid': 'BVcid', 'created': 1785513600, 'length': 1})
         async with self.sessions() as s:
             v = await s.get(Video, 'BVcid')
             self.assertEqual(v.fetch_status, 'failed')
@@ -91,7 +123,7 @@ class Acceptance(unittest.IsolatedAsyncioTestCase):
         c = self.client()
         c.get_video_info.side_effect = bilibili.BiliAPIError(-404, 'mock missing video')
         with self.assertRaises(bilibili.BiliAPIError):
-            await fetcher._process_video(c, 1, {'bvid': 'BVexception', 'created': 1785513600, 'length': 1})
+            await self.process(c, 1, {'bvid': 'BVexception', 'created': 1785513600, 'length': 1})
         async with self.sessions() as s:
             v = await s.get(Video, 'BVexception')
             self.assertEqual(v.fetch_status, 'failed')
@@ -99,7 +131,7 @@ class Acceptance(unittest.IsolatedAsyncioTestCase):
     async def test_asr_exception_is_persisted_failed(self):
         with patch.object(fetcher, 'fetch_transcript', AsyncMock(side_effect=TimeoutError('mock audio timeout'))):
             with self.assertRaises(TimeoutError):
-                await fetcher._process_video(self.client(), 1, {'bvid': 'BVasr', 'created': 1785513600, 'length': 1})
+                await self.process(self.client(), 1, {'bvid': 'BVasr', 'created': 1785513600, 'length': 1})
         async with self.sessions() as s:
             self.assertEqual((await s.get(Video, 'BVasr')).fetch_status, 'failed')
 
@@ -109,7 +141,7 @@ class Acceptance(unittest.IsolatedAsyncioTestCase):
             await s.commit()
         with patch.object(fetcher, 'fetch_transcript', AsyncMock(return_value={'text': 'valid transcript', 'source': 'asr', 'segments': 1})), patch.object(fetcher, 'analyze_video', AsyncMock(return_value=analyzer._empty_analysis(analysis_failed=True))):
             with self.assertRaises(ValueError):
-                await fetcher._process_video(self.client(), 1, {'bvid': 'BVllm', 'created': 1785513600, 'length': 1})
+                await self.process(self.client(), 1, {'bvid': 'BVllm', 'created': 1785513600, 'length': 1})
         async with self.sessions() as s:
             self.assertEqual((await s.get(Video, 'BVllm')).fetch_status, 'failed')
             self.assertEqual((await s.get(Summary, 'BVllm')).summary, 'previous good result')
@@ -202,24 +234,25 @@ class Acceptance(unittest.IsolatedAsyncioTestCase):
             data = await analyzer.analyze_video('test', 'test', [], [], 10)
         self.assertTrue(data['analysis_failed'])
 
-    async def test_cc_exception_falls_back_to_ai(self):
+    async def test_network_error_is_not_interpreted_as_missing_subtitles(self):
         c = SimpleNamespace(get_cc_subtitle=AsyncMock(side_effect=TimeoutError('test')), get_subtitle_url=AsyncMock(return_value='mock://subtitle'))
         with patch.object(transcript, '_download_subtitle', AsyncMock(return_value='a' * 60)):
-            data = await transcript.fetch_transcript(c, 'BVtest', 1, 10)
-        self.assertEqual(data['source'], 'ai_subtitle')
+            with self.assertRaises(TimeoutError):
+                await transcript.fetch_transcript(c, 'BVtest', 1, 10)
+        c.get_subtitle_url.assert_not_awaited()
 
     async def test_valid_curl_video_response_is_parsed(self):
-        proc = SimpleNamespace(returncode=0, communicate=AsyncMock(return_value=(b'{"code":0,"data":{"cid":123}}\n200', b'')))
+        response = SimpleNamespace(status_code=200, content=b'{"code":0,"data":[{"cid":123,"duration":10}]}')
         async with bilibili.BiliClient() as client:
-            with patch.object(bilibili.asyncio, 'create_subprocess_exec', AsyncMock(return_value=proc)), patch.object(bilibili.asyncio, 'sleep', AsyncMock()):
+            with patch.object(bilibili._curl_session, 'get', AsyncMock(return_value=response)):
                 data = await client.get_video_info('BVmock')
         self.assertEqual(data.get('cid'), 123)
 
     async def test_valid_curl_dynamic_response_is_parsed(self):
-        proc = SimpleNamespace(returncode=0, communicate=AsyncMock(return_value=(b'{"code":0,"data":{"items":[{"id_str":"123"}]}}\n200', b'')))
+        response = SimpleNamespace(status_code=200, content=b'{"code":0,"data":{"items":[{"id_str":"123"}]}}')
         async with bilibili.BiliClient() as client:
             client._buvid3 = 'TEST_ONLY'
-            with patch.object(bilibili.asyncio, 'create_subprocess_exec', AsyncMock(return_value=proc)):
+            with patch.object(bilibili._curl_session, 'get', AsyncMock(return_value=response)):
                 data = await client.get_dynamics(1)
         self.assertEqual(len(data.get('items', [])), 1)
 
@@ -242,6 +275,7 @@ class Acceptance(unittest.IsolatedAsyncioTestCase):
             get_audio_url=AsyncMock(return_value='mock://audio'),
             download_audio=AsyncMock(return_value=audio_path))
         with patch.object(transcript, '_to_mp3_path', AsyncMock(return_value=mp3_path)), \
+             patch.object(transcript, '_probe_duration', AsyncMock(return_value=360.0)), \
              patch.object(transcript, '_split_audio_from_file', AsyncMock(return_value=[chunk1, chunk2])), \
              patch.object(transcript, '_call_asr', AsyncMock(side_effect=['first half only', None])):
             with self.assertRaisesRegex(ValueError, '2/2 failed'):
@@ -254,17 +288,11 @@ class Acceptance(unittest.IsolatedAsyncioTestCase):
     async def test_analysis_validator_rejects_invalid_types_and_range(self):
         self.assertFalse(analyzer._validate_analysis({'summary': None, 'key_points': 'wrong type', 'sentiment': 'neutral', 'sentiment_score': 999}))
 
-    async def test_curl_timeout_kills_and_reaps_process(self):
-        killed = []
-        async def communicate():
-            await asyncio.sleep(1)
-            return b'', b''
-        proc = SimpleNamespace(communicate=communicate, kill=lambda: killed.append(True), wait=AsyncMock(return_value=0))
-        with patch.object(bilibili.asyncio, 'create_subprocess_exec', AsyncMock(return_value=proc)):
-            with self.assertRaises(TimeoutError):
+    async def test_curl_timeout_is_bounded_and_classified(self):
+        with patch.object(bilibili._curl_session, 'get', AsyncMock(side_effect=TimeoutError('synthetic timeout'))) as request:
+            with self.assertRaises(bilibili.BiliAPIError):
                 await bilibili._run_curl(['curl', 'mock://timeout'], timeout=0.01)
-        self.assertEqual(killed, [True])
-        proc.wait.assert_awaited_once()
+        self.assertEqual(request.await_args.kwargs['timeout'], 0.01)
 
 
 if __name__ == '__main__':

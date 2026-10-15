@@ -2,10 +2,11 @@
 from sqlalchemy import inspect, text
 from src.models import Base
 
-VERSION = 6
+VERSION = 7
 
 
 def upgrade(connection):
+    current_ver = 0
     # #7: 拒绝高版本数据库被旧程序覆盖
     inspector = inspect(connection)
     if "schema_version" in inspector.get_table_names():
@@ -33,46 +34,49 @@ def upgrade(connection):
     # #1: 错误类型列——SQL精确过滤重试资格
     if "error_type" not in columns:
         connection.execute(text("ALTER TABLE videos ADD COLUMN error_type VARCHAR(20)"))
-    # #1: 回填现有失败记录的error_type——每次upgrade都执行（幂等，WHERE error_type IS NULL保证不重复）
-    # permanent: 404或"啥都木有"
-    connection.execute(text("""
-        UPDATE videos SET error_type = 'permanent'
-        WHERE fetch_status = 'failed' AND error_type IS NULL
-        AND (error_message LIKE '%404%' OR error_message LIKE '%啥都木有%')
-    """))
-    # incomplete_info: duration=0且非字幕问题
-    connection.execute(text("""
-        UPDATE videos SET error_type = 'incomplete_info'
-        WHERE fetch_status = 'failed' AND error_type IS NULL
-        AND (duration = 0 OR duration IS NULL)
-        AND (error_message NOT LIKE '%transcript%' AND error_message NOT LIKE '%subtitle%')
-    """))
-    # llm_failed
-    connection.execute(text("""
-        UPDATE videos SET error_type = 'llm_failed'
-        WHERE fetch_status = 'failed' AND error_type IS NULL
-        AND error_message LIKE '%LLM analysis failed%'
-    """))
-    # transcript
-    connection.execute(text("""
-        UPDATE videos SET error_type = 'transcript'
-        WHERE fetch_status = 'failed' AND error_type IS NULL
-        AND (error_message LIKE '%transcript%' OR error_message LIKE '%subtitle%')
-    """))
-    # 剩余未分类的标记为unknown
-    connection.execute(text("""
-        UPDATE videos SET error_type = 'unknown'
-        WHERE fetch_status = 'failed' AND error_type IS NULL
-    """))
+    # Only pre-v6 installations require legacy repair. V7 never turns legacy
+    # NULL/status rows into work or resets historical retry counters.
+    if not current_ver or current_ver < 6:
+        # #1: 回填现有失败记录的error_type——每次upgrade都执行（幂等，WHERE error_type IS NULL保证不重复）
+        # permanent: 404或"啥都木有"
+        connection.execute(text("""
+            UPDATE videos SET error_type = 'permanent'
+            WHERE fetch_status = 'failed' AND error_type IS NULL
+            AND (error_message LIKE '%404%' OR error_message LIKE '%啥都木有%')
+        """))
+        # incomplete_info: duration=0且非字幕问题
+        connection.execute(text("""
+            UPDATE videos SET error_type = 'incomplete_info'
+            WHERE fetch_status = 'failed' AND error_type IS NULL
+            AND (duration = 0 OR duration IS NULL)
+            AND (error_message NOT LIKE '%transcript%' AND error_message NOT LIKE '%subtitle%')
+        """))
+        # llm_failed
+        connection.execute(text("""
+            UPDATE videos SET error_type = 'llm_failed'
+            WHERE fetch_status = 'failed' AND error_type IS NULL
+            AND error_message LIKE '%LLM analysis failed%'
+        """))
+        # transcript
+        connection.execute(text("""
+            UPDATE videos SET error_type = 'transcript'
+            WHERE fetch_status = 'failed' AND error_type IS NULL
+            AND (error_message LIKE '%transcript%' OR error_message LIKE '%subtitle%')
+        """))
+        # 剩余未分类的标记为unknown
+        connection.execute(text("""
+            UPDATE videos SET error_type = 'unknown'
+            WHERE fetch_status = 'failed' AND error_type IS NULL
+        """))
 
-    # #2: analysis_status 数据修复——独立执行，不受分支条件限制
-    connection.execute(text("""
-        UPDATE videos SET analysis_status = 'completed'
-        WHERE fetch_status = 'ok'
-        AND analysis_status != 'completed'
-        AND bvid IN (SELECT bvid FROM transcripts WHERE full_text IS NOT NULL AND full_text != '')
-        AND bvid IN (SELECT bvid FROM summaries WHERE summary IS NOT NULL AND summary != '')
-    """))
+        # #2: analysis_status 数据修复——独立执行，不受分支条件限制
+        connection.execute(text("""
+            UPDATE videos SET analysis_status = 'completed'
+            WHERE fetch_status = 'ok'
+            AND analysis_status != 'completed'
+            AND bvid IN (SELECT bvid FROM transcripts WHERE full_text IS NOT NULL AND full_text != '')
+            AND bvid IN (SELECT bvid FROM summaries WHERE summary IS NOT NULL AND summary != '')
+        """))
 
     # ── dirty_digests 表 ──
     if "dirty_digests" in inspector.get_table_names():

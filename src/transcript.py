@@ -5,6 +5,8 @@ import base64
 import json
 import tempfile
 import os
+import math
+import hashlib
 from pathlib import Path
 from typing import Optional
 
@@ -12,6 +14,7 @@ import httpx
 
 from src.bilibili import BiliClient, _run_curl
 from src.config import get_config, get_env
+from src.lifecycle import WorkflowError, failure_reason, before_expensive_call, work_context, content_version
 
 
 async def fetch_transcript(client: BiliClient, bvid: str, cid: int, duration: int) -> dict:
@@ -27,61 +30,73 @@ async def fetch_transcript(client: BiliClient, bvid: str, cid: int, duration: in
         {"source": "cc_subtitle"|"ai_subtitle"|"asr", "text": str, "segments": int}
     """
 
-    # Layer 1: CC字幕
+    context = work_context.get()
+    subtitle_reason = "no_track"
     try:
-        cc_url = await client.get_cc_subtitle(bvid, cid)
-        if cc_url:
-            text = await _download_subtitle(cc_url)
-            if text and text.strip():
-                print(f"[transcript] {bvid}: CC字幕命中 ({len(text)} chars)")
-                return {"source": "cc_subtitle", "text": text, "segments": 1}
+        for method, source in ((client.get_cc_subtitle, "cc_subtitle"), (client.get_subtitle_url, "ai_subtitle")):
+            subtitle_url = await method(bvid, cid)
+            if subtitle_url:
+                text = await _download_subtitle(subtitle_url, duration=duration)
+                if not text.strip():
+                    raise WorkflowError("empty_subtitle", "subtitle")
+                if context:
+                    await context.stage("subtitle", "complete", result={"source": source})
+                return {"source": source, "text": text, "segments": 1, "partial": False}
     except Exception as e:
-        print(f"[transcript] {bvid}: CC字幕降级失败: {e}")
+        reason = failure_reason(e)
+        if context:
+            await context.stage("subtitle", "blocked_auth" if reason == "auth_required" else "failed", reason=reason)
+        if reason != "auth_required":
+            raise
+        subtitle_reason = reason
+        # A wait policy cannot silently stop production before real push delivery
+        # has been acknowledged and explicitly enabled by the owner.
+        from src.authorization import auth_wait_enabled
+        if await auth_wait_enabled(context.sessions if context else None):
+            raise WorkflowError("auth_required", "subtitle") from None
 
-    # Layer 2: AI中文字幕 (需SESSDATA)
-    try:
-        ai_url = await client.get_subtitle_url(bvid, cid)
-        if ai_url:
-            text = await _download_subtitle(ai_url)
-            if text and text.strip():
-                print(f"[transcript] {bvid}: ai-zh字幕命中 ({len(text)} chars)")
-                return {"source": "ai_subtitle", "text": text, "segments": 1}
-    except Exception as e:
-        print(f"[transcript] {bvid}: AI字幕降级失败: {e}")
-
-    # Layer 3: MiMo ASR (切片≤3min)
-    # Issue #7: duration 缺失或为0时拒绝进入ASR（防止绕过60分钟限制）
+    if context and subtitle_reason == "no_track":
+        await context.stage("subtitle", "no_track", reason="no_track")
     if not duration or duration <= 0:
-        print(f"[transcript] {bvid}: duration={duration} 无效，跳过ASR")
-        return {"source": "skipped", "text": "", "segments": 0}
-    # 60分钟以上无字幕的视频跳过ASR——成本高且直播回放质量低
+        raise WorkflowError("incomplete_info", "metadata")
     if duration > 3600:
-        print(f"[transcript] {bvid}: {duration}s (>{60}min) 无字幕，跳过ASR")
-        return {"source": "skipped", "text": "", "segments": 0}
-    print(f"[transcript] {bvid}: 无字幕，降级到ASR")
+        raise WorkflowError("policy_long_video", "asr")
+    if context:
+        await context.stage("asr", "running", reason=subtitle_reason)
     asr_result = await _asr_transcribe(client, bvid, cid, duration)
     if asr_result:
+        asr_result["degraded_reason"] = subtitle_reason
         return asr_result
+    raise WorkflowError("transcript_unavailable", "asr")
 
-    return {"source": "asr", "text": "", "segments": 0}
 
-
-async def _download_subtitle(url: str) -> str:
+async def _download_subtitle(url: str, duration: int = 0) -> str:
     """下载字幕JSON并提取纯文本。使用curl避免httpx超时中断降级链。"""
     try:
         cmd = ["curl", "-s", "--max-time", "15", "-L", url]
         body, status = await _run_curl(cmd, timeout=20)
         if status and status != 200:
             print(f"[transcript] subtitle download HTTP {status}")
-            return ""
+            raise WorkflowError("subtitle_download", "subtitle")
         data = json.loads(body)
         segs = data.get("body", [])
+        if not isinstance(segs, list) or not segs:
+            raise WorkflowError("empty_subtitle", "subtitle")
+        last_start = -1.0
+        for segment in segs:
+            start, end = segment.get("from"), segment.get("to")
+            if (type(start) not in (int, float) or type(end) not in (int, float)
+                or not math.isfinite(start) or not math.isfinite(end)
+                or start < 0 or end < start or start < last_start
+                or (duration > 0 and end > duration + 5)
+                or not isinstance(segment.get("content"), str)):
+                raise WorkflowError("subtitle_integrity", "subtitle")
+            last_start = start
         # Each item: {"from": 0.0, "to": 2.0, "content": "text"}
         texts = [item.get("content", "") for item in segs]
         return " ".join(texts)
     except (TimeoutError, OSError, json.JSONDecodeError, KeyError, ValueError) as e:
-        print(f"[transcript] subtitle download failed: {e}")
-        return ""
+        raise WorkflowError("subtitle_download", "subtitle") from None
 
 
 async def _probe_duration(audio_path: str) -> float:
@@ -108,9 +123,14 @@ async def _probe_duration(audio_path: str) -> float:
 
 async def _asr_transcribe(client: BiliClient, bvid: str, cid: int, duration: int) -> Optional[dict]:
     cfg = get_config().get("asr", {})
+    context = work_context.get()
+    if context:
+        async with context.sessions() as session:
+            await context.check_scope(session)
     key = get_env("XIAOMI_API_KEY")
     if not key:
-        return None
+        raise WorkflowError("configuration_missing", "asr")
+    await before_expensive_call()
     url = await client.get_audio_url(bvid, cid)
     if not url:
         return None
@@ -126,29 +146,49 @@ async def _asr_transcribe(client: BiliClient, bvid: str, cid: int, duration: int
         actual_duration = await _probe_duration(mp3_path)
         if actual_duration <= 0:
             print(f"[transcript] {bvid}: ffprobe探测失败，拒绝ASR（防止不可信元数据）")
-            return None
+            raise WorkflowError("invalid_audio_duration", "asr")
         # #7: 硬上限——实际时长超60分钟拒绝ASR
         if actual_duration > 3600:
             print(f"[transcript] {bvid}: 实际时长{actual_duration}s (>{60}min)，跳过ASR")
-            return None
+            raise WorkflowError("policy_long_video", "asr")
         chunk_seconds = int(cfg.get("chunk_seconds", 180))
         # #5: 强制硬限制——每片不超过3分钟，不可由配置绕过
         chunk_seconds = max(1, min(chunk_seconds, 180))
         # #6: 先计算预期分片数，超限直接拒绝，不创建分片
-        expected_chunks = max(1, int(actual_duration / chunk_seconds) + 1)
+        expected_chunks = max(1, math.ceil(actual_duration / chunk_seconds - 1e-8))
         max_chunks = int(cfg.get("max_chunks", 40))
         if expected_chunks > max_chunks:
             print(f"[transcript] {bvid}: 预期分片{expected_chunks}超过上限{max_chunks}，拒绝ASR")
-            return None
+            raise WorkflowError("policy_chunk_limit", "asr")
         chunks = await _split_audio_from_file(mp3_path, chunk_seconds)
         chunk_paths = chunks  # 跟踪，finally统一清理
+        if len(chunks) != expected_chunks:
+            raise WorkflowError("incomplete_audio", "asr")
+        audio_hash = hashlib.sha256()
+        with open(mp3_path, "rb") as stream:
+            for data in iter(lambda: stream.read(1024 * 1024), b""):
+                audio_hash.update(data)
+        context = work_context.get()
+        model = (context.policy or {}).get("asr_model", cfg.get("model", "mimo-v2.5-asr")) if context else cfg.get("model", "mimo-v2.5-asr")
+        run_key = content_version("asr-v1", bvid, cid, audio_hash.hexdigest(), model,
+                                  cfg.get("api_url"), chunk_seconds, expected_chunks)
         texts = []
         for index, chunk_path in enumerate(chunks):
             try:
                 with open(chunk_path, "rb") as f:
                     chunk_data = f.read()
-                text = await _call_asr(cfg.get("api_url", "https://api.xiaomimimo.com/v1/chat/completions"),
-                    key, chunk_data, cfg.get("model", "mimo-v2.5-asr"))
+                input_hash = hashlib.sha256(chunk_data).hexdigest()
+                text = await context.load_segment(run_key, index, input_hash) if context else None
+                if text is None:
+                    await before_expensive_call()
+                    start = index * chunk_seconds
+                    end = min(actual_duration, start + chunk_seconds)
+                    if context:
+                        await context.reserve_audio(end - start)
+                    text = await _call_asr(cfg.get("api_url", "https://api.xiaomimimo.com/v1/chat/completions"),
+                        key, chunk_data, model)
+                    if text and text.strip() and context:
+                        await context.save_segment(run_key, index, input_hash, start, end, model, text.strip())
                 if not text or not text.strip():
                     raise ValueError(f"ASR segment {index + 1}/{len(chunks)} failed; transcript is incomplete")
                 texts.append(text.strip())
@@ -159,7 +199,7 @@ async def _asr_transcribe(client: BiliClient, bvid: str, cid: int, duration: int
                 except OSError:
                     pass
         chunk_paths = []  # 已全部清理
-        return {"source": "asr", "text": " ".join(texts), "segments": len(chunks)}
+        return {"source": "asr", "text": " ".join(texts), "segments": len(chunks), "partial": False}
     finally:
         # #6: 统一清理所有残留分片
         for p in chunk_paths:
@@ -212,7 +252,7 @@ async def _to_mp3_path(src_path: str) -> str:
         raise
     if proc.returncode == 0 and os.path.exists(dst_path):
         return dst_path
-    return src_path  # fallback
+    raise WorkflowError("audio_conversion", "asr")
 
 
 async def _split_audio_from_file(audio_path: str, chunk_seconds: int) -> list:
@@ -237,7 +277,9 @@ async def _split_audio_from_file(audio_path: str, chunk_seconds: int) -> list:
     # #7: 第二次探测失败→拒绝（不返回整文件作为分片）
     if total_duration <= 0:
         raise ValueError(f"ffprobe returned invalid duration for {audio_path}; refusing to split")
-    num_chunks = max(1, int(total_duration / chunk_seconds) + 1)
+    if not 1 <= chunk_seconds <= 180:
+        raise WorkflowError("invalid_chunk_size", "asr")
+    num_chunks = max(1, math.ceil(total_duration / chunk_seconds - 1e-8))
     chunk_paths = []
     try:
         for i in range(num_chunks):
@@ -268,6 +310,7 @@ async def _split_audio_from_file(audio_path: str, chunk_seconds: int) -> list:
                     os.unlink(chunk_path)
                 except OSError:
                     pass
+                raise WorkflowError("incomplete_audio", "asr")
     except BaseException:
         # #7: 分片中途异常→清理已创建的分片（覆盖CancelledError）
         for p in chunk_paths:
@@ -281,6 +324,7 @@ async def _split_audio_from_file(audio_path: str, chunk_seconds: int) -> list:
 
 async def _call_asr(api_url: str, api_key: str, audio_data: bytes, model: str) -> Optional[str]:
     """调用MiMo ASR API转写单段音频。"""
+    await before_expensive_call()
     audio_b64 = base64.b64encode(audio_data).decode("utf-8")
 
     payload = {

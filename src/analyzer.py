@@ -7,6 +7,7 @@ from typing import Optional
 import httpx
 
 from src.config import get_config, get_env
+from src.lifecycle import work_context, before_expensive_call, content_version, WorkflowError
 
 
 async def analyze_video(
@@ -33,6 +34,8 @@ async def analyze_video(
             "danmaku_keywords": [str],
         }
     """
+    if len(transcript_text) > 8000:
+        return await _analyze_long_video(title, transcript_text, comments, danmakus, duration)
     # Prepare comment text
     comment_text = ""
     if comments:
@@ -88,6 +91,56 @@ async def analyze_video(
             # JSON合法但字段缺失 → 记录警告，返回empty标记
             print(f"[analyzer] LLM返回了不完整的JSON结构，视为分析失败")
     return _empty_analysis(analysis_failed=True)
+
+
+async def _analyze_long_video(title, text, comments, danmakus, duration):
+    """Every character enters a chunk; successful chunks survive later failures."""
+    context = work_context.get()
+    parts = []
+    for index, start in enumerate(range(0, len(text), 6000)):
+        chunk = text[start:start + 6000]
+        version = content_version("long-video-v1", title, chunk)
+        name = f"analysis_part_{index}"
+        stage = await context.get_stage(name) if context else None
+        if stage and stage.state == "complete" and stage.input_version == version:
+            data = stage.result
+        else:
+            if context:
+                await context.stage(name, "running", input_version=version)
+            data = await analyze_video(f"{title}（第{index + 1}段）", chunk, [], [], duration)
+            if data.get("analysis_failed"):
+                raise WorkflowError("llm_failed", name)
+            if context:
+                await context.stage(name, "complete", result=data, input_version=version)
+        # Bounded intermediate summaries preserve coverage without re-sending all
+        # source text or permitting an unbounded model-generated intermediate.
+        parts.append({"part": index + 1, "summary": data["summary"][:2000],
+            **{key: [value[:500] for value in data.get(key, [])[:8]]
+               for key in ("key_points", "risk_warnings", "data_citations")}})
+    combined = "以下为按原文顺序完整覆盖视频的各段分析，请综合全部段落：\n" + json.dumps(parts, ensure_ascii=False)
+    if len(combined) >= len(text):
+        raise WorkflowError("analysis_intermediate_too_large", "analysis")
+    return await analyze_video(title, combined, comments, danmakus, duration)
+
+
+async def analyze_interactions(comments, danmakus):
+    """Refresh social fields without regenerating the published video summary."""
+    comment_text = "\n".join(str(item.get("content", {}).get("message", ""))[:500] for item in comments[:20])
+    danmaku_text = "\n".join(str(item)[:200] for item in danmakus[:500])
+    prompt = f"""只分析以下评论和弹幕，不生成视频正文摘要。输入为空表示没有可分析样本。
+评论：{comment_text[:3000]}
+弹幕：{danmaku_text[:3000]}
+输出JSON，仅包含 comment_sentiment、danmaku_sentiment（各为bullish/bearish/neutral概率，总和1）、comment_keywords、danmaku_keywords（字符串数组）。"""
+    response = await _call_llm(prompt)
+    data = _try_parse_json(response) if response else None
+    if data is None:
+        return None
+    validated = _empty_analysis()
+    validated["summary"] = "interaction-only validation"
+    validated.update(data)
+    if not _validate_analysis(validated):
+        return None
+    return {key: validated[key] for key in ("comment_sentiment", "danmaku_sentiment", "comment_keywords", "danmaku_keywords")}
 
 
 async def analyze_dynamic(content: str) -> dict:
@@ -193,12 +246,16 @@ async def _call_llm(prompt: str) -> Optional[str]:
     cfg = get_config()
     llm_cfg = cfg.get("llm", {})
     api_url = llm_cfg.get("api_url", "https://api.xiaomimimo.com/v1/chat/completions")
-    model = llm_cfg.get("model", "mimo-v2.5-pro")
+    context = work_context.get()
+    model = (context.policy or {}).get("llm_model", llm_cfg.get("model", "mimo-v2.6-flash")) if context else llm_cfg.get("model", "mimo-v2.6-flash")
     api_key = get_env("XIAOMI_API_KEY")
 
     if not api_key:
         print("[analyzer] XIAOMI_API_KEY not set")
         return None
+    await before_expensive_call()
+    if context:
+        await context.reserve_llm()
 
     payload = {
         "model": model,

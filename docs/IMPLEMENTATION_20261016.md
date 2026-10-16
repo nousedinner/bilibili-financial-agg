@@ -50,6 +50,8 @@
 
 09:38 继续工作时，公网健康检查仍为 200 / 1.1.0，生产镜像保持最终版本，容器健康且重启次数为 0。Android lint 指出的通知权限竞态已补上发送前显式检查和 SecurityException 处理；不会用忽略 lint 的方式压掉错误。最终验证包与 `android-jvm-results.xml`、`android-lint-results.xml`、`android-final-verified.log` 一起归档。
 
+09:42 最终在线复核：命名锁仍持有，代次 2 的租约持续更新；授权检查在 09:34 独立执行，状态仍明确无效，保留一条待发告警。新任务、阶段、ASR 片段和费用记录仍为 0。健康、授权、任务状态三个接口均为 200，详细证据为 `live-final-verification.json`。手机仍未列出，不将未执行的安装、通知及扫码步骤记为通过。
+
 ## 备份与回滚
 
 VPS 备份目录为 `/home/zzy/bilibili-financial-agg/backups/20261016-implementation/production-before`，包含原源码/配置归档、完整 SQL 和运行元数据，私密文件限制为 600。保留镜像 `fin-agg-rollback:20261016`。新表使用临时迁移账号创建，完成后删除该账号，运行账号继续只有数据读写权限。

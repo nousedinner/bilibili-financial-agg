@@ -27,7 +27,7 @@ from src.models import Base, Blogger, Video, Summary, Dynamic, DailyDigest, Tran
 
 class Acceptance(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        from src import workflow, collection, pipeline, authorization, ownership, lifecycle
+        from src import workflow, collection, pipeline, authorization, ownership, lifecycle, auth_routes
         self.previous_config = copy.deepcopy(config._CONFIG)
         self.temp = tempfile.TemporaryDirectory(prefix='fin-workflow-tests-')
         config._CONFIG = copy.deepcopy(config._CONFIG)
@@ -40,7 +40,7 @@ class Acceptance(unittest.IsolatedAsyncioTestCase):
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
         self.patches = [patch.object(main, 'async_session', self.sessions), patch.object(fetcher, 'async_session', self.sessions)]
         self.patches += [patch.object(module, 'now', lambda: self.at)
-                         for module in (workflow, collection, pipeline, authorization, ownership, lifecycle)]
+                         for module in (workflow, collection, pipeline, authorization, ownership, lifecycle, auth_routes)]
         for p in self.patches:
             p.start()
         main.app.dependency_overrides[main.require_api_key] = lambda: None

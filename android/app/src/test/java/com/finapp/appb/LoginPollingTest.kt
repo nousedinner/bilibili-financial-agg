@@ -1,6 +1,6 @@
 package com.finapp.appb
 
-import com.finapp.appb.data.repository.ManagementException
+import com.finapp.appb.data.repository.BiliAuthorizationException
 import com.finapp.appb.data.repository.waitForBiliLogin
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
@@ -15,7 +15,7 @@ class LoginPollingTest {
         var notices = 0
         val complete = waitForBiliLogin(180, poll = {
             when (++attempts) {
-                1 -> throw ManagementException("temporary exchange",503)
+                1 -> throw BiliAuthorizationException("temporary exchange",503)
                 2 -> throw IOException("network interrupted")
                 else -> true
             }
@@ -39,15 +39,15 @@ class LoginPollingTest {
         assertEquals(45000L,elapsed)
     }
 
-    @Test fun wrongManagementKeyEndsTheAttemptWithoutAutomaticRetry() = runBlocking {
+    @Test fun permanentAuthorizationRejectionEndsTheAttemptWithoutAutomaticRetry() = runBlocking {
         var elapsed = 0L
         var attempts = 0
         try {
-            waitForBiliLogin(180,poll = { attempts++; throw ManagementException("wrong key",403) },
+            waitForBiliLogin(180,poll = { attempts++; throw BiliAuthorizationException("authorization rejected",403) },
                 onTemporaryFailure = { fail("Permanent authorization errors must not retry") },
                 clock = { elapsed },pause = { elapsed += it })
             fail("Expected the authorization error")
-        } catch (error: ManagementException) {
+        } catch (error: BiliAuthorizationException) {
             assertEquals(403,error.status)
             assertEquals(1,attempts)
         }

@@ -16,7 +16,7 @@ import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
 class ApiException(val status: Int, message: String) : IOException(message)
-class ManagementException(message: String, val status: Int = 0) : IOException(message)
+class BiliAuthorizationException(message: String, val status: Int = 0) : IOException(message)
 class SessionChangedException : CancellationException("Session switched")
 fun Throwable.isAuthError() = this is ApiException && status in listOf(401, 403)
 fun Throwable.canUseCache() = this is IOException && (this !is ApiException || status >= 500)
@@ -125,9 +125,9 @@ class FinRepository(private val prefs: ConnectionStore, private val cache: Conte
         if (current !== session) throw SessionChangedException()
     }
 
-    private fun <T> payload(response: Response<ApiResponse<T>>, management: Boolean = false): T {
-        if (management && response.code() in listOf(403,409,410,429,502,503)) throw ManagementException(when(response.code()) {
-            403 -> "独立管理密钥不正确，阅读连接保持不变"
+    private fun <T> payload(response: Response<ApiResponse<T>>, authorizationFlow: Boolean = false): T {
+        if (authorizationFlow && response.code() in listOf(403,409,410,429,502,503)) throw BiliAuthorizationException(when(response.code()) {
+            403 -> "服务器暂未允许这次 B 站授权，请稍后重试"
             409 -> "授权会话或版本已变化，请刷新状态后重新开始"
             410 -> "二维码已过期，请重新发起授权"
             429 -> "请稍后检查授权结果"
@@ -148,13 +148,13 @@ class FinRepository(private val prefs: ConnectionStore, private val cache: Conte
         call: suspend (FinApiService) -> Response<ApiResponse<T>>,
         save: suspend (T) -> Unit = {},
         fallback: (suspend () -> T?)? = null,
-        management: Boolean = false
+        authorizationFlow: Boolean = false
     ): Result<T> {
         var session: Session? = null
         return try {
             val active = mutex.withLock { initialized() ?: throw ApiException(401, "请先配置连接") }
             session = active
-            val data = payload(call(active.api), management)
+            val data = payload(call(active.api), authorizationFlow)
             mutex.withLock { checkSession(active); save(data) }
             Result.success(data)
         } catch (e: CancellationException) { throw e } catch (e: Exception) {
@@ -323,12 +323,12 @@ class FinRepository(private val prefs: ConnectionStore, private val cache: Conte
     suspend fun serverAlerts() = request({ it.alerts() })
     suspend fun testPush() = request({ it.testPush() })
     suspend fun acknowledgeAlert(id: String) = request({ it.acknowledgeAlert(id) })
-    private fun verifyManagementDestination(api: FinApiService, server: String) {
-        require(server.startsWith("https://") || (com.finapp.appb.BuildConfig.DEBUG && java.net.URI(server).host in listOf("localhost","127.0.0.1"))) { "管理授权需要 HTTPS" }
+    private fun verifyAuthorizationDestination(api: FinApiService, server: String) {
+        require(server.startsWith("https://") || (com.finapp.appb.BuildConfig.DEBUG && java.net.URI(server).host in listOf("localhost","127.0.0.1"))) { "服务器授权需要 HTTPS" }
         if (current?.api !== api || current?.baseUrl != server.trim().trimEnd('/') + "/") throw SessionChangedException()
     }
-    suspend fun startBiliLogin(key: String, server: String) = request({ verifyManagementDestination(it, server); it.startBiliLogin(key) }, management=true)
-    suspend fun pollBiliLogin(id: String, nonce: String, key: String, server: String) = request({ verifyManagementDestination(it, server); it.pollBiliLogin(id, LoginPollRequest(nonce), key) }, management=true)
+    suspend fun startBiliLogin(server: String) = request({ verifyAuthorizationDestination(it, server); it.startBiliLogin() }, authorizationFlow=true)
+    suspend fun pollBiliLogin(id: String, nonce: String, server: String) = request({ verifyAuthorizationDestination(it, server); it.pollBiliLogin(id, LoginPollRequest(nonce)) }, authorizationFlow=true)
     suspend fun triggerFetch(): Result<String> = request({ it.triggerFetch() }).map { it.message }
 
     // ── Video Detail: Cache-First ──

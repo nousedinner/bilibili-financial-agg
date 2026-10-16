@@ -79,25 +79,70 @@ class RepositoryTest {
         assertEquals("test-key", server.takeRequest(5, TimeUnit.SECONDS)!!.getHeader("X-API-Key"))
     }
 
-    @Test fun readingAuthorizationDoesNotTransmitManagementKey() = runBlocking {
+    @Test fun readingAuthorizationUsesOnlyTheConnectionKey() = runBlocking {
         connect()
         server.enqueue(response("""{"code":0,"data":{"state":"unknown","last_confirmed":"invalid","credential_version":2,"push":{"configured":false,"verified":false}}}"""))
         val status=repo.authorizationStatus().getOrThrow()
         assertEquals("unknown",status.state)
         assertFalse(status.push.verified)
-        assertNull(server.takeRequest(5,TimeUnit.SECONDS)!!.getHeader("X-Management-Key"))
+        val request=server.takeRequest(5,TimeUnit.SECONDS)!!
+        assertEquals("test-key",request.getHeader("X-API-Key"))
+        assertNull(request.getHeader("X-Management-Key"))
     }
 
-    @Test fun wrongManagementKeyDoesNotInvalidateReadingConnection() = runBlocking {
+    @Test fun biliAuthorizationRejectionDoesNotInvalidateReadingConnection() = runBlocking {
         connect()
         server.enqueue(MockResponse().setResponseCode(403))
-        val result=repo.startBiliLogin("separate-management-secret",server.url("/").toString())
-        assertTrue(result.exceptionOrNull() is ManagementException)
+        val result=repo.startBiliLogin(server.url("/").toString())
+        assertTrue(result.exceptionOrNull() is BiliAuthorizationException)
         val request=server.takeRequest(5,TimeUnit.SECONDS)!!
-        assertEquals("separate-management-secret",request.getHeader("X-Management-Key"))
-        assertFalse(request.path!!.contains("separate-management-secret"))
+        assertEquals("test-key",request.getHeader("X-API-Key"))
+        assertNull(request.getHeader("X-Management-Key"))
+        assertFalse(result.exceptionOrNull()!!.message!!.contains("管理密钥"))
         server.enqueue(response("""{"code":0,"data":{"state":"valid"}}"""))
         assertEquals("valid",repo.authorizationStatus().getOrThrow().state)
+    }
+
+    @Test fun loginCreationAndPollingUseTheExistingConnectionKey() = runBlocking {
+        connect()
+        val base=server.url("/").toString()
+        server.enqueue(response("""{"code":0,"data":{"id":"session-one","nonce":"TEST_LOGIN_NONCE","qr_url":"https://account.bilibili.com/scan","expires_in":180}}"""))
+        val login=repo.startBiliLogin(base).getOrThrow()
+        val start=server.takeRequest(5,TimeUnit.SECONDS)!!
+        assertEquals("/api/bili/auth/sessions",start.path)
+        assertEquals("test-key",start.getHeader("X-API-Key"))
+        assertNull(start.getHeader("X-Management-Key"))
+        server.enqueue(response("""{"code":0,"data":{"state":"awaiting_scan"}}"""))
+        assertEquals("awaiting_scan",repo.pollBiliLogin(login.id,login.nonce,base).getOrThrow().state)
+        val poll=server.takeRequest(5,TimeUnit.SECONDS)!!
+        assertEquals("/api/bili/auth/sessions/session-one/poll",poll.path)
+        assertEquals("test-key",poll.getHeader("X-API-Key"))
+        assertNull(poll.getHeader("X-Management-Key"))
+        assertEquals(login.nonce,Gson().fromJson(poll.body.readUtf8(),LoginPollRequest::class.java).nonce)
+    }
+
+    @Test fun revokedConnectionKeyDuringLoginStillInvalidatesCachedContent() = runBlocking {
+        connect();server.enqueue(response(page));repo.getFeedPage().getOrThrow();server.takeRequest(5,TimeUnit.SECONDS)
+        server.enqueue(MockResponse().setResponseCode(401))
+        val result=repo.startBiliLogin(server.url("/").toString())
+        assertTrue(result.exceptionOrNull()!!.isAuthError())
+        assertTrue(cache.feeds.isEmpty())
+    }
+
+    @Test fun switchingServersNeverSendsTheOldLoginNonceToTheNewServer() = runBlocking {
+        connect()
+        val previous=server.url("/").toString()
+        val other=MockWebServer();other.start()
+        try {
+            other.enqueue(response("""{"code":0,"data":[]}"""))
+            repo.connect(other.url("/").toString(),"other-key","owner").getOrThrow()
+            other.takeRequest(5,TimeUnit.SECONDS)
+            try {
+                repo.pollBiliLogin("old-session","OLD_SERVER_NONCE",previous)
+                fail("A login session must remain bound to its original server")
+            } catch (_:SessionChangedException) { }
+            assertNull(other.takeRequest(200,TimeUnit.MILLISECONDS))
+        } finally { other.shutdown() }
     }
 
     @Test fun compoundCursorRoundTripsAndDynamicCacheKeepsId() = runBlocking {
@@ -122,8 +167,8 @@ class RepositoryTest {
         connect()
         for (code in listOf(502,503)) {
             server.enqueue(MockResponse().setResponseCode(code))
-            val result=repo.startBiliLogin("separate-management-secret",server.url("/").toString())
-            assertTrue(result.exceptionOrNull() is ManagementException)
+            val result=repo.startBiliLogin(server.url("/").toString())
+            assertTrue(result.exceptionOrNull() is BiliAuthorizationException)
             assertFalse(result.exceptionOrNull()!!.message!!.contains(code.toString()))
             server.enqueue(response("""{"code":0,"data":{"state":"invalid"}}"""))
             assertEquals("invalid",repo.authorizationStatus().getOrThrow().state)

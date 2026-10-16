@@ -28,7 +28,7 @@ def _event(session, incident, kind, version, at):
         "occurred_at": at.isoformat()}, state="pending", created_at=at))
 
 
-async def record_auth_check(sessions, version, state, reason=None):
+async def record_auth_check(sessions, version, state, reason=None, *, only_if_unconfirmed=False):
     if state not in ("valid", "invalid", "unknown"):
         raise ValueError("Invalid authorization state")
     current_version = credential_store().current().version
@@ -42,6 +42,9 @@ async def record_auth_check(sessions, version, state, reason=None):
         row = (await session.execute(select(AuthState).where(AuthState.id == 1).with_for_update())).scalar_one_or_none()
         if row and row.credential_version > version:
             return {"ignored": "stale_credential"}
+        if (only_if_unconfirmed and row and row.credential_version == version
+                and row.checked_at is not None):
+            return {"ignored": "existing_authorization_evidence"}
         if row is None:
             row = AuthState(id=1, credential_version=version, state="unknown")
             session.add(row)

@@ -48,7 +48,6 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             try {
                 com.finapp.appb.notifications.AuthorizationNotifications.disable(app)
-                com.finapp.appb.data.local.ManagementKeyStore(app).clear()
                 repo.logout(); onComplete()
             }
             catch (e: kotlinx.coroutines.CancellationException) { throw e }

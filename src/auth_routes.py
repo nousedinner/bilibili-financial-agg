@@ -7,7 +7,7 @@ import secrets
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
@@ -68,18 +68,6 @@ def _validated_login_qr(data):
 def build_router(api_dependency, sessions_getter, guard_getter):
     router = APIRouter(dependencies=[Depends(api_dependency)])
 
-    async def management(x_management_key: str | None = Header(None)):
-        key = get_env("FIN_AGG_MANAGEMENT_KEY")
-        if not key:
-            from pathlib import Path
-            path = Path(get_env("FIN_AGG_MANAGEMENT_KEY_FILE", "/app/data/management-key"))
-            if path.is_file():
-                key = path.read_text(encoding="utf-8").strip()
-        if not key:
-            raise HTTPException(503, "尚未配置管理密钥")
-        if not x_management_key or not secrets.compare_digest(x_management_key, key):
-            raise HTTPException(403, "需要独立管理密钥")
-
     @asynccontextmanager
     async def owned():
         guard = guard_getter()
@@ -108,7 +96,7 @@ def build_router(api_dependency, sessions_getter, guard_getter):
                     "gap_from": scan.gap_from.isoformat() if scan.gap_from else None,
                     "gap_until": scan.gap_until.isoformat() if scan.gap_until else None} for scan in scans]}}
 
-    @router.post("/api/bili/auth/check", dependencies=[Depends(management)])
+    @router.post("/api/bili/auth/check")
     async def auth_check():
         async with owned():
             await check_authorization(sessions_getter())
@@ -175,7 +163,7 @@ def build_router(api_dependency, sessions_getter, guard_getter):
             await session.commit()
         return {"code": 0, "data": {"acknowledged": True}}
 
-    @router.post("/api/bili/auth/sessions", dependencies=[Depends(management)])
+    @router.post("/api/bili/auth/sessions")
     async def create_login():
         async with owned():
             async with _login_client() as client:
@@ -191,7 +179,7 @@ def build_router(api_dependency, sessions_getter, guard_getter):
                 await session.commit()
         return {"code": 0, "data": {"id": session_id, "nonce": nonce, "qr_url": qr_url, "expires_in": 180}}
 
-    @router.post("/api/bili/auth/sessions/{session_id}/poll", dependencies=[Depends(management)])
+    @router.post("/api/bili/auth/sessions/{session_id}/poll")
     async def poll_login(session_id: str, req: LoginPoll):
         # The upstream QR and exchange ticket are one-use. Serialize this one
         # session without holding database/fencing locks over network calls.
@@ -210,8 +198,8 @@ def build_router(api_dependency, sessions_getter, guard_getter):
                     await session.commit()
                     # If the response/state write was interrupted after the
                     # validated file swap, reconcile it without consuming QR again.
-                    if credential_store().current().version == completed_version:
-                        await record_auth_check(sessions_getter(), completed_version, "valid")
+                    if credential_store().current().version == completed_version and row.expires_at > now():
+                        await record_auth_check(sessions_getter(), completed_version, "valid", only_if_unconfirmed=True)
                     return {"code": 0, "data": {"state": "complete", "credential_version": completed_version}}
                 if row.expires_at <= now() or row.state == "expired":
                     login_checkpoint.delete(session_id)
@@ -220,9 +208,29 @@ def build_router(api_dependency, sessions_getter, guard_getter):
                     raise HTTPException(429, "请稍后检查授权结果")
                 row.last_polled_at = now()
                 qr_key, expected_version, expires_at = row.qrcode_key, row.credential_version, row.expires_at
-                if credential_store().current().version != expected_version:
+                current_credential = credential_store().current()
+                if current_credential.version != expected_version:
+                    if current_credential.version == expected_version + 1:
+                        try:
+                            saved = login_checkpoint.load(session_id, expected_version, expires_at)
+                        except (ValueError, OSError):
+                            raise HTTPException(503, "授权恢复记录暂时不可用，请稍后重试") from None
+                        try:
+                            committed = CredentialStore._parse(saved.get('candidate'), expected_version + 1) if saved else None
+                        except ValueError:
+                            committed = None
+                        if committed == current_credential:
+                            # File replacement succeeded but the final DB transaction
+                            # did not. Only this session's exact verified candidate
+                            # may reconcile the committed version without another QR.
+                            row.state, row.qrcode_key = "complete", ""
+                            await session.commit()
+                            login_checkpoint.delete(session_id)
+                            await record_auth_check(sessions_getter(), current_credential.version, "valid", only_if_unconfirmed=True)
+                            return {"code": 0, "data": {"state": "complete", "credential_version": current_credential.version}}
                     login_checkpoint.delete(session_id)
                     raise HTTPException(409, "授权版本已变化，请重新发起登录")
+                expected_uid = get_env("BILI_UID") or current_credential.dedeuserid
                 await session.commit()
             async def checkpoint(payload):
                 async with sessions_getter()() as session:
@@ -263,7 +271,7 @@ def build_router(api_dependency, sessions_getter, guard_getter):
                 # nav account identity must be checked separately from a user-supplied cookie label.
                 nav = await client._get("https://api.bilibili.com/x/web-interface/nav", signed=False)
                 actual_uid = str(nav.get("data", {}).get("mid", ""))
-                if actual_uid != candidate["dedeuserid"] or (get_env("BILI_UID") and actual_uid != get_env("BILI_UID")):
+                if actual_uid != candidate["dedeuserid"] or (expected_uid and actual_uid != expected_uid):
                     raise HTTPException(409, "授权账号与服务器采集账号不一致")
             async with sessions_getter()() as session:
                 await fence(session)
@@ -275,10 +283,10 @@ def build_router(api_dependency, sessions_getter, guard_getter):
                 row.state, row.qrcode_key = "complete", ""
                 await session.commit()
                 login_checkpoint.delete(session_id)
-            await record_auth_check(sessions_getter(), credential.version, "valid")
+            await record_auth_check(sessions_getter(), credential.version, "valid", only_if_unconfirmed=True)
         return {"code": 0, "data": {"state": "complete", "credential_version": credential.version}}
 
-    @router.post("/api/work/retry", dependencies=[Depends(management)])
+    @router.post("/api/work/retry")
     async def explicit_retry(req: ManualRetry):
         from src.workflow import create_batch, admit, freeze_batch
         from src.lifecycle import HARD_SINCE

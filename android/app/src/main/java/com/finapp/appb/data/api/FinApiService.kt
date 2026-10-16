@@ -9,9 +9,9 @@ interface FinApiService {
     @GET("api/notifications/events") suspend fun alerts(): Response<ApiResponse<List<ServerAlert>>>
     @POST("api/notifications/test") suspend fun testPush(): Response<ApiResponse<Map<String, Any>>>
     @POST("api/notifications/events/{id}/ack") suspend fun acknowledgeAlert(@Path("id") id: String): Response<ApiResponse<Map<String, Any>>>
-    @POST("api/bili/auth/sessions") suspend fun startBiliLogin(@Header("X-Management-Key") key: String): Response<ApiResponse<LoginStart>>
-    @POST("api/bili/auth/sessions/{id}/poll") suspend fun pollBiliLogin(@Path("id") id: String, @Body req: LoginPollRequest,
-        @Header("X-Management-Key") key: String): Response<ApiResponse<LoginState>>
+    @POST("api/bili/auth/sessions") suspend fun startBiliLogin(): Response<ApiResponse<LoginStart>>
+    @POST("api/bili/auth/sessions/{id}/poll") suspend fun pollBiliLogin(@Path("id") id: String,
+        @Body req: LoginPollRequest): Response<ApiResponse<LoginState>>
 
     // ── System ──
     @GET("api/health")

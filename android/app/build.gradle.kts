@@ -25,8 +25,8 @@ android {
         manifestPlaceholders["appLabel"] = if (authorizationPoc) "财经聚合验证" else "财经聚合"
         minSdk = 26
         targetSdk = 34
-        versionCode = 4
-        versionName = "1.1.2"
+        versionCode = 5
+        versionName = "1.1.3"
         buildConfigField("String", "FIREBASE_APP_ID", pushValue("appId"))
         buildConfigField("String", "FIREBASE_API_KEY", pushValue("apiKey"))
         buildConfigField("String", "FIREBASE_PROJECT_ID", pushValue("projectId"))

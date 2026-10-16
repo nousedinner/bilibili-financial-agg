@@ -5,7 +5,7 @@ import kotlinx.coroutines.delay
 import java.io.IOException
 
 internal fun Throwable.retryableLoginPoll(): Boolean = when (this) {
-    is ManagementException -> status in listOf(429, 502, 503)
+    is BiliAuthorizationException -> status in listOf(429, 502, 503)
     is ApiException -> status in 500..599
     is IOException -> true
     else -> false

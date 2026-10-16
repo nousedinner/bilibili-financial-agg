@@ -15,9 +15,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.finapp.appb.notifications.AuthorizationNotifications
 import com.finapp.appb.viewmodel.AuthorizationViewModel
@@ -27,7 +24,6 @@ import com.finapp.appb.viewmodel.AuthorizationViewModel
 fun AuthorizationScreen(viewModel: AuthorizationViewModel, onBack: () -> Unit) {
     val state by viewModel.state.collectAsState()
     val context = LocalContext.current
-    var key by remember { mutableStateOf("") }
     var savedMessage by remember { mutableStateOf<String?>(null) }
     val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { viewModel.enableNotifications() }
     val document = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("image/png")) { uri ->
@@ -48,11 +44,7 @@ fun AuthorizationScreen(viewModel: AuthorizationViewModel, onBack: () -> Unit) {
                 OutlinedButton(onClick={viewModel.testNotification()},modifier=Modifier.fillMaxWidth()) { Text("测试即时推送") }
             }
             HorizontalDivider()
-            OutlinedTextField(value=key,onValueChange={key=it},label={Text(if(state.keySaved) "替换管理密钥（可留空）" else "服务器独立管理密钥")},
-                singleLine=true,visualTransformation=PasswordVisualTransformation(),keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Password),modifier=Modifier.fillMaxWidth())
-            TextButton(onClick={viewModel.saveKey(key);key=""},enabled=key.isNotBlank()) { Text("保存管理密钥") }
-            Button(onClick={viewModel.startLogin()},enabled=!state.busy && state.keySaved,modifier=Modifier.fillMaxWidth()) { Text("重新授权服务器") }
-            if(!state.keySaved) Text("先保存当前服务器的独立管理密钥，即可重新授权。")
+            Button(onClick={viewModel.startLogin()},enabled=!state.busy,modifier=Modifier.fillMaxWidth()) { Text("重新授权服务器") }
             if(state.busy) LinearProgressIndicator(modifier=Modifier.fillMaxWidth())
             state.qr?.let { bitmap ->
                 Image(bitmap.asImageBitmap(),contentDescription="服务器授权二维码",modifier=Modifier.fillMaxWidth().height(260.dp))

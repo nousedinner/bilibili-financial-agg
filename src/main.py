@@ -155,7 +155,7 @@ async def _scheduled_digest():
 
 app = FastAPI(
     title="B站财经博主聚合服务",
-    version="1.1.2",
+    version="1.1.3",
     lifespan=lifespan,
 )
 
@@ -652,7 +652,7 @@ async def health():
         return JSONResponse(status_code=503, content={"status": "degraded",
             "reason": "job status write failed",
             "pending_jobs": [p["job_id"] for p in pending]})
-    return {"status": "ok", "db": "connected", "version": "1.1.2"}
+    return {"status": "ok", "db": "connected", "version": "1.1.3"}
 
 
 @app.get("/api/status", dependencies=[Depends(require_api_key)])

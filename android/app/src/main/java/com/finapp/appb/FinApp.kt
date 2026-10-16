@@ -7,6 +7,7 @@ import com.finapp.appb.data.repository.FinRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 class FinApp : Application() {
     val preferences by lazy { UserPreferences(this) }
@@ -18,6 +19,7 @@ class FinApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        appScope.launch { com.finapp.appb.data.local.removeLegacyManagementKey(this@FinApp) }
         com.finapp.appb.notifications.AuthorizationNotifications.start(this)
         // Only initialize session; data loading is handled by ViewModels (cache-first)
     }

@@ -155,7 +155,7 @@ async def _scheduled_digest():
 
 app = FastAPI(
     title="B站财经博主聚合服务",
-    version="1.1.1",
+    version="1.1.2",
     lifespan=lifespan,
 )
 
@@ -652,7 +652,7 @@ async def health():
         return JSONResponse(status_code=503, content={"status": "degraded",
             "reason": "job status write failed",
             "pending_jobs": [p["job_id"] for p in pending]})
-    return {"status": "ok", "db": "connected", "version": "1.1.1"}
+    return {"status": "ok", "db": "connected", "version": "1.1.2"}
 
 
 @app.get("/api/status", dependencies=[Depends(require_api_key)])
@@ -692,6 +692,8 @@ class BackfillRequest(BaseModel):
     since: date
     until: Optional[date] = None
     mid: Optional[int] = Field(None, gt=0, le=9223372036854775807)
+    max_videos: Optional[int] = Field(None, ge=1, le=200)
+    max_pages: int = Field(50, ge=1, le=200)
 
 
 @app.post("/api/fetch/backfill", dependencies=[Depends(require_api_key)])
@@ -709,7 +711,8 @@ async def trigger_backfill(req: BackfillRequest):
             if not b or not b.enabled:
                 raise HTTPException(404, "博主不存在或已禁用")
     frozen_until = min(_utcnow(), datetime.combine(req.until, datetime.max.time())) if req.until else _utcnow()
-    return await _submit_job("backfill", lambda: _backfill_work(req.mid, req.since.isoformat(), until=frozen_until))
+    return await _submit_job("backfill", lambda: _backfill_work(req.mid, req.since.isoformat(),
+        until=frozen_until, max_videos=req.max_videos, max_pages=req.max_pages))
 
 
 async def _run_backfill_task(mid: int = None, since: str = "2026-07-01"):
@@ -737,13 +740,13 @@ async def _retry_transcripts_task():
 
 async def _recover_interrupted():
     async with async_session() as session:
+        from src.lifecycle import fence
+        await fence(session)
         # 标记残留的running/queued记录为interrupted
         await session.execute(update(FetchJob).where(
             FetchJob.status.in_(["running", "queued"])).values(
             status="interrupted", finished_at=_utcnow(), error_message="Service restarted"))
         from src.models import VideoWork, WorkStage, AlertDelivery
-        from src.lifecycle import fence
-        await fence(session)
         # Restart recovery is restricted to explicitly admitted new work. Legacy
         # videos and their retry counters remain untouched.
         await session.execute(update(VideoWork).where(VideoWork.state == "running").values(
@@ -769,6 +772,14 @@ async def _reserve_job(kind):
     if _job_lock.locked():
         raise HTTPException(409, "已有采集或补算任务正在运行")
     await _job_lock.acquire()
+
+
+async def _fence_job_registration(session):
+    if _owner_guard is not None:
+        await _owner_guard.ticket().fence(session)
+    else:
+        from src.lifecycle import fence
+        await fence(session)
 
 
 async def _execute_job(job_id, work):
@@ -857,6 +868,7 @@ async def _run_job(kind, work):
                 skipped = FetchJob(id=str(uuid4()), kind=kind, status="skipped",
                     started_at=_utcnow(), finished_at=_utcnow(),
                     error_message="Busy: another task holds the lock")
+                await _fence_job_registration(session)
                 session.add(skipped)
                 await session.commit()
             logger.info(f"[scheduler] {kind}: busy, recorded as skipped")
@@ -867,6 +879,7 @@ async def _run_job(kind, work):
     try:
         async with async_session() as session:
             job = FetchJob(id=str(uuid4()), kind=kind, status="running", started_at=_utcnow())
+            await _fence_job_registration(session)
             session.add(job)
             await session.commit()
             job_id = job.id
@@ -882,6 +895,7 @@ async def _submit_job(kind, work):
     try:
         async with async_session() as session:
             job = FetchJob(id=str(uuid4()), kind=kind, status="running", started_at=_utcnow())
+            await _fence_job_registration(session)
             session.add(job)
             await session.commit()
             job_id = job.id
@@ -916,14 +930,16 @@ async def _digest_work():
     return result
 
 
-async def _backfill_work(mid, since, until=None):
+async def _backfill_work(mid, since, until=None, *, max_videos=None, max_pages=50):
     until = until or _utcnow()
     bloggers = [{"mid": mid}] if mid else await _get_enabled_bloggers()
     results = []
     # Issue #6: 共享预算——所有博主共用 backfill_cap
     remaining = get_config().get("data", {}).get("backfill_cap", 20)
+    if max_videos is not None:
+        remaining = min(remaining, max_videos)
     # #5: 共享页面预算——所有博主共用，防止单博主异常放大请求量
-    page_budget = {"remaining": 50}
+    page_budget = {"remaining": max_pages}
     visited = 0
     for b in bloggers:
         if remaining <= 0 or page_budget["remaining"] <= 0:

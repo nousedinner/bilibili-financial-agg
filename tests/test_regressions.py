@@ -90,6 +90,38 @@ class Regressions(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.http.get('/api/feed', params={'before': 'nan'})).status_code, 422)
         self.assertFalse(main._job_lock.locked())
 
+    async def test_manual_request_freezes_explicit_limits_before_job_execution(self):
+        async def submit(kind, work):
+            self.assertEqual(kind, 'backfill')
+            return await work()
+        worker = AsyncMock(return_value={'bounded': True})
+        with patch.object(main, '_submit_job', side_effect=submit), patch.object(main, '_backfill_work', worker):
+            response = await self.http.post('/api/fetch/backfill', json={
+                'since': '2026-09-09', 'until': '2026-09-10', 'max_videos': 2, 'max_pages': 1})
+        self.assertEqual(response.status_code, 200, response.text)
+        args, kwargs = worker.await_args
+        self.assertEqual(args, (None, '2026-09-09'))
+        self.assertEqual(kwargs['until'], datetime(2026, 9, 10, 23, 59, 59, 999999))
+        self.assertEqual((kwargs['max_videos'], kwargs['max_pages']), (2, 1))
+
+    async def test_manual_invalid_limits_never_reserve_a_job(self):
+        with patch.object(main, '_submit_job', AsyncMock()) as submit:
+            for field in ('max_videos', 'max_pages'):
+                for value in (0, 201):
+                    response = await self.http.post('/api/fetch/backfill', json={
+                        'since': '2026-09-09', field: value})
+                    self.assertEqual(response.status_code, 422, response.text)
+            submit.assert_not_awaited()
+
+    async def test_manual_requested_quota_cannot_increase_server_video_cap(self):
+        config._CONFIG.setdefault('data', {})['backfill_cap'] = 1
+        run = AsyncMock(return_value={'attempted': 1, 'failed': 0, 'has_more': False})
+        digests = AsyncMock(return_value={'failed': 0, 'generated': 0, 'has_more': False})
+        upper = datetime(2026, 9, 10, 12)
+        with patch.object(main, 'run_backfill', run), patch.object(main, 'regenerate_dirty_digests', digests):
+            await main._backfill_work(1, '2026-09-09', upper, max_videos=2, max_pages=1)
+        run.assert_awaited_once_with(1, '2026-09-09', 1, page_budget={'remaining': 1}, until=upper)
+
     async def test_video_success_updates_all_related_tables_and_dirty_date(self):
         c = self.client()
         c.get_comments.return_value = {'replies': [{'content': {'message': 'hello'}}], 'total': 99}
@@ -200,6 +232,10 @@ class Regressions(unittest.IsolatedAsyncioTestCase):
             result = await fetcher.run_backfill(42, '2026-09-01', cap=2)
         self.assertEqual(result['failed'], 2)
         self.assertEqual(process.await_count, 2)
+        async with self.sessions() as session:
+            batch = await session.get(WorkBatch, result['batch_id'])
+            self.assertEqual(batch.spent_pages, 1)
+            self.assertEqual(batch.selected_bvids, ['BV0', 'BV1'])
 
     async def test_late_content_rebuilds_original_day_and_keeps_failed_day_pending(self):
         day = fetcher._latest_closed_date() - timedelta(days=2)

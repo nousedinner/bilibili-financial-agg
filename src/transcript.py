@@ -32,6 +32,8 @@ async def fetch_transcript(client: BiliClient, bvid: str, cid: int, duration: in
 
     context = work_context.get()
     subtitle_reason = "no_track"
+    if context:
+        await context.stage("subtitle", "running", input_version=content_version(bvid, cid))
     try:
         for method, source in ((client.get_cc_subtitle, "cc_subtitle"), (client.get_subtitle_url, "ai_subtitle")):
             subtitle_url = await method(bvid, cid)

@@ -107,10 +107,12 @@ async def admit(sessions, batch_id, mid, payload, *, allow_legacy=False):
     return True
 
 
-async def freeze_batch(sessions, batch_id, *, complete=True):
+async def freeze_batch(sessions, batch_id, *, complete=True, spent_pages=None):
     async with sessions() as session:
         await fence(session)
         batch = await session.get(WorkBatch, batch_id)
+        if spent_pages is not None:
+            batch.spent_pages = spent_pages
         batch.status = "ready" if complete else "partial_discovery"
         await session.commit()
 
@@ -251,12 +253,24 @@ class WorkContext:
     async def reserve_llm(self):
         async with self.sessions() as session:
             await self.check_scope(session)
-            day = now().date()
-            usage = (await session.execute(select(DailyUsage).where(DailyUsage.day == day).with_for_update())).scalar_one_or_none()
-            if usage is None:
-                usage = DailyUsage(day=day, audio_seconds=0, llm_calls=0)
-                session.add(usage)
-            if usage.llm_calls >= int(get_config().get("limits", {}).get("daily_llm_calls", 300)):
-                raise WorkflowError("llm_budget", "analysis")
-            usage.llm_calls += 1
+            await _reserve_llm_in_transaction(session)
             await session.commit()
+
+
+async def _reserve_llm_in_transaction(session):
+    day = now().date()
+    usage = (await session.execute(select(DailyUsage).where(DailyUsage.day == day).with_for_update())).scalar_one_or_none()
+    if usage is None:
+        usage = DailyUsage(day=day, audio_seconds=0, llm_calls=0)
+        session.add(usage)
+    if usage.llm_calls >= int(get_config().get("limits", {}).get("daily_llm_calls", 300)):
+        raise WorkflowError("llm_budget", "analysis")
+    usage.llm_calls += 1
+
+
+async def reserve_global_llm(sessions):
+    """Digest and other owned model requests share the video pipeline's daily cap."""
+    async with sessions() as session:
+        await fence(session)
+        await _reserve_llm_in_transaction(session)
+        await session.commit()

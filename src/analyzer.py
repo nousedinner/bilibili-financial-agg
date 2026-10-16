@@ -7,7 +7,7 @@ from typing import Optional
 import httpx
 
 from src.config import get_config, get_env
-from src.lifecycle import work_context, before_expensive_call, content_version, WorkflowError
+from src.lifecycle import work_context, owner_context, before_expensive_call, content_version, WorkflowError
 
 
 async def analyze_video(
@@ -256,6 +256,10 @@ async def _call_llm(prompt: str) -> Optional[str]:
     await before_expensive_call()
     if context:
         await context.reserve_llm()
+    elif owner_context.get() is not None:
+        from src.db import async_session
+        from src.workflow import reserve_global_llm
+        await reserve_global_llm(async_session)
 
     payload = {
         "model": model,

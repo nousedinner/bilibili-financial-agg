@@ -43,6 +43,7 @@ from src.models import (
 )
 from src.db import async_session
 from src.config import get_config, get_env
+from src.lifecycle import fence, OwnershipLost
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,7 @@ async def outbox_replay_on_startup():
     for entry in pending:
         try:
             async with async_session() as session:
+                await fence(session)
                 job = await session.get(FetchJob, entry["job_id"])
                 if job and job.status in ("running", "queued"):
                     job.status = entry["status"]
@@ -136,6 +138,8 @@ async def outbox_replay_on_startup():
                     await session.commit()
                 outbox_pop(entry["job_id"])
                 logger.info(f"[outbox] replayed {entry['job_id']}: {entry['status']}")
+        except OwnershipLost:
+            raise
         except Exception as e:
             logger.error(f"[outbox] replay failed for {entry['job_id']}: {e}")
             try:
@@ -401,6 +405,7 @@ async def _generate_digest(bloggers: list, results: dict, target_date: date = No
 
     # Issue #11 #4: DailyDigest 保存 + DirtyDigest 删除合并为单一事务
     async with async_session() as session:
+        await fence(session)
         if digest_content:
             await session.merge(DailyDigest(digest_date=target_date, content=digest_content))
         dirty = await session.get(DirtyDigest, target_date)
@@ -488,6 +493,7 @@ async def regenerate_dirty_digests(include_latest=False):
     max_per_round = 5  # Issue #10: 每轮最多处理5个dirty日期
     async with async_session() as session:
         if include_latest and latest >= hard_since_date and await session.get(DirtyDigest, latest) is None:
+            await fence(session)
             session.add(DirtyDigest(digest_date=latest))
             await session.commit()
         # Issue #14 #6: 多查1条检测是否有待处理日期
@@ -503,9 +509,12 @@ async def regenerate_dirty_digests(include_latest=False):
         try:
             await _generate_digest(bloggers, {}, day)
             result["generated"] += 1
+        except OwnershipLost:
+            raise
         except Exception as exc:
             result["failed"] += 1
             async with async_session() as session:
+                await fence(session)
                 row = await session.get(DirtyDigest, day)
                 row.error_message = str(exc)[:500]
                 row.retry_count = (row.retry_count or 0) + 1

@@ -21,7 +21,6 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.finapp.appb.notifications.AuthorizationNotifications
 import com.finapp.appb.viewmodel.AuthorizationViewModel
-import com.finapp.appb.BuildConfig
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -43,15 +42,17 @@ fun AuthorizationScreen(viewModel: AuthorizationViewModel, onBack: () -> Unit) {
                 if (Build.VERSION.SDK_INT >= 33 && !AuthorizationNotifications.permitted(context)) permission.launch(Manifest.permission.POST_NOTIFICATIONS)
                 else viewModel.enableNotifications()
             }, modifier=Modifier.fillMaxWidth()) { Text("启用授权告警") }
-            Text(if (state.status?.push?.verified == true) "已确认收到过服务器测试推送" else "即时推送尚未完成送达确认")
-            if (AuthorizationNotifications.enabled(context)) Text("后台定期检查已启用，可能受系统省电影响而延迟。")
-            OutlinedButton(onClick={viewModel.testNotification()},modifier=Modifier.fillMaxWidth()) { Text("发送服务器测试通知") }
+            if (AuthorizationNotifications.enabled(context)) Text("已启用后台定期检查；打开 APP 也会检查授权状态。系统调度可能让提醒延迟。")
+            if (AuthorizationNotifications.pushConfigured()) {
+                Text(if (state.status?.push?.verified == true) "已确认收到过即时推送" else "可选的即时推送尚未完成送达确认")
+                OutlinedButton(onClick={viewModel.testNotification()},modifier=Modifier.fillMaxWidth()) { Text("测试即时推送") }
+            }
             HorizontalDivider()
             OutlinedTextField(value=key,onValueChange={key=it},label={Text(if(state.keySaved) "替换管理密钥（可留空）" else "服务器独立管理密钥")},
                 singleLine=true,visualTransformation=PasswordVisualTransformation(),keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Password),modifier=Modifier.fillMaxWidth())
             TextButton(onClick={viewModel.saveKey(key);key=""},enabled=key.isNotBlank()) { Text("保存管理密钥") }
-            Button(onClick={viewModel.startLogin()},enabled=!state.busy && BuildConfig.AUTHORIZATION_POC,modifier=Modifier.fillMaxWidth()) { Text("重新授权服务器") }
-            if(!BuildConfig.AUTHORIZATION_POC) Text("同机授权入口待实际手机验证后启用，当前不会替换服务器凭据。")
+            Button(onClick={viewModel.startLogin()},enabled=!state.busy && state.keySaved,modifier=Modifier.fillMaxWidth()) { Text("重新授权服务器") }
+            if(!state.keySaved) Text("先保存当前服务器的独立管理密钥，即可重新授权。")
             if(state.busy) LinearProgressIndicator(modifier=Modifier.fillMaxWidth())
             state.qr?.let { bitmap ->
                 Image(bitmap.asImageBitmap(),contentDescription="服务器授权二维码",modifier=Modifier.fillMaxWidth().height(260.dp))
@@ -73,7 +74,7 @@ fun AuthorizationScreen(viewModel: AuthorizationViewModel, onBack: () -> Unit) {
                         } catch(error:Exception) { savedMessage=error.message ?: "保存失败" }
                     } else document.launch("财经聚合授权.png")
                 },modifier=Modifier.fillMaxWidth()) { Text("保存二维码到相册") }
-                Text("二维码有效期约三分钟。手机上的确认流程仍需实际验证，完成前不会替换服务器凭据。")
+                Text("二维码有效期约三分钟。在哔哩哔哩确认后返回此页，等待显示授权成功；服务器验证通过后才会更新会话。")
             }
             state.message?.let { Text(it) }
             savedMessage?.let { Text(it) }

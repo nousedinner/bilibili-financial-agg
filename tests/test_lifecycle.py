@@ -80,6 +80,29 @@ class Lifecycle(unittest.IsolatedAsyncioTestCase):
         client.get_video_info.assert_not_awaited()
         self.assertEqual(await self.count(Video),0)
 
+    async def test_repeated_subtitle_failure_exhausts_only_its_own_stage(self):
+        await self.admit()
+        client = self.client()
+        client.get_cc_subtitle = AsyncMock(side_effect=bilibili.BiliAPIError(-352, 'fixture risk block'))
+        client.get_subtitle_url = AsyncMock(return_value=None)
+        with patch.object(transcript, '_asr_transcribe', AsyncMock()) as asr, \
+                patch.object(fetcher, 'analyze_video', AsyncMock()) as llm:
+            for _ in range(3):
+                with self.assertRaises(bilibili.BiliAPIError):
+                    await fetcher._process_video(client, 1, self.payload())
+            with self.assertRaisesRegex(WorkflowError, 'retry_exhausted'):
+                await fetcher._process_video(client, 1, self.payload())
+        client.get_cc_subtitle.assert_awaited()
+        self.assertEqual(client.get_cc_subtitle.await_count, 3)
+        asr.assert_not_awaited()
+        llm.assert_not_awaited()
+        async with self.sessions() as db:
+            self.assertEqual((await db.get(WorkStage, ('BVnew', 'subtitle'))).attempts, 3)
+            self.assertEqual((await db.get(WorkStage, ('BVnew', 'metadata'))).attempts, 1)
+            self.assertEqual((await db.get(WorkStage, ('BVnew', 'asr'))).attempts, 0)
+            self.assertEqual((await db.get(VideoWork, 'BVnew')).state, 'exhausted')
+            self.assertIsNone(await db.get(Summary, 'BVnew'))
+
     async def test_hard_and_recent_boundaries_reject_before_queue_creation(self):
         batch=await workflow.create_batch(self.sessions,origin='incremental',since=automatic_floor(self.at),until=self.at)
         for age in (timedelta(days=8),timedelta(days=200)):
@@ -554,6 +577,87 @@ class Lifecycle(unittest.IsolatedAsyncioTestCase):
         finally:
             owner_context.reset(token)
             await guard.close()
+
+    async def test_digest_result_cannot_publish_after_generation_changes(self):
+        day = self.at.date()
+        async with self.sessions() as db:
+            db.add_all([Blogger(mid=1, name='fixture', enabled=True),
+                Video(bvid='BVdigest', mid=1, title='fixture', publish_time=self.at, fetch_status='ok'),
+                Summary(bvid='BVdigest', summary='fixture'),
+                DailyDigest(digest_date=day, content={'summary': 'old'}), DirtyDigest(digest_date=day)])
+            await db.commit()
+        guard = OwnerGuard(self.engine, self.sessions, heartbeat_seconds=3600)
+        await guard.start()
+        token = owner_context.set(guard.ticket())
+        async def response(_):
+            await guard.acquire()
+            return {'summary': 'new', 'overall_sentiment': 'neutral', 'overall_sentiment_desc': '',
+                    'consensus': [], 'differences': [], 'key_topics': []}
+        try:
+            with patch.object(fetcher, 'generate_daily_digest', side_effect=response):
+                with self.assertRaises(OwnershipLost):
+                    await fetcher._generate_digest([{'mid': 1, 'name': 'fixture'}], {}, day)
+        finally:
+            owner_context.reset(token)
+            await guard.close()
+        async with self.sessions() as db:
+            self.assertEqual((await db.get(DailyDigest, day)).content['summary'], 'old')
+            self.assertIsNotNone(await db.get(DirtyDigest, day))
+
+    async def test_stale_outbox_replay_preserves_intent_and_job_state(self):
+        async with self.sessions() as db:
+            db.add(FetchJob(id='stale-outbox', kind='fixture', status='running'))
+            await db.commit()
+        self.assertTrue(fetcher.outbox_save('stale-outbox', 'completed', {'processed': 1}))
+        guard = OwnerGuard(self.engine, self.sessions, heartbeat_seconds=3600)
+        await guard.start()
+        old = guard.ticket()
+        await guard.acquire()
+        token = owner_context.set(old)
+        try:
+            with self.assertRaises(OwnershipLost):
+                await fetcher.outbox_replay_on_startup()
+        finally:
+            owner_context.reset(token)
+            await guard.close()
+        async with self.sessions() as db:
+            self.assertEqual((await db.get(FetchJob, 'stale-outbox')).status, 'running')
+        self.assertEqual([entry['job_id'] for entry in fetcher.outbox_pending()], ['stale-outbox'])
+
+    async def test_digest_model_request_uses_the_shared_daily_limit(self):
+        from src import db as database
+        config._CONFIG.setdefault('limits', {})['daily_llm_calls'] = 1
+        guard = OwnerGuard(self.engine, self.sessions, heartbeat_seconds=3600)
+        await guard.start()
+        token = owner_context.set(guard.ticket())
+        try:
+            await workflow.reserve_global_llm(self.sessions)
+            with patch.object(database, 'async_session', self.sessions), patch.object(analyzer.httpx, 'AsyncClient') as network:
+                with self.assertRaisesRegex(WorkflowError, 'llm_budget'):
+                    await analyzer._call_llm('fixture digest')
+                network.assert_not_called()
+        finally:
+            owner_context.reset(token)
+            await guard.close()
+        async with self.sessions() as db:
+            self.assertEqual((await db.get(DailyUsage, self.at.date())).llm_calls, 1)
+
+    async def test_stale_job_registration_releases_the_local_lock(self):
+        guard = OwnerGuard(self.engine, self.sessions, heartbeat_seconds=3600)
+        await guard.start()
+        old = guard.ticket()
+        await guard.acquire()
+        token = owner_context.set(old)
+        worker = AsyncMock()
+        try:
+            with self.assertRaises(OwnershipLost):
+                await main._submit_job('fixture', worker)
+        finally:
+            owner_context.reset(token)
+            await guard.close()
+        worker.assert_not_awaited()
+        self.assertFalse(main._job_lock.locked())
+        self.assertEqual(await self.count(FetchJob), 0)
 
     async def test_long_transcript_tail_enters_a_model_request(self):
         text='A'*8000+'CRITICAL_TAIL_FACT'

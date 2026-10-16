@@ -42,7 +42,7 @@ class AuthorizationViewModel(application: Application) : AndroidViewModel(applic
     }
     fun enableNotifications() {
         AuthorizationNotifications.enable(app)
-        mutable.value = mutable.value.copy(message = if (AuthorizationNotifications.permitted(app)) "已启用授权告警；可发送服务器测试通知" else "通知尚未获得允许，可在系统设置中开启")
+        mutable.value = mutable.value.copy(message = if (AuthorizationNotifications.permitted(app)) "已启用授权告警，将通过后台检查提醒" else "通知尚未获得允许，可在系统设置中开启")
         refresh()
     }
     fun testNotification() = viewModelScope.launch {

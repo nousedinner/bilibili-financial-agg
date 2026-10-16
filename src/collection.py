@@ -11,8 +11,8 @@ from src.workflow import create_batch, admit, freeze_batch, due_work, publicatio
 
 def default_budget():
     data = get_config().get("data", {})
-    return {"pages": int(data.get("task_page_budget", 50)),
-            "new_videos": int(data.get("task_video_budget", data.get("first_run_cap", 20))),
+    return {"pages": max(0, min(200, int(data.get("task_page_budget", 50)))),
+            "new_videos": max(0, min(200, int(data.get("task_video_budget", data.get("first_run_cap", 20))))),
             "retries": int(data.get("task_retry_budget", 50))}
 
 
@@ -34,6 +34,7 @@ async def _process_selected(sessions, client, jobs, process):
 
 async def scan_blogger(sessions, client, mid, name, process, *, budget=None):
     budget = default_budget() if budget is None else budget
+    initial_pages = budget["pages"]
     result = {"name": name, "new_count": 0, "failed_count": 0, "retried_count": 0,
               "dynamics_count": 0, "skipped_count": 0}
     at = now()
@@ -135,7 +136,7 @@ async def scan_blogger(sessions, client, mid, name, process, *, budget=None):
         result["error"] = str(exc)[:200]
         result["failed_count"] += 1
     finally:
-        await freeze_batch(sessions, batch_id, complete=complete)
+        await freeze_batch(sessions, batch_id, complete=complete, spent_pages=initial_pages - budget["pages"])
         async with sessions() as session:
             await fence(session)
             scan = DiscoveryScan(id=batch_id, mid=mid, since=floor, until=at,
@@ -177,6 +178,7 @@ async def manual_backfill(sessions, client, mid, since, process, *, cap=20, page
     if since_dt < HARD_SINCE or since_dt > upper:
         raise WorkflowError("outside_scope", "admission")
     budget = page_budget if page_budget is not None else {"remaining": 50}
+    initial_pages = budget["remaining"]
     async with sessions() as session:
         blogger = await session.get(Blogger, mid)
         if blogger is None or not blogger.enabled:
@@ -221,7 +223,7 @@ async def manual_backfill(sessions, client, mid, since, process, *, cap=20, page
             page += 1
     except Exception as exc:
         error = getattr(exc, "reason", type(exc).__name__)
-    await freeze_batch(sessions, batch_id, complete=True)
+    await freeze_batch(sessions, batch_id, complete=True, spent_pages=initial_pages - budget["remaining"])
     jobs = await due_work(sessions, limit=cap, batch_id=batch_id)
     result = await _process_selected(sessions, client, jobs, process)
     result = {**result, "mid": mid, "name": blogger.name, "batch_id": batch_id,

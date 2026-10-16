@@ -8,6 +8,7 @@ import com.finapp.appb.FinApp
 import com.finapp.appb.data.api.AuthorizationStatus
 import com.finapp.appb.data.api.LoginStart
 import com.finapp.appb.data.local.ManagementKeyStore
+import com.finapp.appb.data.repository.waitForBiliLogin
 import com.finapp.appb.notifications.AuthorizationNotifications
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
@@ -70,19 +71,15 @@ class AuthorizationViewModel(application: Application) : AndroidViewModel(applic
                 val bitmap = Bitmap.createBitmap(600, 600, Bitmap.Config.ARGB_8888)
                 for (y in 0 until 600) for (x in 0 until 600) bitmap.setPixel(x, y, if (matrix[x,y]) 0xff000000.toInt() else 0xffffffff.toInt())
                 mutable.value = mutable.value.copy(qr = bitmap, message = "保存二维码，用哔哩哔哩扫一扫从相册识别并确认，然后返回此页")
-                var complete = false
-                repeat((login.expiresIn / 5).coerceIn(1, 40)) {
-                    if (!complete) {
-                        delay(5000)
+                val complete = waitForBiliLogin(login.expiresIn, poll = {
                         val result = app.repository.pollBiliLogin(login.id, login.nonce, key,server).getOrThrow()
-                        if (result.state == "complete") {
-                            complete = true
-                            mutable.value = mutable.value.copy(qr = null, message = "服务器授权已验证并更新；历史视频不会因此批量重跑")
-                            refresh()
-                        }
-                    }
-                }
-                if (!complete) mutable.value = mutable.value.copy(qr = null, message = "二维码已到期，可重新发起授权")
+                        result.state == "complete"
+                    }, onTemporaryFailure = {
+                        mutable.value = mutable.value.copy(message = "授权验证暂时无法完成，二维码有效期内会自动重试；请保留此会话")
+                    })
+                mutable.value = mutable.value.copy(qr = null, message = if (complete)
+                    "服务器授权已验证并更新；历史视频不会因此批量重跑" else "二维码已到期，可重新发起授权")
+                refresh()
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (error: Exception) { mutable.value = mutable.value.copy(qr = null, message = error.message ?: "授权暂未完成，原有凭据保持不变") }
             finally { mutable.value = mutable.value.copy(busy = false) }

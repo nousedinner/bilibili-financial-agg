@@ -122,6 +122,8 @@ async def _authorization_maintenance():
     token = owner_context.set(ticket)
     try:
         await ticket.check()
+        from src import login_checkpoint
+        login_checkpoint.prune(_utcnow())
         await check_authorization(async_session)
     except Exception as exc:
         logger.warning("Authorization check deferred (%s)", type(exc).__name__)
@@ -153,7 +155,7 @@ async def _scheduled_digest():
 
 app = FastAPI(
     title="B站财经博主聚合服务",
-    version="1.1.0",
+    version="1.1.1",
     lifespan=lifespan,
 )
 
@@ -650,7 +652,7 @@ async def health():
         return JSONResponse(status_code=503, content={"status": "degraded",
             "reason": "job status write failed",
             "pending_jobs": [p["job_id"] for p in pending]})
-    return {"status": "ok", "db": "connected", "version": "1.1.0"}
+    return {"status": "ok", "db": "connected", "version": "1.1.1"}
 
 
 @app.get("/api/status", dependencies=[Depends(require_api_key)])

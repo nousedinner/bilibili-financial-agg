@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json as _json
+from http.cookies import SimpleCookie, CookieError
 import os
 import subprocess
 import time
@@ -162,6 +163,83 @@ class BiliClient:
     async def _observe(self, state, reason=None):
         if self._auth_observer is not None:
             await self._auth_observer(self.credential_version, state, reason)
+
+    def _login_cookie_values(self):
+        values = {}
+        for cookie in self._transport.cookies.jar:
+            domain = cookie.domain.lstrip('.').lower()
+            if domain == 'bilibili.com' or domain.endswith('.bilibili.com'):
+                if cookie.name in ('SESSDATA', 'bili_jct', 'DedeUserID'):
+                    values[cookie.name] = cookie.value
+        return values
+
+    async def resolve_login_callback(self, callback_url, refresh_token=''):
+        """Exchange an official one-use ticket and preserve raw Set-Cookie values."""
+        def checked(url):
+            try:
+                parsed = urllib.parse.urlsplit(url)
+                safe = (parsed.scheme == 'https' and parsed.hostname in {
+                    'passport.bilibili.com', 'account.bilibili.com', 'passport.biligame.com'}
+                    and parsed.port in (None, 443) and parsed.username is None
+                    and parsed.password is None and not parsed.fragment)
+            except (TypeError, ValueError):
+                safe = False
+            if not safe:
+                raise BiliAPIError(502, 'Untrusted login callback')
+            return parsed
+
+        parsed = checked(callback_url)
+        query = urllib.parse.parse_qs(parsed.query)
+        values = self._login_cookie_values()
+        for name in ('SESSDATA', 'bili_jct', 'DedeUserID'):
+            if not values.get(name) and query.get(name):
+                values[name] = query[name][0]
+        if all(values.get(name) for name in ('SESSDATA', 'bili_jct', 'DedeUserID')):
+            return {'sessdata': values['SESSDATA'], 'bili_jct': values['bili_jct'],
+                'dedeuserid': values['DedeUserID'], 'refresh_token': refresh_token}
+        current = callback_url
+        for _ in range(5):
+            parsed = checked(current)
+            if parsed.path != '/x/passport-login/web/crossDomain':
+                raise BiliAPIError(502, 'Unsupported login exchange')
+            from src.lifecycle import owner_context
+            ticket = owner_context.get()
+            if ticket is not None:
+                await ticket.check()
+            try:
+                await request_policy().before(current)
+            except WorkflowError as exc:
+                raise BiliAPIError(-352, 'Login exchange cooldown active', retry_after=exc.delay) from None
+            try:
+                response = await self._transport.get(current, headers=dict(_HEADERS),
+                    timeout=15, allow_redirects=False)
+            except Exception:
+                raise BiliAPIError(-1, 'Login exchange transport unavailable') from None
+            if response.status_code not in (200, 301, 302, 303, 307, 308):
+                request_policy().observe(current, response.status_code)
+                raise BiliAPIError(response.status_code, 'Login exchange temporarily unavailable')
+            values.update(self._login_cookie_values())
+            # crossDomain may issue cookies for another official SSO domain.
+            # Read this already-validated response without altering raw values;
+            # final nav/UID verification remains mandatory before activation.
+            lines = response.headers.get_list('set-cookie') if hasattr(response.headers, 'get_list') else [response.headers.get('set-cookie', '')]
+            for line in lines:
+                parsed_cookies = SimpleCookie()
+                try:
+                    parsed_cookies.load(line)
+                except CookieError:
+                    continue
+                for name in ('SESSDATA', 'bili_jct', 'DedeUserID'):
+                    if name in parsed_cookies:
+                        values[name] = parsed_cookies[name].value
+            if all(values.get(name) for name in ('SESSDATA', 'bili_jct', 'DedeUserID')):
+                return {'sessdata': values['SESSDATA'], 'bili_jct': values['bili_jct'],
+                    'dedeuserid': values['DedeUserID'], 'refresh_token': refresh_token}
+            location = response.headers.get('location')
+            if response.status_code == 200 or not location:
+                break
+            current = urllib.parse.urljoin(current, location)
+        raise BiliAPIError(502, 'Login exchange returned no complete credential')
 
     # ------------------------------------------------------------------
     # WBI 签名

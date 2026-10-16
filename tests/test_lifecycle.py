@@ -371,6 +371,135 @@ class Lifecycle(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.count(AuthState),0)
         self.assertEqual(credential_store().current().version,1)
 
+    async def test_qr_ticket_exchange_preserves_set_cookie_values(self):
+        import httpx
+        async with bilibili.BiliClient() as client:
+            response=SimpleNamespace(status_code=200,headers=httpx.Headers([
+                ('set-cookie','SESSDATA=TEST%2CENCODED%2CSESSION; Domain=.biligame.com; Secure; HttpOnly'),
+                ('set-cookie','bili_jct=TEST_CSRF; Path=/; Secure'),
+                ('set-cookie','DedeUserID=1; Path=/; Secure')]))
+            request=AsyncMock(return_value=response)
+            with patch.object(client._transport,'get',request):
+                result=await client.resolve_login_callback('https://passport.biligame.com/x/passport-login/web/crossDomain?ticket=TEST_TICKET','TEST_REFRESH')
+            self.assertEqual(result['sessdata'],'TEST%2CENCODED%2CSESSION')
+            self.assertEqual(result['dedeuserid'],'1')
+            self.assertEqual(request.await_count,1)
+            self.assertFalse(request.await_args.kwargs['allow_redirects'])
+
+    async def test_qr_ticket_rejects_external_redirects_and_credentials_in_url(self):
+        async with bilibili.BiliClient() as client:
+            request=AsyncMock(return_value=SimpleNamespace(status_code=302,headers={'location':'https://untrusted.invalid/callback'}))
+            with patch.object(client._transport,'get',request):
+                with self.assertRaises(bilibili.BiliAPIError):
+                    await client.resolve_login_callback('https://passport.biligame.com/x/passport-login/web/crossDomain?ticket=TEST')
+            self.assertEqual(request.await_count,1)
+            for url in ['https://untrusted.invalid/x/passport-login/web/crossDomain',
+                'https://user@passport.bilibili.com/x/passport-login/web/crossDomain']:
+                request.reset_mock()
+                with patch.object(client._transport,'get',request),self.assertRaises(bilibili.BiliAPIError):
+                    await client.resolve_login_callback(url)
+                request.assert_not_awaited()
+
+    async def test_qr_ticket_keeps_cookies_across_approved_redirect_hops(self):
+        import httpx
+        async with bilibili.BiliClient() as client:
+            responses=[
+                SimpleNamespace(status_code=302,headers=httpx.Headers([
+                    ('set-cookie','SESSDATA=TEST%2CSESSION; Domain=.biligame.com; Secure'),
+                    ('location','https://passport.bilibili.com/x/passport-login/web/crossDomain?ticket=TEST_NEXT')])),
+                SimpleNamespace(status_code=200,headers=httpx.Headers([
+                    ('set-cookie','bili_jct=TEST_CSRF; Secure'),('set-cookie','DedeUserID=1; Secure')]))]
+            request=AsyncMock(side_effect=responses)
+            with patch.object(client._transport,'get',request):
+                candidate=await client.resolve_login_callback('https://passport.biligame.com/x/passport-login/web/crossDomain?ticket=TEST_FIRST')
+            self.assertEqual(candidate['sessdata'],'TEST%2CSESSION')
+            self.assertEqual(candidate['dedeuserid'],'1')
+            self.assertEqual(request.await_count,2)
+
+    async def test_qr_one_use_response_survives_transient_exchange_and_completion_retry(self):
+        from src import login_checkpoint
+        headers={'X-Management-Key':'management-test-secret'}
+        upstream=AsyncMock(side_effect=[
+            {'code':0,'data':{'url':'https://account.bilibili.com/scan?qrcode_key=TEST_QR','qrcode_key':'TEST_QR'}},
+            {'code':0,'data':{'code':0,'url':'https://passport.biligame.com/x/passport-login/web/crossDomain?ticket=TEST_TICKET','refresh_token':'TEST_REFRESH'}},
+            {'code':0,'data':{'mid':1,'isLogin':True}}])
+        candidate={'sessdata':'TEST%2CENCODED%2CSESSION','bili_jct':'TEST_CSRF','dedeuserid':'1','refresh_token':'TEST_REFRESH'}
+        resolve=AsyncMock(side_effect=[bilibili.BiliAPIError(-1,'temporary'),candidate])
+        with patch.dict('os.environ',{'FIN_AGG_MANAGEMENT_KEY':'management-test-secret','BILI_UID':'1'}),patch.object(bilibili.BiliClient,'_get',upstream),patch.object(bilibili.BiliClient,'resolve_login_callback',resolve),patch.object(bilibili.BiliClient,'validate_sessdata',AsyncMock(return_value={'state':'valid'})):
+            created=(await self.http.post('/api/bili/auth/sessions',headers=headers)).json()['data']
+            path='/api/bili/auth/sessions/'+created['id']+'/poll'
+            first=await self.http.post(path,headers=headers,json={'nonce':created['nonce']})
+            self.assertEqual(first.status_code,503)
+            self.assertEqual(credential_store().current().version,1)
+            async with self.sessions() as db:
+                row=await db.get(LoginSession,created['id'])
+                row.last_polled_at-=timedelta(seconds=5)
+                saved=login_checkpoint.load(row.id,row.credential_version,row.expires_at)
+                self.assertIn('callback_url',saved)
+                await db.commit()
+            second=await self.http.post(path,headers=headers,json={'nonce':created['nonce']})
+            self.assertEqual(second.status_code,200,second.text)
+            repeated=await self.http.post(path,headers=headers,json={'nonce':created['nonce']})
+            self.assertEqual(repeated.status_code,200,repeated.text)
+        self.assertEqual(upstream.await_count,3)  # Generate, one poll, one nav; never re-poll DONE.
+        self.assertEqual(credential_store().current().version,2)
+        self.assertEqual(await self.count(VideoWork),0)
+
+    async def test_login_checkpoint_cleanup_keeps_live_and_unrelated_files(self):
+        from src import login_checkpoint
+        from uuid import uuid4
+        old,active=str(uuid4()),str(uuid4())
+        login_checkpoint.save(old,1,self.at-timedelta(minutes=1),{'callback_url':'TEST_EXPIRED'})
+        login_checkpoint.save(active,1,self.at+timedelta(minutes=1),{'callback_url':'TEST_ACTIVE'})
+        directory=credential_store().path.parent/'.login-checkpoints'
+        unrelated=directory/'unrelated.json'
+        unrelated.write_text(json.dumps({'expires_at':(self.at-timedelta(days=1)).isoformat()}))
+        login_checkpoint.prune(self.at)
+        self.assertFalse((directory/(old+'.json')).exists())
+        self.assertTrue((directory/(active+'.json')).exists())
+        self.assertTrue(unrelated.exists())
+        self.assertEqual(await self.count(VideoWork),0)
+
+    async def test_unknown_new_credential_does_not_inherit_old_invalid_evidence(self):
+        await authorization.record_auth_check(self.sessions,1,'invalid','auth_required')
+        await credential_store().replace({'sessdata':'TEST_REPLACEMENT','dedeuserid':'1'},expected_version=1)
+        status=await authorization.public_auth_status(self.sessions)
+        self.assertEqual(status['state'],'unknown')
+        self.assertIsNone(status['last_confirmed'])
+        self.assertIsNone(status['checked_at'])
+        await authorization.record_auth_check(self.sessions,2,'unknown','network_transient')
+        async with self.sessions() as db:
+            row=await db.get(AuthState,1)
+            self.assertEqual(row.credential_version,2)
+            self.assertIsNone(row.last_confirmed)
+        await authorization.record_auth_check(self.sessions,2,'invalid','auth_required')
+        async with self.sessions() as db:
+            events=(await db.execute(select(AlertDelivery).order_by(AlertDelivery.created_at))).scalars().all()
+            current=[event for event in events if event.credential_version==2]
+            self.assertEqual([event.kind for event in current],['invalid'])
+            row=await db.get(AuthState,1)
+            self.assertIsNone(row.recovered_at)
+        self.assertEqual(await self.count(VideoWork),0)
+
+    async def test_completed_login_reconciles_interrupted_authorization_state_write(self):
+        import hashlib
+        from uuid import uuid4
+        session_id=str(uuid4());nonce='TEST_NONCE_ALREADY_VALIDATED_123456'
+        await credential_store().replace({'sessdata':'TEST_VALID','dedeuserid':'1'},expected_version=1)
+        async with self.sessions() as db:
+            db.add(LoginSession(id=session_id,nonce_hash=hashlib.sha256(nonce.encode()).hexdigest(),
+                qrcode_key='',credential_version=1,state='complete',expires_at=self.at+timedelta(minutes=1)))
+            await db.commit()
+        with patch.dict('os.environ',{'FIN_AGG_MANAGEMENT_KEY':'management-test-secret'}),patch.object(bilibili.BiliClient,'_get') as upstream:
+            response=await self.http.post('/api/bili/auth/sessions/'+session_id+'/poll',
+                headers={'X-Management-Key':'management-test-secret'},json={'nonce':nonce})
+        self.assertEqual(response.status_code,200,response.text)
+        upstream.assert_not_called()
+        status=await authorization.public_auth_status(self.sessions)
+        self.assertEqual(status['state'],'valid')
+        self.assertEqual(status['credential_version'],2)
+        self.assertEqual(await self.count(VideoWork),0)
+
     async def test_fcm_request_uses_scoped_signed_assertion_without_upstream_credentials(self):
         import httpx
         from cryptography.hazmat.primitives.asymmetric import rsa,padding

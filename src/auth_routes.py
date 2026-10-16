@@ -1,9 +1,10 @@
 """Single-owner authorization and notification endpoints; no cookies in responses."""
 from contextlib import asynccontextmanager
+import asyncio
 from datetime import timedelta
 import hashlib
 import secrets
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -17,6 +18,9 @@ from src.config import get_env
 from src.credentials import credential_store, CredentialStore
 from src.lifecycle import now, owner_context, fence
 from src.models import AppDevice, AlertDelivery, LoginSession, Video, WorkBatch, VideoWork, DiscoveryScan
+from src import login_checkpoint
+
+_login_locks = {}
 
 
 class DeviceInput(BaseModel):
@@ -189,6 +193,12 @@ def build_router(api_dependency, sessions_getter, guard_getter):
 
     @router.post("/api/bili/auth/sessions/{session_id}/poll", dependencies=[Depends(management)])
     async def poll_login(session_id: str, req: LoginPoll):
+        # The upstream QR and exchange ticket are one-use. Serialize this one
+        # session without holding database/fencing locks over network calls.
+        async with _login_locks.setdefault(session_id, asyncio.Lock()):
+            return await _poll_login(session_id, req)
+
+    async def _poll_login(session_id: str, req: LoginPoll):
         async with owned():
             async with sessions_getter()() as session:
                 await fence(session)
@@ -196,28 +206,50 @@ def build_router(api_dependency, sessions_getter, guard_getter):
                 if row is None or not secrets.compare_digest(row.nonce_hash, hashlib.sha256(req.nonce.encode()).hexdigest()):
                     raise HTTPException(404, "授权会话不存在")
                 if row.state == "complete":
-                    return {"code": 0, "data": {"state": "complete"}}
+                    completed_version = row.credential_version + 1
+                    await session.commit()
+                    # If the response/state write was interrupted after the
+                    # validated file swap, reconcile it without consuming QR again.
+                    if credential_store().current().version == completed_version:
+                        await record_auth_check(sessions_getter(), completed_version, "valid")
+                    return {"code": 0, "data": {"state": "complete", "credential_version": completed_version}}
                 if row.expires_at <= now() or row.state == "expired":
+                    login_checkpoint.delete(session_id)
                     raise HTTPException(410, "二维码已过期，请重新发起授权")
                 if row.last_polled_at and now() - row.last_polled_at < timedelta(seconds=3):
                     raise HTTPException(429, "请稍后检查授权结果")
                 row.last_polled_at = now()
-                qr_key, expected_version = row.qrcode_key, row.credential_version
+                qr_key, expected_version, expires_at = row.qrcode_key, row.credential_version, row.expires_at
+                if credential_store().current().version != expected_version:
+                    login_checkpoint.delete(session_id)
+                    raise HTTPException(409, "授权版本已变化，请重新发起登录")
                 await session.commit()
+            async def checkpoint(payload):
+                async with sessions_getter()() as session:
+                    await fence(session)
+                    login_checkpoint.save(session_id, expected_version, expires_at, payload)
+                    await session.commit()
+            try:
+                saved = login_checkpoint.load(session_id, expected_version, expires_at)
+            except (ValueError, OSError):
+                raise HTTPException(503, "授权恢复记录暂时不可用，请重新发起授权") from None
             async with _login_client() as client:
-                result = await client._get("https://passport.bilibili.com/x/passport-login/web/qrcode/poll",
-                    {"qrcode_key": qr_key}, signed=False)
-            data = result.get("data") or {}
-            code = data.get("code")
-            if code in (86101, 86090):
-                return {"code": 0, "data": {"state": "awaiting_scan" if code == 86101 else "awaiting_confirmation"}}
-            if code != 0:
-                raise HTTPException(410 if code == 86038 else 502, "授权会话已过期或上游响应异常")
-            query = parse_qs(urlsplit(data.get("url", "")).query)
-            candidate = {"sessdata": (query.get("SESSDATA") or [""])[0],
-                "bili_jct": (query.get("bili_jct") or [""])[0],
-                "dedeuserid": (query.get("DedeUserID") or [""])[0],
-                "refresh_token": str(data.get("refresh_token") or "")}
+                if saved is None:
+                    result = await client._get("https://passport.bilibili.com/x/passport-login/web/qrcode/poll",
+                        {"qrcode_key": qr_key}, signed=False)
+                    data = result.get("data") or {}
+                    code = data.get("code")
+                    if code in (86101, 86090):
+                        return {"code": 0, "data": {"state": "awaiting_scan" if code == 86101 else "awaiting_confirmation"}}
+                    if code != 0:
+                        raise HTTPException(410 if code == 86038 else 502, "授权会话已过期或上游响应异常")
+                    saved = {'callback_url': str(data.get('url') or ''),
+                        'refresh_token': str(data.get('refresh_token') or '')}
+                    await checkpoint(saved)
+                candidate = saved.get('candidate')
+                if candidate is None:
+                    candidate = await client.resolve_login_callback(saved['callback_url'], saved['refresh_token'])
+                    await checkpoint({'candidate': candidate})
             if not candidate["bili_jct"] or not candidate["dedeuserid"].isdigit() or int(candidate["dedeuserid"]) <= 0:
                 raise HTTPException(502, "授权响应缺少账号或会话字段")
             try:
@@ -240,8 +272,9 @@ def build_router(api_dependency, sessions_getter, guard_getter):
                 except ValueError:
                     raise HTTPException(409, "授权版本已变化，请重新发起登录") from None
                 row = await session.get(LoginSession, session_id)
-                row.state, row.qrcode_key, row.nonce_hash = "complete", "", ""
+                row.state, row.qrcode_key = "complete", ""
                 await session.commit()
+                login_checkpoint.delete(session_id)
             await record_auth_check(sessions_getter(), credential.version, "valid")
         return {"code": 0, "data": {"state": "complete", "credential_version": credential.version}}
 

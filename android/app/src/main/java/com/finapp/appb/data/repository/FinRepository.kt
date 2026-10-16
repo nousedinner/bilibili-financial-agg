@@ -16,7 +16,7 @@ import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
 class ApiException(val status: Int, message: String) : IOException(message)
-class ManagementException(message: String) : IOException(message)
+class ManagementException(message: String, val status: Int = 0) : IOException(message)
 class SessionChangedException : CancellationException("Session switched")
 fun Throwable.isAuthError() = this is ApiException && status in listOf(401, 403)
 fun Throwable.canUseCache() = this is IOException && (this !is ApiException || status >= 500)
@@ -133,7 +133,7 @@ class FinRepository(private val prefs: ConnectionStore, private val cache: Conte
             429 -> "请稍后检查授权结果"
             502 -> "暂时无法获取有效的 B 站授权会话，请稍后重试"
             else -> "授权管理服务暂时不可用，请稍后重试或检查服务器配置"
-        })
+        }, response.code())
         if (!response.isSuccessful) throw ApiException(response.code(), when (response.code()) {
             401, 403 -> "认证已失效，请重新配置"
             409 -> "已有任务正在运行，请稍后查看状态"

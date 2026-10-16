@@ -47,8 +47,15 @@ async def record_auth_check(sessions, version, state, reason=None):
             session.add(row)
         previous_version = row.credential_version
         row.credential_version, row.state, row.reason, row.checked_at = version, state, reason, at
+        if previous_version != version:
+            row.last_confirmed = None
         incident = await session.get(AuthIncident, row.incident_id) if row.incident_id else None
         if state == "invalid":
+            if incident and incident.credential_version != version and incident.resolved_at is None:
+                # A different credential has its own evidence and incident. Do
+                # not call this a recovery or reuse the previous daily cadence.
+                incident.resolved_at = at
+                incident = None
             if incident is None or incident.resolved_at is not None:
                 incident = AuthIncident(id=str(uuid4()), credential_version=version,
                     opened_at=at, last_reminded_at=at)
@@ -271,10 +278,10 @@ async def public_auth_status(sessions):
         pending = (await session.execute(select(func.count()).select_from(AlertDelivery).where(
             AlertDelivery.state.in_(["pending", "retry", "waiting_configuration", "waiting_device", "sending"])))) .scalar()
         return {"state": row.state if row and row.credential_version == version else "unknown",
-            "last_confirmed": row.last_confirmed if row else None,
+            "last_confirmed": row.last_confirmed if row and row.credential_version == version else None,
             "reason": row.reason if row and row.credential_version == version else None,
             "credential_version": version,
-            "checked_at": row.checked_at.isoformat() if row and row.checked_at else None,
+            "checked_at": row.checked_at.isoformat() if row and row.credential_version == version and row.checked_at else None,
             "recovered_at": row.recovered_at.isoformat() if row and row.recovered_at else None,
             "incident_id": row.incident_id if row else None,
             "push": {"configured": push_sender().configured(), "registered": device is not None,

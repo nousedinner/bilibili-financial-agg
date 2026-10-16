@@ -1,0 +1,15 @@
+# Allow only backend build inputs. Keep local credentials and archives out.
+**
+!Dockerfile
+!.dockerignore
+!requirements.txt
+!src/
+!src/**
+!scripts/
+!scripts/manage_db.py
+!config/
+!config/config.example.yaml
+src/**/__pycache__/
+src/**/*.pyc
+scripts/**/__pycache__/
+scripts/**/*.pyc

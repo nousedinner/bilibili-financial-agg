@@ -11,7 +11,7 @@ RUN mkdir -p /app/data
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY config/ ./config/
+COPY config/config.example.yaml ./config/config.example.yaml
 COPY src/ ./src/
 COPY scripts/ ./scripts/
 

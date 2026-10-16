@@ -27,6 +27,10 @@ artifacts/
 /backups/
 **/*service-account*.json
 
+# Private signing material
+*.jks
+*.keystore
+
 # OS
 .DS_Store
 Thumbs.db

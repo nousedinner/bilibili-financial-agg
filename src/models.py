@@ -5,7 +5,7 @@ from sqlalchemy import (
     DateTime, Date, Enum, JSON, ForeignKey, Index,
 )
 from sqlalchemy.dialects.mysql import LONGTEXT
-from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.orm import DeclarativeBase, validates
 from datetime import datetime
 
 
@@ -54,7 +54,7 @@ class Transcript(Base):
 
     bvid = Column(String(20), primary_key=True)
     source = Column(Enum("cc_subtitle", "ai_subtitle", "asr", name="transcript_source"), nullable=False)
-    full_text = Column(Text)
+    full_text = Column(Text().with_variant(LONGTEXT(), "mysql"))
     segment_count = Column(Integer)
     created_at = Column(DateTime, default=_localnow)
 
@@ -133,6 +133,11 @@ class ApiUser(Base):
     api_key = Column(String(128), unique=True, nullable=False)
     enabled = Column(Boolean, default=True)
     created_at = Column(DateTime, default=_localnow)
+
+    @validates("api_key")
+    def protect_key(self, key, value):
+        from src.api_keys import key_digest, is_key_digest
+        return value if is_key_digest(value) else key_digest(value)
 
 
 class DailyDigest(Base):

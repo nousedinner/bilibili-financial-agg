@@ -9,6 +9,8 @@ import httpx
 from src.config import get_config, get_env
 from src.lifecycle import work_context, owner_context, before_expensive_call, content_version, WorkflowError
 
+VIDEO_PROMPT_VERSION = "video-v3"
+
 
 async def analyze_video(
     title: str,
@@ -54,6 +56,10 @@ async def analyze_video(
 
     prompt = f"""分析以下B站财经视频，输出JSON格式结果。
 
+正文 sentiment/sentiment_score 只评价作者在转写中对市场或标的的净方向判断；评论和弹幕分别评价，不能改变正文结论。
+明确偏向上涨/反弹为 bullish，明确偏向下跌为 bearish；没有明确方向、观点均衡或非市场内容为 neutral。
+单日涨跌、生活情绪不能代替作者立场。摘要和数据引用只能来自转写，不补写原文没有的年份、日期或数字。
+
 ## 视频信息
 标题: {title}
 时长: {duration}秒
@@ -86,7 +92,11 @@ async def analyze_video(
     if result:
         parsed = _try_parse_json(result)
         if parsed is not None:
-            if _validate_analysis(parsed):
+            original_fields = sorted(parsed)
+            if _validate_analysis(parsed, comment_samples=len(comments), danmaku_samples=len(danmakus)):
+                parsed["_model_fields"] = original_fields
+                parsed["_output_schema"] = ANALYSIS_SCHEMA
+                parsed["_prompt_version"] = VIDEO_PROMPT_VERSION
                 return parsed
             # JSON合法但字段缺失 → 记录警告，返回empty标记
             print(f"[analyzer] LLM返回了不完整的JSON结构，视为分析失败")
@@ -125,6 +135,9 @@ async def _analyze_long_video(title, text, comments, danmakus, duration):
 
 async def analyze_interactions(comments, danmakus):
     """Refresh social fields without regenerating the published video summary."""
+    if not comments and not danmakus:
+        return {"comment_sentiment": None, "danmaku_sentiment": None,
+                "comment_keywords": [], "danmaku_keywords": [], "_output_schema": ANALYSIS_SCHEMA}
     comment_text = "\n".join(str(item.get("content", {}).get("message", ""))[:500] for item in comments[:20])
     danmaku_text = "\n".join(str(item)[:200] for item in danmakus[:500])
     prompt = f"""只分析以下评论和弹幕，不生成视频正文摘要。输入为空表示没有可分析样本。
@@ -135,12 +148,11 @@ async def analyze_interactions(comments, danmakus):
     data = _try_parse_json(response) if response else None
     if data is None:
         return None
-    validated = _empty_analysis()
-    validated["summary"] = "interaction-only validation"
-    validated.update(data)
-    if not _validate_analysis(validated):
+    original_fields = sorted(data)
+    if not _validate_interactions(data, comment_samples=len(comments), danmaku_samples=len(danmakus)):
         return None
-    return {key: validated[key] for key in ("comment_sentiment", "danmaku_sentiment", "comment_keywords", "danmaku_keywords")}
+    return {**{key: data[key] for key in ("comment_sentiment", "danmaku_sentiment", "comment_keywords", "danmaku_keywords")},
+            "_model_fields": original_fields, "_output_schema": ANALYSIS_SCHEMA}
 
 
 async def analyze_dynamic(content: str) -> dict:
@@ -327,10 +339,30 @@ def _try_parse_json(text: str) -> Optional[dict]:
     return None
 
 
+ANALYSIS_SCHEMA = 2
 _REQUIRED_ANALYSIS_FIELDS = {"summary", "key_points", "sentiment", "sentiment_score"}
 
 
-def _validate_analysis(parsed: dict) -> bool:
+def _validate_interactions(parsed, *, comment_samples=None, danmaku_samples=None):
+    if not isinstance(parsed, dict):
+        return False
+    for prefix, count in (("comment", comment_samples), ("danmaku", danmaku_samples)):
+        key = prefix + "_sentiment"
+        keywords = prefix + "_keywords"
+        if count == 0:
+            parsed[key], parsed[keywords] = None, []
+            continue
+        value = parsed.get(key)
+        if not isinstance(value, dict) or set(value) != _VALID_SENTIMENTS:
+            return False
+        if not all(_valid_score(v) and v >= 0 for v in value.values()) or abs(sum(value.values()) - 1) > 0.02:
+            return False
+        if keywords not in parsed or not _string_list(parsed[keywords]):
+            return False
+    return True
+
+
+def _validate_analysis(parsed: dict, *, comment_samples=None, danmaku_samples=None) -> bool:
     if not isinstance(parsed, dict) or not _REQUIRED_ANALYSIS_FIELDS.issubset(parsed):
         return False
     if not isinstance(parsed["summary"], str) or not parsed["summary"].strip():
@@ -345,12 +377,8 @@ def _validate_analysis(parsed: dict) -> bool:
         value = parsed.get(key, [])
         if not _string_list(value):
             return False
-    for key in ("comment_sentiment", "danmaku_sentiment"):
-        value = parsed.get(key, defaults[key])
-        if not isinstance(value, dict) or set(value) != _VALID_SENTIMENTS:
-            return False
-        if not all(_valid_score(v) and v >= 0 for v in value.values()) or abs(sum(value.values()) - 1) > 0.02:
-            return False
+    if not _validate_interactions(parsed, comment_samples=comment_samples, danmaku_samples=danmaku_samples):
+        return False
     for key, value in defaults.items():
         parsed.setdefault(key, value)
     parsed["sentiment"] = sentiment.strip().lower()

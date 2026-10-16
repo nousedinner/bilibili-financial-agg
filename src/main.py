@@ -60,7 +60,7 @@ async def lifespan(app: FastAPI):
     await init_db()
     from src.ownership import OwnerGuard
     from src.lifecycle import owner_context
-    _owner_guard = OwnerGuard(engine, async_session)
+    _owner_guard = OwnerGuard(engine, async_session, on_reacquired=_recover_owner)
     await _owner_guard.start()
     try:
         startup_ticket = owner_context.set(_owner_guard.ticket())
@@ -124,6 +124,8 @@ async def _authorization_maintenance():
         await ticket.check()
         from src import login_checkpoint
         login_checkpoint.prune(_utcnow())
+        from src.auth_routes import prune_login_sessions
+        await prune_login_sessions(async_session)
         await check_authorization(async_session)
     except Exception as exc:
         logger.warning("Authorization check deferred (%s)", type(exc).__name__)
@@ -155,7 +157,7 @@ async def _scheduled_digest():
 
 app = FastAPI(
     title="B站财经博主聚合服务",
-    version="1.1.3",
+    version="1.1.4",
     lifespan=lifespan,
 )
 
@@ -167,10 +169,12 @@ app = FastAPI(
 async def require_api_key(x_api_key: Optional[str] = Header(None)):
     if not x_api_key:
         raise HTTPException(status_code=401, detail="缺少X-API-Key header")
+    from src.api_keys import key_digest
+    digest = key_digest(x_api_key)
     async with async_session() as session:
-        stmt = select(ApiUser).where(ApiUser.api_key == x_api_key, ApiUser.enabled == True)
+        stmt = select(ApiUser).where(ApiUser.api_key == digest, ApiUser.enabled == True)
         user = (await session.execute(stmt)).scalar_one_or_none()
-        if not user:
+        if not user or not secrets.compare_digest(user.api_key.encode(), digest.encode()):
             raise HTTPException(status_code=401, detail="无效的API Key")
 
 
@@ -439,8 +443,8 @@ async def get_video_detail(bvid: str):
                 "analysis_status": video.analysis_status,
                 "work_status": work.state if work else "legacy",
                 "published_version": work.published_version if work else None,
-                "comments_status": comment_stage.state if comment_stage else "legacy" if comment else "unknown",
-                "danmaku_status": danmaku_stage.state if danmaku_stage else "legacy" if danmaku else "unknown",
+                "comments_status": "no_samples" if comment is not None and not comment.fetched_count else comment_stage.state if comment_stage else "legacy" if comment else "unknown",
+                "danmaku_status": "no_samples" if danmaku is not None and not danmaku.sampled_count else danmaku_stage.state if danmaku_stage else "legacy" if danmaku else "unknown",
                 "summary": {
                     "text": summary.summary if summary else None,
                     "key_points": summary.key_points if summary else [],
@@ -464,7 +468,7 @@ async def get_video_detail(bvid: str):
                     },
                     "hot_comments": comment.hot_comments if comment else [],
                     "keywords": comment.keywords if comment else [],
-                } if comment else None,
+                } if comment and comment.fetched_count and comment.sentiment_neutral is not None else None,
                 "danmaku": {
                     "total": danmaku.total_count if danmaku else 0,
                     "sampled": danmaku.sampled_count if danmaku else 0,
@@ -474,7 +478,7 @@ async def get_video_detail(bvid: str):
                         "neutral": danmaku.sentiment_neutral if danmaku else 0,
                     },
                     "keywords": danmaku.keywords if danmaku else [],
-                } if danmaku else None,
+                } if danmaku and danmaku.sampled_count and danmaku.sentiment_neutral is not None else None,
             },
         }
 
@@ -652,7 +656,7 @@ async def health():
         return JSONResponse(status_code=503, content={"status": "degraded",
             "reason": "job status write failed",
             "pending_jobs": [p["job_id"] for p in pending]})
-    return {"status": "ok", "db": "connected", "version": "1.1.3"}
+    return {"status": "ok", "db": "connected", "version": app.version}
 
 
 @app.get("/api/status", dependencies=[Depends(require_api_key)])
@@ -738,6 +742,12 @@ async def _retry_transcripts_task():
     return await _run_job("retry_transcripts", _retry_work)
 
 
+async def _recover_owner():
+    from src.fetcher import outbox_replay_on_startup
+    await outbox_replay_on_startup()
+    await _recover_interrupted()
+
+
 async def _recover_interrupted():
     async with async_session() as session:
         from src.lifecycle import fence
@@ -786,18 +796,20 @@ async def _execute_job(job_id, work):
     # Issue #13 #3: 最外层 try/finally 保证取消时也能写终态和释放锁
     from src.fetcher import outbox_save, outbox_pop
     task = asyncio.current_task()
-    _background_tasks.add(task)
     status, result, error = "completed", None, None
     cancelled_exc = None
     from src.lifecycle import owner_context, fence, OwnershipLost
-    owner_ticket = _owner_guard.ticket() if _owner_guard is not None else None
-    owner_token = owner_context.set(owner_ticket)
-    if _owner_guard is not None:
-        _owner_guard.tasks.add(task)
-
+    guard, owner_token = _owner_guard, None
     try:
+        _background_tasks.add(task)
+        owner_ticket = guard.ticket() if guard is not None else None
+        owner_token = owner_context.set(owner_ticket)
+        if guard is not None:
+            guard.tasks.add(task)
         # 业务执行
         try:
+            from src.workflow import recover_abandoned_work
+            await recover_abandoned_work(async_session)
             result = await work()
             if result and (result.get("total_failed", 0) or result.get("failed", 0)
                            or result.get("truncated") or result.get("has_more")):
@@ -805,6 +817,8 @@ async def _execute_job(job_id, work):
         except asyncio.CancelledError as exc:
             status, error = "interrupted", "Task cancelled"
             cancelled_exc = exc
+        except OwnershipLost:
+            raise
         except Exception as exc:
             status, error = "failed", str(exc)[:1000]
 
@@ -844,12 +858,16 @@ async def _execute_job(job_id, work):
                 else:
                     # Issue #14 #3: MySQL最终失败，outbox已保存，启动时会重放
                     logger.error(f"[execute_job] 状态提交最终失败: {job_id}, 已持久化到outbox (DEGRADED)")
+    except OwnershipLost:
+        outbox_save(job_id, "interrupted", None, "Execution ownership lost")
+        raise
     finally:
         _job_lock.release()
         _background_tasks.discard(task)
-        if _owner_guard is not None:
-            _owner_guard.tasks.discard(task)
-        owner_context.reset(owner_token)
+        if guard is not None:
+            guard.tasks.discard(task)
+        if owner_token is not None:
+            owner_context.reset(owner_token)
 
     if cancelled_exc is not None:
         raise cancelled_exc
@@ -1012,7 +1030,7 @@ async def upstream_error(request, exc):
 
 
 from src.auth_routes import build_router
-app.include_router(build_router(require_api_key, lambda: async_session, lambda: _owner_guard))
+app.include_router(build_router(require_api_key, lambda: async_session, lambda: _owner_guard, lambda: _job_lock))
 
 from src.lifecycle import WorkflowError
 @app.exception_handler(WorkflowError)

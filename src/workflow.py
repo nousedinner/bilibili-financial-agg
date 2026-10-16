@@ -8,10 +8,24 @@ from sqlalchemy import select, or_, and_, exists
 
 from src.config import get_config
 from src.credentials import credential_store
+from src.retry_strategy import max_retries_for
 from src.lifecycle import (HARD_SINCE, STAGES, WorkflowError, automatic_floor,
     validate_publication, now, fence, content_version)
 from src.models import (WorkBatch, VideoWork, WorkStage, TranscriptCheckpoint,
     ASRSegment, DailyUsage, Blogger, Video, Transcript, Summary)
+
+
+async def recover_abandoned_work(sessions):
+    """Called only by the exclusive job holder, before it starts any pipeline."""
+    from sqlalchemy import update
+    async with sessions() as session:
+        await fence(session)
+        abandoned = select(VideoWork.bvid).where(VideoWork.state == "running")
+        await session.execute(update(WorkStage).where(WorkStage.bvid.in_(abandoned),
+            WorkStage.state == "running").values(state="failed", reason="interrupted", next_attempt_at=now()))
+        await session.execute(update(VideoWork).where(VideoWork.state == "running").values(
+            state="interrupted", reason="interrupted", next_attempt_at=now(), updated_at=now()))
+        await session.commit()
 
 
 def publication(payload):
@@ -58,7 +72,8 @@ async def admit(sessions, batch_id, mid, payload, *, allow_legacy=False):
         if bvid not in selected and len(selected) >= batch.max_videos:
             return False
         old = await session.get(Video, bvid)
-        work = await session.get(VideoWork, bvid)
+        work = (await session.execute(select(VideoWork).where(VideoWork.bvid == bvid)
+            .with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
         if work and batch.origin == "incremental":
             return False
         if old is not None:
@@ -78,7 +93,7 @@ async def admit(sessions, batch_id, mid, payload, *, allow_legacy=False):
         if expires <= at:
             raise WorkflowError("scope_expired", "admission")
         policy = {"llm_model": get_config().get("llm", {}).get("model", "mimo-v2.6-flash"),
-            "asr_model": get_config().get("asr", {}).get("model", "mimo-v2.5-asr"), "prompt_version": "video-v2"}
+            "asr_model": get_config().get("asr", {}).get("model", "mimo-v2.5-asr"), "prompt_version": "video-v3"}
         if work is None:
             work = VideoWork(bvid=bvid, mid=mid, batch_id=batch_id, origin=batch.origin,
                 last_trigger=batch.origin, payload={**payload, "_policy": policy}, publish_time=published,
@@ -127,6 +142,7 @@ async def due_work(sessions, limit=50, *, batch_id=None, mid=None):
         retry_states.append("blocked_auth")
     stage_due = exists(select(WorkStage.bvid).where(WorkStage.bvid == VideoWork.bvid,
         WorkStage.state == "failed", WorkStage.attempts < 3,
+        or_(WorkStage.reason.is_(None), WorkStage.reason != "permanent"),
         or_(WorkStage.next_attempt_at.is_(None), WorkStage.next_attempt_at <= at)))
     query = select(VideoWork).where(VideoWork.mid.in_(select(Blogger.mid).where(Blogger.enabled == True)),
         VideoWork.publish_time >= HARD_SINCE, VideoWork.expires_at > at,
@@ -149,6 +165,8 @@ class WorkContext:
     current_stage: str = "metadata"
     cid: int = 0
     policy: dict = None
+    generation: int = None
+    terminal_reason: str = None
 
     async def check_scope(self, session):
         await fence(session)
@@ -169,36 +187,60 @@ class WorkContext:
             raise WorkflowError("blogger_disabled", "admission")
         self.cid = work.cid or 0
         self.policy = work.payload.get("_policy", {})
+        from src.lifecycle import owner_context
+        ticket = owner_context.get()
+        self.generation = ticket.generation if ticket else None
+        return work
+
+    async def finalize_scope(self, session):
+        await fence(session)
+        work = (await session.execute(select(VideoWork).where(VideoWork.bvid == self.bvid)
+            .with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
+        if work is not None and self.generation is not None and work.generation != self.generation:
+            from src.lifecycle import OwnershipLost
+            raise OwnershipLost()
+        if work is not None:
+            batch = await session.get(WorkBatch, work.batch_id)
+            blogger = await session.get(Blogger, work.mid)
+            if batch is None or self.bvid not in (batch.selected_bvids or []) or work.expires_at <= now():
+                self.terminal_reason = "scope_expired"
+            elif blogger is None or not blogger.enabled:
+                self.terminal_reason = "blogger_disabled"
         return work
 
     async def stage(self, name, state, *, reason=None, result=None, input_version=None):
         async with self.sessions() as session:
             work = await self.check_scope(session)
-            row = await session.get(WorkStage, (self.bvid, name))
-            if row is None:
-                row = WorkStage(bvid=self.bvid, stage=name, attempts=0, state="pending")
-                session.add(row)
-            if input_version and row.input_version and input_version != row.input_version:
-                row.attempts, row.result = 0, None
-            if state == "running":
-                if (row.attempts or 0) >= 3:
-                    raise WorkflowError("retry_exhausted", name)
-                row.attempts = (row.attempts or 0) + 1
-                self.current_stage = name
-            if state == "blocked_auth" and row.state == "running":
-                row.attempts = max(0, (row.attempts or 0) - 1)
-            row.state, row.reason, row.cid = state, reason, self.cid or work.cid
-            row.credential_version, row.updated_at = self.credential_version, now()
-            if input_version:
-                row.input_version = input_version
-            if result is not None:
-                row.result = result
-            if state == "failed":
-                delay = 900 if reason == "risk_blocked" else 120 if reason == "http_blocked" else 60 * 2 ** min(row.attempts or 0, 5)
-                row.next_attempt_at = now() + timedelta(seconds=delay)
-            elif state == "complete":
-                row.next_attempt_at = None
+            row = await self.update_stage(session, work, name, state, reason=reason,
+                                          result=result, input_version=input_version)
             await session.commit()
+        return row
+
+    async def update_stage(self, session, work, name, state, *, reason=None, result=None, input_version=None):
+        row = await session.get(WorkStage, (self.bvid, name))
+        if row is None:
+            row = WorkStage(bvid=self.bvid, stage=name, attempts=0, state="pending")
+            session.add(row)
+        if input_version and row.input_version and input_version != row.input_version:
+            row.attempts, row.result = 0, None
+        if state == "running":
+            if (row.attempts or 0) >= max_retries_for(row.reason or "unknown"):
+                raise WorkflowError("retry_exhausted", name)
+            row.attempts = (row.attempts or 0) + 1
+            self.current_stage = name
+        if state == "blocked_auth" and row.state == "running":
+            row.attempts = max(0, (row.attempts or 0) - 1)
+        row.state, row.reason, row.cid = state, reason, self.cid or work.cid
+        row.credential_version, row.updated_at = self.credential_version, now()
+        if input_version:
+            row.input_version = input_version
+        if result is not None:
+            row.result = result
+        if state == "failed":
+            delay = 900 if reason == "risk_blocked" else 120 if reason == "http_blocked" else 60 * 2 ** min(row.attempts or 0, 5)
+            row.next_attempt_at = now() + timedelta(seconds=delay)
+        else:
+            row.next_attempt_at = None
         return row
 
     async def get_stage(self, name):

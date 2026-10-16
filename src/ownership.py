@@ -22,20 +22,22 @@ class OwnershipTicket:
 
 
 class OwnerGuard:
-    def __init__(self, engine, sessions, *, heartbeat_seconds=20, lease_seconds=90, lock_name="fin_agg_scheduler"):
+    def __init__(self, engine, sessions, *, heartbeat_seconds=20, lease_seconds=90, lock_name="fin_agg_scheduler", on_reacquired=None):
         self.engine, self.sessions = engine, sessions
         self.heartbeat_seconds, self.lease_seconds = heartbeat_seconds, lease_seconds
         self.owner, self.generation = str(uuid4()), 0
         self.connection = None
         self.lost = True
+        self.recovering = False
         self.closed = False
         self.monitor = None
         self.io_lock = asyncio.Lock()
         self.tasks = set()
         self.lock_name = lock_name
+        self.on_reacquired = on_reacquired
 
     def ticket(self):
-        if self.lost:
+        if self.lost or self.recovering:
             raise OwnershipLost()
         return OwnershipTicket(self, self.generation)
 
@@ -79,7 +81,7 @@ class OwnerGuard:
 
     async def check(self, generation=None):
         expected = self.generation if generation is None else generation
-        if self.lost or expected != self.generation:
+        if self.lost or self.recovering or expected != self.generation:
             raise OwnershipLost()
         try:
             async with self.io_lock:
@@ -115,7 +117,20 @@ class OwnerGuard:
                     # Tickets capture a generation, so late old tasks stay fenced out.
                     if any(not task.done() for task in self.tasks):
                         continue
-                    await self.acquire()
+                    # Keep admissions closed until old jobs/outbox intents have
+                    # been recovered. Only this recovery ticket may fence writes.
+                    self.recovering = True
+                    try:
+                        await self.acquire()
+                        if self.on_reacquired is not None:
+                            from src.lifecycle import owner_context
+                            token = owner_context.set(OwnershipTicket(self, self.generation))
+                            try:
+                                await self.on_reacquired()
+                            finally:
+                                owner_context.reset(token)
+                    finally:
+                        self.recovering = False
                 else:
                     await self.check()
                     async with self.sessions() as session:

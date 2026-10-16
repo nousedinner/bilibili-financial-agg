@@ -54,7 +54,7 @@ class RequestPolicy:
         cfg = get_config().get("limits", {})
         if code in (-352, -403):
             self.risk_until = time.monotonic() + float(cfg.get("risk_cooldown_seconds", 900))
-        elif code in (-412, 412, 429):
+        elif code in (-412, 403, 412, 429):
             self.endpoint_blocks[self.endpoint(url)] = time.monotonic() + float(cfg.get("http_cooldown_seconds", 120))
 
 

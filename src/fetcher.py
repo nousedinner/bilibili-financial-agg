@@ -341,7 +341,9 @@ async def _process_dynamic_core(client: BiliClient, mid: int, dyn_data: dict):
     author_mod = modules.get("module_author", {})
     if isinstance(author_mod, dict):
         pub_ts = author_mod.get("pub_ts", 0)
-    pub_dt = _publish_time(pub_ts) if pub_ts else _utcnow().replace(tzinfo=None)
+    pub_dt = _publish_time(pub_ts) if pub_ts else None
+    if pub_dt is None:
+        raise ValueError("Dynamic publication timestamp is missing; refusing fabricated publication time")
 
     # LLM Analysis
     analysis = await analyze_dynamic(content_text)

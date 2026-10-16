@@ -510,25 +510,31 @@ class BiliClient:
         limit = int(get_config().get("asr", {}).get("max_audio_bytes", 256 * 1024 * 1024))
         # #5: 返回临时文件路径而非bytes，避免全量驻留内存
         r = await _curl_session.get(url, headers=_HEADERS, timeout=120, stream=True)
-        r.raise_for_status()
-        fd, tmp_path = tempfile.mkstemp(suffix=".audio")
-        downloaded = 0
+        tmp_path = None
+        transferred = False
         try:
+            r.raise_for_status()
+            fd, tmp_path = tempfile.mkstemp(suffix=".audio")
+            downloaded = 0
             with os.fdopen(fd, "wb") as f:
                 async for chunk in r.aiter_content(chunk_size=64 * 1024):
                     downloaded += len(chunk)
                     if downloaded > limit:
                         raise ValueError(f"Audio exceeds configured download limit ({limit} bytes)")
                     f.write(chunk)
-            return tmp_path
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-        finally:
             await r.aclose()
+            transferred = True
+            return tmp_path
+        finally:
+            try:
+                if not transferred:
+                    await r.aclose()
+            finally:
+                if tmp_path and not transferred:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
 
     # ------------------------------------------------------------------
     # 评论

@@ -4,12 +4,13 @@ import asyncio
 from datetime import timedelta
 import hashlib
 import secrets
+import weakref
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, delete, func
 
 from src.authorization import (public_auth_status, record_auth_check, deliver_alerts,
                                check_authorization, push_sender)
@@ -20,7 +21,15 @@ from src.lifecycle import now, owner_context, fence
 from src.models import AppDevice, AlertDelivery, LoginSession, Video, WorkBatch, VideoWork, DiscoveryScan
 from src import login_checkpoint
 
-_login_locks = {}
+_login_locks = weakref.WeakValueDictionary()
+_login_create_lock = asyncio.Lock()
+
+
+async def prune_login_sessions(sessions):
+    async with sessions() as session:
+        await fence(session)
+        await session.execute(delete(LoginSession).where(LoginSession.expires_at < now() - timedelta(days=1)))
+        await session.commit()
 
 
 class DeviceInput(BaseModel):
@@ -65,7 +74,7 @@ def _validated_login_qr(data):
     return qr_url, qr_key
 
 
-def build_router(api_dependency, sessions_getter, guard_getter):
+def build_router(api_dependency, sessions_getter, guard_getter, job_lock_getter=None):
     router = APIRouter(dependencies=[Depends(api_dependency)])
 
     @asynccontextmanager
@@ -79,6 +88,20 @@ def build_router(api_dependency, sessions_getter, guard_getter):
             yield
         finally:
             owner_context.reset(token)
+
+    @asynccontextmanager
+    async def admission_lock():
+        lock = job_lock_getter() if job_lock_getter else None
+        if lock is None:
+            yield
+            return
+        if lock.locked():
+            raise HTTPException(409, "已有采集任务正在运行，请稍后重试")
+        await lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
 
     @router.get("/api/bili/auth/status")
     async def auth_status():
@@ -165,7 +188,16 @@ def build_router(api_dependency, sessions_getter, guard_getter):
 
     @router.post("/api/bili/auth/sessions")
     async def create_login():
-        async with owned():
+        async with owned(), _login_create_lock:
+            async with sessions_getter()() as session:
+                await fence(session)
+                active = (await session.execute(select(func.count()).select_from(LoginSession).where(
+                    LoginSession.expires_at > now(), LoginSession.state == "pending"))).scalar()
+                recent = (await session.execute(select(func.count()).select_from(LoginSession).where(
+                    LoginSession.expires_at > now() + timedelta(seconds=170)))).scalar()
+                if active >= 3 or recent:
+                    raise HTTPException(429, "授权会话创建过于频繁，请稍后重试", headers={"Retry-After": "10"})
+                await session.commit()
             async with _login_client() as client:
                 result = await client._get("https://passport.bilibili.com/x/passport-login/web/qrcode/generate", signed=False)
             data = result.get("data") or {}
@@ -292,7 +324,7 @@ def build_router(api_dependency, sessions_getter, guard_getter):
         from src.lifecycle import HARD_SINCE
         from src.fetcher import _video_info
         bvids = list(dict.fromkeys(req.bvids))
-        async with owned():
+        async with admission_lock(), owned():
             async with sessions_getter()() as session:
                 videos = list((await session.execute(select(Video).where(Video.bvid.in_(bvids)))).scalars())
             if len(videos) != len(bvids) or any(not video.publish_time or video.publish_time < HARD_SINCE for video in videos):

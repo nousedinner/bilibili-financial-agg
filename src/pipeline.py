@@ -6,13 +6,14 @@ from src.lifecycle import (WorkflowError, OwnershipLost, failure_reason, content
 from src.models import (Video, VideoWork, WorkStage, TranscriptCheckpoint, Transcript,
     Summary, CommentAnalysis, DanmakuAnalysis)
 from src.workflow import WorkContext
+from src.retry_strategy import should_retry
 
 
 async def _interaction(context, name, fetch):
     stage = await context.get_stage(name)
     if stage and stage.state == "complete" and stage.cid == context.cid:
         return stage.result, False
-    if stage and (stage.attempts or 0) >= 3:
+    if stage and not should_retry(stage.attempts or 0, stage.reason or "unknown"):
         return None, False
     if stage and stage.next_attempt_at and stage.next_attempt_at > now():
         return None, False
@@ -32,6 +33,7 @@ async def _interaction(context, name, fetch):
 
 async def process(sessions, client, bvid, *, fetch_transcript, analyze_video,
                   analyze_interactions, validate_analysis, mark_digest):
+    from src.analyzer import ANALYSIS_SCHEMA
     context = WorkContext(sessions, bvid, int(getattr(client, "credential_version", 1) or 1))
     token = work_context.set(context)
     published = False
@@ -116,12 +118,14 @@ async def process(sessions, client, bvid, *, fetch_transcript, analyze_video,
         interaction_version = content_version(comments_data, danmaku_data)
         body_version = content_version(version, context.policy)
         body_stage = await context.get_stage("analysis")
-        cached = (body_stage and body_stage.input_version == body_version
+        cached = (body_stage and body_stage.state == "complete" and body_stage.input_version == body_version
                   and isinstance(body_stage.result, dict) and "analysis" in body_stage.result)
         if cached:
             analysis = dict(body_stage.result["analysis"])
             interaction_stage = await context.get_stage("interaction_analysis")
-            if not interaction_stage or interaction_stage.input_version != interaction_version:
+            if (not interaction_stage or interaction_stage.state != "complete"
+                    or interaction_stage.input_version != interaction_version
+                    or (interaction_stage.result or {}).get("_output_schema") != ANALYSIS_SCHEMA):
                 try:
                     await context.stage("interaction_analysis", "running", input_version=interaction_version)
                     await before_expensive_call()
@@ -134,18 +138,25 @@ async def process(sessions, client, bvid, *, fetch_transcript, analyze_video,
                     raise
                 except Exception as exc:
                     await context.stage("interaction_analysis", "failed", reason=failure_reason(exc))
+                    raise WorkflowError("llm_failed", "interaction_analysis") from exc
             else:
                 analysis.update(interaction_stage.result or {})
         else:
             await context.stage("analysis", "running", input_version=body_version)
             await before_expensive_call()
             analysis = await analyze_video(str(payload.get("title") or ""), revision.full_text, comments, danmakus, duration)
-            if analysis.get("analysis_failed") or not validate_analysis(analysis):
+            if analysis.get("analysis_failed") or not validate_analysis(analysis,
+                    comment_samples=len(comments), danmaku_samples=len(danmakus)):
                 raise WorkflowError("llm_failed", "analysis")
             await context.stage("analysis", "complete", input_version=body_version,
                                 result={"analysis": analysis, "transcript_version": version})
             await context.stage("interaction_analysis", "complete", input_version=interaction_version,
-                result={key: analysis[key] for key in ("comment_sentiment", "danmaku_sentiment", "comment_keywords", "danmaku_keywords")})
+                result={**{key: analysis[key] for key in ("comment_sentiment", "danmaku_sentiment", "comment_keywords", "danmaku_keywords")},
+                        "_output_schema": ANALYSIS_SCHEMA, "_model_fields": analysis.get("_model_fields")})
+
+        if analysis.get("analysis_failed") or not validate_analysis(analysis,
+                comment_samples=len(comments), danmaku_samples=len(danmakus)):
+            raise WorkflowError("llm_failed", "analysis")
 
         async with sessions() as session:
             work = await context.check_scope(session)
@@ -158,13 +169,13 @@ async def process(sessions, client, bvid, *, fetch_transcript, analyze_video,
             if comments_data is not None:
                 cs = analysis["comment_sentiment"]
                 await session.merge(CommentAnalysis(ref_id=bvid, ref_type="video", total_count=comments_data["total"],
-                    fetched_count=len(comments), sentiment_bullish=cs["bullish"], sentiment_bearish=cs["bearish"],
-                    sentiment_neutral=cs["neutral"], hot_comments=[c.get("content", {}).get("message", "") for c in comments[:5]],
+                    fetched_count=len(comments), sentiment_bullish=cs["bullish"] if cs else None, sentiment_bearish=cs["bearish"] if cs else None,
+                    sentiment_neutral=cs["neutral"] if cs else None, hot_comments=[c.get("content", {}).get("message", "") for c in comments[:5]],
                     keywords=analysis["comment_keywords"]))
             if danmaku_data is not None:
                 ds = analysis["danmaku_sentiment"]
                 await session.merge(DanmakuAnalysis(bvid=bvid, total_count=danmaku_data["total"], sampled_count=len(danmakus),
-                    sentiment_bullish=ds["bullish"], sentiment_bearish=ds["bearish"], sentiment_neutral=ds["neutral"],
+                    sentiment_bullish=ds["bullish"] if ds else None, sentiment_bearish=ds["bearish"] if ds else None, sentiment_neutral=ds["neutral"] if ds else None,
                     keywords=analysis["danmaku_keywords"]))
             video = await session.get(Video, bvid)
             video.title, video.duration, video.view_count = str(payload.get("title") or "")[:500], duration, payload.get("play", 0)
@@ -195,16 +206,24 @@ async def process(sessions, client, bvid, *, fetch_transcript, analyze_video,
             stage_name = context.current_stage
         state = "blocked_auth" if reason == "auth_required" else "skipped" if reason.startswith("policy_") else "failed"
         try:
-            stage = await context.stage(stage_name, state, reason=reason)
             async with sessions() as session:
-                work = await context.check_scope(session)
+                # Finalization is fenced, but expiry/disabled-blogger checks must
+                # not prevent an already running item from recording its outcome.
+                work = await context.finalize_scope(session)
+                if work is None:
+                    raise exc
+                if context.terminal_reason:
+                    reason, state = context.terminal_reason, "skipped"
+                if reason in ("scope_expired", "outside_scope", "blogger_disabled", "not_admitted"):
+                    state = "skipped"
+                stage = await context.update_stage(session, work, stage_name, state, reason=reason)
                 work.reason, work.credential_version, work.updated_at = reason, context.credential_version, now()
                 if state in ("blocked_auth", "skipped"):
                     work.state = state
                 elif reason == "interrupted":
                     work.state = "interrupted"
                 else:
-                    work.state = "exhausted" if (stage.attempts or 0) >= 3 or reason == "permanent" else "retry"
+                    work.state = "retry" if should_retry(stage.attempts or 0, reason) else "exhausted"
                 work.next_attempt_at = stage.next_attempt_at
                 video = await session.get(Video, bvid)
                 public_summary, public_transcript = await session.get(Summary, bvid), await session.get(Transcript, bvid)
@@ -217,7 +236,7 @@ async def process(sessions, client, bvid, *, fetch_transcript, analyze_video,
                 await session.commit()
         except OwnershipLost:
             raise
-        if state == "skipped":
+        if state == "skipped" and not isinstance(exc, asyncio.CancelledError):
             return {"status": "skipped", "reason": reason}
         raise
     finally:

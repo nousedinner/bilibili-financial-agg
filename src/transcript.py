@@ -12,7 +12,7 @@ from typing import Optional
 
 import httpx
 
-from src.bilibili import BiliClient, _run_curl
+from src.bilibili import BiliClient, BiliAPIError, _run_curl
 from src.config import get_config, get_env
 from src.lifecycle import WorkflowError, failure_reason, before_expensive_call, work_context, content_version
 
@@ -34,8 +34,8 @@ async def fetch_transcript(client: BiliClient, bvid: str, cid: int, duration: in
     subtitle_reason = "no_track"
     if context:
         await context.stage("subtitle", "running", input_version=content_version(bvid, cid))
-    try:
-        for method, source in ((client.get_cc_subtitle, "cc_subtitle"), (client.get_subtitle_url, "ai_subtitle")):
+    for method, source in ((client.get_cc_subtitle, "cc_subtitle"), (client.get_subtitle_url, "ai_subtitle")):
+        try:
             subtitle_url = await method(bvid, cid)
             if subtitle_url:
                 text = await _download_subtitle(subtitle_url, duration=duration)
@@ -44,18 +44,19 @@ async def fetch_transcript(client: BiliClient, bvid: str, cid: int, duration: in
                 if context:
                     await context.stage("subtitle", "complete", result={"source": source})
                 return {"source": source, "text": text, "segments": 1, "partial": False}
-    except Exception as e:
-        reason = failure_reason(e)
-        if context:
-            await context.stage("subtitle", "blocked_auth" if reason == "auth_required" else "failed", reason=reason)
-        if reason != "auth_required":
-            raise
-        subtitle_reason = reason
-        # A wait policy cannot silently stop production before real push delivery
-        # has been acknowledged and explicitly enabled by the owner.
-        from src.authorization import auth_wait_enabled
-        if await auth_wait_enabled(context.sessions if context else None):
-            raise WorkflowError("auth_required", "subtitle") from None
+        except Exception as e:
+            reason = failure_reason(e)
+            if context:
+                await context.stage("subtitle", "blocked_auth" if reason == "auth_required" else "failed", reason=reason)
+            subtitle_reason = reason
+            if reason in ("subtitle_download", "empty_subtitle", "subtitle_integrity"):
+                continue
+            if reason != "auth_required":
+                raise
+            from src.authorization import auth_wait_enabled
+            if await auth_wait_enabled(context.sessions if context else None):
+                raise WorkflowError("auth_required", "subtitle") from None
+            break
 
     if context and subtitle_reason == "no_track":
         await context.stage("subtitle", "no_track", reason="no_track")
@@ -67,6 +68,8 @@ async def fetch_transcript(client: BiliClient, bvid: str, cid: int, duration: in
         await context.stage("asr", "running", reason=subtitle_reason)
     asr_result = await _asr_transcribe(client, bvid, cid, duration)
     if asr_result:
+        if context and subtitle_reason in ("subtitle_download", "empty_subtitle", "subtitle_integrity"):
+            await context.stage("subtitle", "skipped", reason=subtitle_reason)
         asr_result["degraded_reason"] = subtitle_reason
         return asr_result
     raise WorkflowError("transcript_unavailable", "asr")
@@ -81,6 +84,10 @@ async def _download_subtitle(url: str, duration: int = 0) -> str:
             print(f"[transcript] subtitle download HTTP {status}")
             raise WorkflowError("subtitle_download", "subtitle")
         data = json.loads(body)
+        if isinstance(data, dict) and data.get("code") not in (None, 0):
+            from src.request_policy import request_policy
+            request_policy().observe(url, data["code"])
+            raise BiliAPIError(data["code"], "Subtitle upstream error")
         segs = data.get("body", [])
         if not isinstance(segs, list) or not segs:
             raise WorkflowError("empty_subtitle", "subtitle")
@@ -97,7 +104,9 @@ async def _download_subtitle(url: str, duration: int = 0) -> str:
         # Each item: {"from": 0.0, "to": 2.0, "content": "text"}
         texts = [item.get("content", "") for item in segs]
         return " ".join(texts)
-    except (TimeoutError, OSError, json.JSONDecodeError, KeyError, ValueError) as e:
+    except WorkflowError:
+        raise
+    except (TimeoutError, OSError, json.JSONDecodeError, KeyError, ValueError, TypeError, AttributeError) as e:
         raise WorkflowError("subtitle_download", "subtitle") from None
 
 
@@ -240,21 +249,30 @@ async def _to_mp3(audio: bytes) -> bytes:
 async def _to_mp3_path(src_path: str) -> str:
     """#5: 文件路径版转码——不读入bytes，直接文件到文件。带超时+进程回收。"""
     dst_path = src_path.rsplit(".", 1)[0] + ".mp3"
+    completed = False
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg", "-y", "-i", src_path, "-vn", "-acodec", "libmp3lame", "-q:a", "4", dst_path,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
     try:
-        await asyncio.wait_for(proc.wait(), timeout=300)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
         try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        await proc.wait()
-        raise
-    if proc.returncode == 0 and os.path.exists(dst_path):
-        return dst_path
-    raise WorkflowError("audio_conversion", "asr")
+            await asyncio.wait_for(proc.wait(), timeout=300)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+            raise
+        if proc.returncode == 0 and os.path.exists(dst_path):
+            completed = True
+            return dst_path
+        raise WorkflowError("audio_conversion", "asr")
+    finally:
+        if not completed:
+            try:
+                os.unlink(dst_path)
+            except OSError:
+                pass
 
 
 async def _split_audio_from_file(audio_path: str, chunk_seconds: int) -> list:

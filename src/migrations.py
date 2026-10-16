@@ -2,7 +2,7 @@
 from sqlalchemy import inspect, text
 from src.models import Base
 
-VERSION = 7
+VERSION = 8
 
 
 def upgrade(connection):
@@ -97,6 +97,16 @@ def upgrade(connection):
         if full_text and str(full_text["type"]).upper() != "LONGTEXT":
             connection.execute(text("ALTER TABLE transcripts MODIFY full_text LONGTEXT"))
 
+    # V8 changes representation only; existing phone keys remain valid. SQL
+    # parameters contain digests, never the original key.
+    if not current_ver or current_ver < 8:
+        from src.api_keys import key_digest, is_key_digest
+        rows = connection.execute(text("SELECT id, api_key FROM api_users")).fetchall()
+        for user_id, old_key in rows:
+            if not is_key_digest(old_key):
+                connection.execute(text("UPDATE api_users SET api_key=:digest WHERE id=:id"),
+                                   {"digest": key_digest(old_key), "id": user_id})
+
     # ── schema_version ──
     connection.execute(text("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)"))
     connection.execute(text("DELETE FROM schema_version"))
@@ -118,3 +128,45 @@ def verify(connection):
         or "error_type" not in videos_cols
         or "retry_count" not in dirty_cols):
         raise RuntimeError("Unsupported schema; run python -m scripts.manage_db upgrade")
+    # create_all cannot evolve an existing table. Verify the actual columns,
+    # primary keys and required indexes before the application starts.
+    from sqlalchemy import String, Text, Boolean, Integer, Enum, UniqueConstraint
+    from src.api_keys import is_key_digest
+    for table_name, table in Base.metadata.tables.items():
+        actual = {column["name"]: column for column in inspector.get_columns(table_name)}
+        absent = set(table.columns.keys()) - set(actual)
+        if absent:
+            raise RuntimeError(f"Unsupported schema: {table_name} missing {sorted(absent)}")
+        for column in table.columns:
+            expected = column.type.dialect_impl(connection.dialect)
+            observed = actual[column.name]["type"]
+            if not column.nullable and not column.primary_key and actual[column.name].get("nullable", True):
+                raise RuntimeError(f"Unsupported schema nullability: {table_name}.{column.name}")
+            if isinstance(expected, Enum) and hasattr(observed, "enums") and not set(expected.enums).issubset(observed.enums):
+                raise RuntimeError(f"Unsupported schema enum: {table_name}.{column.name}")
+            if isinstance(expected, Boolean) and isinstance(observed, Integer):
+                continue
+            if expected._type_affinity is not observed._type_affinity:
+                raise RuntimeError(f"Unsupported schema type: {table_name}.{column.name}")
+            if isinstance(expected, String) and not isinstance(expected, Text):
+                if expected.length and observed.length and observed.length < expected.length:
+                    raise RuntimeError(f"Unsupported schema width: {table_name}.{column.name}")
+        if connection.dialect.name == "mysql" and table_name in ("transcripts", "transcript_checkpoints"):
+            if str(actual["full_text"]["type"]).upper() != "LONGTEXT":
+                raise RuntimeError(f"Unsupported schema: {table_name}.full_text must be LONGTEXT")
+        primary = tuple(inspector.get_pk_constraint(table_name).get("constrained_columns") or [])
+        if primary != tuple(column.name for column in table.primary_key):
+            raise RuntimeError(f"Unsupported schema primary key: {table_name}")
+        indexes = inspector.get_indexes(table_name) + [dict(value,unique=True) for value in inspector.get_unique_constraints(table_name)]
+        for constraint in table.constraints:
+            if isinstance(constraint, UniqueConstraint):
+                columns = tuple(column.name for column in constraint.columns)
+                if not any(tuple(value.get("column_names") or []) == columns and value.get("unique") for value in indexes):
+                    raise RuntimeError(f"Unsupported schema unique key: {table_name}.{columns}")
+        for index in table.indexes:
+            columns = tuple(column.name for column in index.columns)
+            if not any(tuple(value.get("column_names") or []) == columns
+                       and (not index.unique or value.get("unique")) for value in indexes):
+                raise RuntimeError(f"Unsupported schema index: {table_name}.{index.name}")
+    if any(not is_key_digest(row[0]) for row in connection.execute(text("SELECT api_key FROM api_users"))):
+        raise RuntimeError("Connection key migration required; run python -m scripts.manage_db upgrade")

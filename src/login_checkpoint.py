@@ -3,8 +3,9 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from src.credentials import credential_store
 
@@ -49,6 +50,17 @@ def prune(at):
     directory = credential_store().path.parent / '.login-checkpoints'
     if not directory.exists():
         return
+    # A killed writer never reaches its finally block. Only discard sufficiently
+    # old files created by this module; do not follow links or remove live writes.
+    for path in directory.glob('.pending-*'):
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            modified = datetime.fromtimestamp(path.stat().st_mtime, ZoneInfo('Asia/Shanghai')).replace(tzinfo=None)
+            if modified <= at - timedelta(minutes=10):
+                path.unlink()
+        except OSError:
+            pass
     for path in directory.glob('*.json'):
         if path.is_symlink() or not path.is_file():
             continue

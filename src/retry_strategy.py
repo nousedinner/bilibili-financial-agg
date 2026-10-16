@@ -3,8 +3,8 @@
 # 不同错误类型的最大重试次数
 MAX_RETRIES_BY_ERROR = {
     "permanent": 0,      # 视频已删除/404，永不重试
-    "incomplete_info": 2, # 视频信息不完整(duration=0)，需重新抓取
-    "llm_failed": 2,      # LLM分析失败，降级重试
+    "incomplete_info": 3, # Align with the admitted stage's existing attempt cap.
+    "llm_failed": 3,
     "transcript": 3,      # 字幕获取失败，正常重试
     "unknown": 3,         # 未知错误，正常重试
 }
@@ -15,6 +15,10 @@ def classify_error(error_message: str, duration: int = 0) -> str:
     if not error_message:
         return "unknown"
     msg = error_message.lower()
+    reason = msg.rsplit(": ", 1)[-1]
+    if reason in MAX_RETRIES_BY_ERROR or reason in ("risk_blocked", "http_blocked", "auth_required",
+            "empty_subtitle", "subtitle_integrity", "subtitle_download", "transient"):
+        return reason
     # 视频已删除
     if "404" in msg or "啥都木有" in msg:
         return "permanent"

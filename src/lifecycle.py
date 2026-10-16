@@ -38,7 +38,7 @@ def failure_reason(exc):
         return "auth_required"
     if code in (-352, -403):
         return "risk_blocked"
-    if code in (-412, 412, 429):
+    if code in (-412, 403, 412, 429):
         return "http_blocked"
     if code == -404:
         return "permanent"

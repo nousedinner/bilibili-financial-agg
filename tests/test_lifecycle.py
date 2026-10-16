@@ -104,6 +104,32 @@ class Lifecycle(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await db.get(VideoWork, 'BVnew')).state, 'exhausted')
             self.assertIsNone(await db.get(Summary, 'BVnew'))
 
+    async def test_metadata_risk_keeps_its_full_cooldown_without_starting_transcription(self):
+        await self.admit()
+        async with bilibili.BiliClient('TEST_SESSION') as client:
+            with patch.object(bilibili,'_run_curl',AsyncMock(side_effect=bilibili.BiliAPIError(-352,'fixture risk'))),patch.object(fetcher,'fetch_transcript',AsyncMock()) as transcribe:
+                with self.assertRaises(bilibili.BiliAPIError) as raised:
+                    await fetcher._process_video(client,1,self.payload())
+                self.assertEqual(raised.exception.code,-352)
+                transcribe.assert_not_awaited()
+        async with self.sessions() as db:
+            work=await db.get(VideoWork,'BVnew')
+            self.assertEqual(work.reason,'risk_blocked')
+            self.assertEqual(work.next_attempt_at,self.at+timedelta(seconds=900))
+            self.assertEqual((await db.get(WorkStage,('BVnew','metadata'))).attempts,1)
+
+    async def test_aid_lookup_preserves_transport_and_json_risk_errors(self):
+        async with bilibili.BiliClient('TEST_SESSION') as client:
+            for code in (412,-352):
+                with patch.object(bilibili,'_run_curl',AsyncMock(side_effect=bilibili.BiliAPIError(code,'fixture'))):
+                    with self.assertRaises(bilibili.BiliAPIError) as raised:
+                        await client.get_video_aid('BVnew')
+                    self.assertEqual(raised.exception.code,code)
+            with patch.object(bilibili,'_run_curl',AsyncMock(return_value=(json.dumps({'code':-352,'message':'fixture risk'}).encode(),200))):
+                with self.assertRaises(bilibili.BiliAPIError) as raised:
+                    await client.get_video_aid('BVnew')
+                self.assertEqual(raised.exception.reason,'risk_blocked')
+
     async def test_hard_and_recent_boundaries_reject_before_queue_creation(self):
         batch=await workflow.create_batch(self.sessions,origin='incremental',since=automatic_floor(self.at),until=self.at)
         for age in (timedelta(days=8),timedelta(days=200)):

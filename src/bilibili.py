@@ -453,9 +453,12 @@ class BiliClient:
         try:
             body, _ = await _run_curl(_bili_curl_args(url), timeout=10)
             data = _json.loads(body)
+        except BiliAPIError:
+            raise
         except Exception as e:
             raise BiliAPIError(-1, f"pagelist request failed: {e}")
         if data.get("code") != 0:
+            request_policy().observe(url, data.get("code", -1))
             raise BiliAPIError(data.get("code", -1), data.get("message", "pagelist error"))
         pages = data.get("data", [])
         if not pages:
@@ -476,6 +479,10 @@ class BiliClient:
             data = _json.loads(body)
             if data.get("code") == 0:
                 return data.get("data", {}).get("aid", 0) or 0
+            request_policy().observe(url, data.get("code", -1))
+            raise BiliAPIError(data.get("code", -1), data.get("message", "view error"))
+        except BiliAPIError:
+            raise
         except Exception as e:
             print(f"[bilibili] get_video_aid({bvid}) failed: {e}")
         return 0

@@ -82,6 +82,8 @@ schema 7 起，新增博主或缺失水位线时只建立当时的起点，不�
 
 重新授权在服务器创建三分钟有效的新会话，用户用官方 B 站 APP 确认；候选账号、登录状态验证通过后原子更新 `/app/data/bili-credential.json`，无需重启，不读取官方 APP 私有数据，不依赖 ROOT。当前同机交互必须先真机验证，默认构建不开放授权写操作；验证包用 `-PauthorizationPoc=true` 构建。
 
+1.1.1 支持成功响应中的受信 SSO 一次性票据及原始 Set-Cookie 值。短期回调/候选检查点位于凭据目录的 `.login-checkpoints`，文件权限为 600，与原凭据版本及三分钟会话绑定，到期清理。临时失败重试同一会话，完成请求可幂等补记状态；票据已消费且网络响应完全丢失时仍可能需要重新扫码。普通手机权限的验证结果及剩余步骤见 [真机记录](docs/DEVICE_VALIDATION_20261016.md)。
+
 即时通知使用可选的 FCM HTTP v1。服务账号 JSON 只放服务器的 `/app/data/firebase-service-account.json` 并设置 600 权限；路径可在 `push.service_account_file` 或 `FCM_SERVICE_ACCOUNT_FILE` 指定。APP 的公共 Firebase 客户端配置参考 `android/app/firebase.properties.example`，真实配置文件不入 Git，绝不能把服务账号私钥放入 APP。用户主动启用时正常申请通知权限；后台周期检查只作补漏，不能声称即时送达。必须从服务器发送真实测试通知并在手机点击确认，不能用本地弹窗替代验收。
 
 `asr.auth_failure_policy` 默认 `continue`，保留既有摘要可用性并受批次/每日音频预算限制。只有推送配置完整、设备允许通知且实际确认过服务器测试通知时，`wait` 才能生效；否则不让新任务悄悄长期等待。凭据恢复只唤醒明确关联旧凭据、仍在原范围内的已登记阻塞任务，不升级历史 ASR。真实后台通知和同机授权未验收时应明确保留此边界。

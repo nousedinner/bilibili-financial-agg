@@ -126,12 +126,13 @@ class FinRepository(private val prefs: ConnectionStore, private val cache: Conte
     }
 
     private fun <T> payload(response: Response<ApiResponse<T>>, management: Boolean = false): T {
-        if (management && response.code() in listOf(403,409,410,429,503)) throw ManagementException(when(response.code()) {
+        if (management && response.code() in listOf(403,409,410,429,502,503)) throw ManagementException(when(response.code()) {
             403 -> "独立管理密钥不正确，阅读连接保持不变"
             409 -> "授权会话或版本已变化，请刷新状态后重新开始"
             410 -> "二维码已过期，请重新发起授权"
             429 -> "请稍后检查授权结果"
-            else -> "服务器尚未配置授权管理服务"
+            502 -> "暂时无法获取有效的 B 站授权会话，请稍后重试"
+            else -> "授权管理服务暂时不可用，请稍后重试或检查服务器配置"
         })
         if (!response.isSuccessful) throw ApiException(response.code(), when (response.code()) {
             401, 403 -> "认证已失效，请重新配置"

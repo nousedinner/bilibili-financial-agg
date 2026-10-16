@@ -12,7 +12,7 @@ from sqlalchemy import select
 
 from src.authorization import (public_auth_status, record_auth_check, deliver_alerts,
                                check_authorization, push_sender)
-from src.bilibili import BiliClient
+from src.bilibili import BiliClient, BiliAPIError
 from src.config import get_env
 from src.credentials import credential_store, CredentialStore
 from src.lifecycle import now, owner_context, fence
@@ -30,6 +30,35 @@ class LoginPoll(BaseModel):
 
 class ManualRetry(BaseModel):
     bvids: list[str] = Field(min_length=1, max_length=50)
+
+
+@asynccontextmanager
+async def _login_client(*args, **kwargs):
+    try:
+        async with BiliClient(*args, **kwargs) as client:
+            yield client
+    except BiliAPIError:
+        raise HTTPException(503, "B站授权服务暂时不可用，请稍后重试") from None
+
+
+def _validated_login_qr(data):
+    if not isinstance(data, dict):
+        raise HTTPException(502, "上游返回的授权会话无效")
+    qr_url, qr_key = data.get("url"), data.get("qrcode_key")
+    if (not isinstance(qr_url, str) or not 0 < len(qr_url) <= 2048
+            or not isinstance(qr_key, str) or not 0 < len(qr_key) <= 256):
+        raise HTTPException(502, "上游返回的授权会话无效")
+    try:
+        parsed = urlsplit(qr_url)
+        trusted = (parsed.scheme == "https" and parsed.hostname in {
+            "passport.bilibili.com", "account.bilibili.com"}
+            and parsed.port in (None, 443) and parsed.username is None
+            and parsed.password is None and not parsed.fragment)
+    except ValueError:
+        trusted = False
+    if not trusted:
+        raise HTTPException(502, "上游返回的授权会话无效")
+    return qr_url, qr_key
 
 
 def build_router(api_dependency, sessions_getter, guard_getter):
@@ -145,12 +174,10 @@ def build_router(api_dependency, sessions_getter, guard_getter):
     @router.post("/api/bili/auth/sessions", dependencies=[Depends(management)])
     async def create_login():
         async with owned():
-            async with BiliClient() as client:
+            async with _login_client() as client:
                 result = await client._get("https://passport.bilibili.com/x/passport-login/web/qrcode/generate", signed=False)
             data = result.get("data") or {}
-            qr_url, qr_key = data.get("url", ""), data.get("qrcode_key", "")
-            if urlsplit(qr_url).hostname != "passport.bilibili.com" or urlsplit(qr_url).scheme != "https" or not qr_key:
-                raise HTTPException(502, "上游返回的授权会话无效")
+            qr_url, qr_key = _validated_login_qr(data)
             session_id, nonce = str(uuid4()), secrets.token_urlsafe(32)
             async with sessions_getter()() as session:
                 await fence(session)
@@ -177,7 +204,7 @@ def build_router(api_dependency, sessions_getter, guard_getter):
                 row.last_polled_at = now()
                 qr_key, expected_version = row.qrcode_key, row.credential_version
                 await session.commit()
-            async with BiliClient() as client:
+            async with _login_client() as client:
                 result = await client._get("https://passport.bilibili.com/x/passport-login/web/qrcode/poll",
                     {"qrcode_key": qr_key}, signed=False)
             data = result.get("data") or {}
@@ -197,7 +224,7 @@ def build_router(api_dependency, sessions_getter, guard_getter):
                 parsed = CredentialStore._parse(candidate, expected_version + 1)
             except ValueError:
                 raise HTTPException(502, "授权响应缺少有效凭据") from None
-            async with BiliClient(parsed.sessdata, cookie_extra=parsed.cookie_header()) as client:
+            async with _login_client(parsed.sessdata, cookie_extra=parsed.cookie_header()) as client:
                 validation = await client.validate_sessdata()
                 if validation["state"] != "valid":
                     raise HTTPException(502, "候选凭据尚未通过验证，已保留原有授权")

@@ -118,6 +118,18 @@ class RepositoryTest {
         assertEquals("123", offline.items.single().dynId)
     }
 
+    @Test fun upstreamLoginFailuresKeepReadingConnectionAndShowActionableMessage() = runBlocking {
+        connect()
+        for (code in listOf(502,503)) {
+            server.enqueue(MockResponse().setResponseCode(code))
+            val result=repo.startBiliLogin("separate-management-secret",server.url("/").toString())
+            assertTrue(result.exceptionOrNull() is ManagementException)
+            assertFalse(result.exceptionOrNull()!!.message!!.contains(code.toString()))
+            server.enqueue(response("""{"code":0,"data":{"state":"invalid"}}"""))
+            assertEquals("invalid",repo.authorizationStatus().getOrThrow().state)
+        }
+    }
+
     @Test fun authenticationFailureNeverReturnsOrKeepsCache() = runBlocking {
         connect(); server.enqueue(response(page)); repo.getFeedPage().getOrThrow()
         server.enqueue(MockResponse().setResponseCode(401))

@@ -335,6 +335,42 @@ class Lifecycle(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(secret,completed.text)
         self.assertEqual(await self.count(VideoWork),0)
 
+    async def test_qr_generation_accepts_both_observed_official_login_hosts(self):
+        headers={'X-Management-Key':'management-test-secret'}
+        for host in ['passport.bilibili.com','account.bilibili.com']:
+            url='https://'+host+'/h5-app/passport/login/scan?qrcode_key='+'a'*32
+            upstream={'code':0,'data':{'url':url,'qrcode_key':'a'*32}}
+            with self.subTest(host=host),patch.dict('os.environ',{'FIN_AGG_MANAGEMENT_KEY':'management-test-secret'}),patch.object(bilibili.BiliClient,'_get',AsyncMock(return_value=upstream)):
+                result=await self.http.post('/api/bili/auth/sessions',headers=headers)
+            self.assertEqual(result.status_code,200,result.text)
+            self.assertEqual(result.json()['data']['qr_url'],url)
+        self.assertEqual(await self.count(LoginSession),2)
+        self.assertEqual(credential_store().current().version,1)
+        self.assertEqual(await self.count(VideoWork),0)
+
+    async def test_qr_generation_rejects_untrusted_urls_without_creating_sessions(self):
+        headers={'X-Management-Key':'management-test-secret'}
+        urls=['https://account.bilibili.com.evil.invalid/scan','http://account.bilibili.com/scan',
+            'https://user@account.bilibili.com/scan','https://account.bilibili.com:8443/scan',
+            'https://passport.bilibili.com/scan#untrusted',123]
+        for url in urls:
+            upstream={'code':0,'data':{'url':url,'qrcode_key':'a'*32}}
+            with self.subTest(url=url),patch.dict('os.environ',{'FIN_AGG_MANAGEMENT_KEY':'management-test-secret'}),patch.object(bilibili.BiliClient,'_get',AsyncMock(return_value=upstream)):
+                result=await self.http.post('/api/bili/auth/sessions',headers=headers)
+            self.assertEqual(result.status_code,502)
+        self.assertEqual(await self.count(LoginSession),0)
+        self.assertEqual(credential_store().current().version,1)
+        self.assertEqual(await self.count(VideoWork),0)
+
+    async def test_login_upstream_block_does_not_invalidate_server_credential(self):
+        headers={'X-Management-Key':'management-test-secret'}
+        with patch.dict('os.environ',{'FIN_AGG_MANAGEMENT_KEY':'management-test-secret'}),patch.object(bilibili.BiliClient,'_get',AsyncMock(side_effect=bilibili.BiliAPIError(412,'fixture blocked'))):
+            result=await self.http.post('/api/bili/auth/sessions',headers=headers)
+        self.assertEqual(result.status_code,503)
+        self.assertEqual(await self.count(LoginSession),0)
+        self.assertEqual(await self.count(AuthState),0)
+        self.assertEqual(credential_store().current().version,1)
+
     async def test_fcm_request_uses_scoped_signed_assertion_without_upstream_credentials(self):
         import httpx
         from cryptography.hazmat.primitives.asymmetric import rsa,padding

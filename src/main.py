@@ -35,9 +35,6 @@ logger = logging.getLogger(__name__)
 _job_lock = asyncio.Lock()
 _background_tasks = set()
 _scheduler = None
-_cookie_cache = (0.0, {})
-_cookie_lock = asyncio.Lock()
-_pending_job_failures: dict = {}  # Issue #11 #3: 按job_id追踪终态写入失败
 _owner_guard = None
 
 
@@ -63,16 +60,20 @@ async def lifespan(app: FastAPI):
     _owner_guard = OwnerGuard(engine, async_session, on_reacquired=_recover_owner)
     await _owner_guard.start()
     try:
-        startup_ticket = owner_context.set(_owner_guard.ticket())
+        startup_ticket = None
         try:
-            from src.fetcher import outbox_replay_on_startup
-            await outbox_replay_on_startup()
-            await _recover_interrupted()
-            _start_scheduler()
-            await _authorization_maintenance()
-            await _deliver_notification_outbox()
+            startup_ticket = owner_context.set(_owner_guard.ticket())
+            await _recover_owner()
+        except Exception as exc:
+            # The guard monitor retries recovery with admissions fenced closed.
+            _owner_guard._lose()
+            logger.warning("Startup recovery deferred (%s)", type(exc).__name__)
         finally:
-            owner_context.reset(startup_ticket)
+            if startup_ticket is not None:
+                owner_context.reset(startup_ticket)
+        _start_scheduler()
+        await _authorization_maintenance()
+        await _deliver_notification_outbox()
         yield
     finally:
         if _scheduler:
@@ -87,7 +88,7 @@ async def lifespan(app: FastAPI):
     await engine.dispose()
     # Issue #14 #3: 关闭outbox SQLite连接
     from src.fetcher import outbox_close
-    outbox_close()
+    await asyncio.to_thread(outbox_close)
 
 
 def _start_scheduler():
@@ -110,6 +111,8 @@ def _start_scheduler():
         id="authorization_health", max_instances=1, coalesce=True)
     _scheduler.add_job(_deliver_notification_outbox, "interval", seconds=60,
         id="notification_delivery", max_instances=1, coalesce=True)
+    _scheduler.add_job(_drain_job_outbox, "interval", seconds=60,
+        id="job_status_delivery", max_instances=1, coalesce=True)
     _scheduler.start()
 
 
@@ -118,9 +121,10 @@ async def _authorization_maintenance():
     from src.lifecycle import owner_context
     if _owner_guard is None or _owner_guard.lost:
         return
-    ticket = _owner_guard.ticket()
-    token = owner_context.set(ticket)
+    token = None
     try:
+        ticket = _owner_guard.ticket()
+        token = owner_context.set(ticket)
         await ticket.check()
         from src import login_checkpoint
         login_checkpoint.prune(_utcnow())
@@ -130,7 +134,8 @@ async def _authorization_maintenance():
     except Exception as exc:
         logger.warning("Authorization check deferred (%s)", type(exc).__name__)
     finally:
-        owner_context.reset(token)
+        if token is not None:
+            owner_context.reset(token)
 
 
 async def _deliver_notification_outbox():
@@ -138,13 +143,37 @@ async def _deliver_notification_outbox():
     from src.lifecycle import owner_context
     if _owner_guard is None or _owner_guard.lost:
         return
-    token = owner_context.set(_owner_guard.ticket())
+    token = None
     try:
+        token = owner_context.set(_owner_guard.ticket())
         await deliver_alerts(async_session)
     except Exception as exc:
         logger.warning("Notification delivery deferred (%s)", type(exc).__name__)
     finally:
-        owner_context.reset(token)
+        if token is not None:
+            owner_context.reset(token)
+
+
+async def _drain_job_outbox():
+    from src.fetcher import outbox_replay_on_startup
+    from src.lifecycle import owner_context
+    guard = _owner_guard
+    if guard is None or guard.lost or guard.recovering or _job_lock.locked():
+        return
+    async with _job_lock:
+        token, task = None, asyncio.current_task()
+        try:
+            ticket = guard.ticket()
+            token = owner_context.set(ticket)
+            guard.tasks.add(task)
+            await ticket.check()
+            await outbox_replay_on_startup()
+        except Exception as exc:
+            logger.warning("Job status delivery deferred (%s)", type(exc).__name__)
+        finally:
+            guard.tasks.discard(task)
+            if token is not None:
+                owner_context.reset(token)
 
 
 async def _scheduled_fetch():
@@ -157,7 +186,7 @@ async def _scheduled_digest():
 
 app = FastAPI(
     title="B站财经博主聚合服务",
-    version="1.1.4",
+    version="1.1.5",
     lifespan=lifespan,
 )
 
@@ -414,6 +443,16 @@ async def list_videos(
         }
 
 
+def _legacy_neutral_unverified(row, samples, interaction_stage):
+    """Legacy all-neutral values can be either model output or a fallback."""
+    from src.analyzer import ANALYSIS_SCHEMA
+    result = interaction_stage.result if interaction_stage else None
+    verified = isinstance(result, dict) and result.get("_output_schema") == ANALYSIS_SCHEMA
+    return bool(row is not None and samples and not verified
+        and row.sentiment_bullish == 0 and row.sentiment_bearish == 0
+        and row.sentiment_neutral == 1)
+
+
 @app.get("/api/videos/{bvid}", dependencies=[Depends(require_api_key)])
 async def get_video_detail(bvid: str):
     async with async_session() as session:
@@ -429,6 +468,11 @@ async def get_video_detail(bvid: str):
         work = await session.get(VideoWork, bvid)
         comment_stage = await session.get(WorkStage, (bvid, "comments"))
         danmaku_stage = await session.get(WorkStage, (bvid, "danmaku"))
+        interaction_stage = await session.get(WorkStage, (bvid, "interaction_analysis"))
+        comment_unverified = _legacy_neutral_unverified(comment,
+            comment.fetched_count if comment else 0, interaction_stage)
+        danmaku_unverified = _legacy_neutral_unverified(danmaku,
+            danmaku.sampled_count if danmaku else 0, interaction_stage)
 
         return {
             "code": 0,
@@ -443,8 +487,8 @@ async def get_video_detail(bvid: str):
                 "analysis_status": video.analysis_status,
                 "work_status": work.state if work else "legacy",
                 "published_version": work.published_version if work else None,
-                "comments_status": "no_samples" if comment is not None and not comment.fetched_count else comment_stage.state if comment_stage else "legacy" if comment else "unknown",
-                "danmaku_status": "no_samples" if danmaku is not None and not danmaku.sampled_count else danmaku_stage.state if danmaku_stage else "legacy" if danmaku else "unknown",
+                "comments_status": "unverified" if comment_unverified else "no_samples" if comment is not None and not comment.fetched_count else comment_stage.state if comment_stage else "legacy" if comment else "unknown",
+                "danmaku_status": "unverified" if danmaku_unverified else "no_samples" if danmaku is not None and not danmaku.sampled_count else danmaku_stage.state if danmaku_stage else "legacy" if danmaku else "unknown",
                 "summary": {
                     "text": summary.summary if summary else None,
                     "key_points": summary.key_points if summary else [],
@@ -468,7 +512,7 @@ async def get_video_detail(bvid: str):
                     },
                     "hot_comments": comment.hot_comments if comment else [],
                     "keywords": comment.keywords if comment else [],
-                } if comment and comment.fetched_count and comment.sentiment_neutral is not None else None,
+                } if comment and comment.fetched_count and comment.sentiment_neutral is not None and not comment_unverified else None,
                 "danmaku": {
                     "total": danmaku.total_count if danmaku else 0,
                     "sampled": danmaku.sampled_count if danmaku else 0,
@@ -478,7 +522,7 @@ async def get_video_detail(bvid: str):
                         "neutral": danmaku.sentiment_neutral if danmaku else 0,
                     },
                     "keywords": danmaku.keywords if danmaku else [],
-                } if danmaku and danmaku.sampled_count and danmaku.sentiment_neutral is not None else None,
+                } if danmaku and danmaku.sampled_count and danmaku.sentiment_neutral is not None and not danmaku_unverified else None,
             },
         }
 
@@ -649,9 +693,14 @@ async def health():
         return JSONResponse(status_code=503, content={"status": "degraded", "scheduler": "stopped"})
     if _owner_guard is not None and _owner_guard.lost:
         return JSONResponse(status_code=503, content={"status": "degraded", "reason": "worker ownership lost"})
+    if _owner_guard is not None and _owner_guard.recovering:
+        return JSONResponse(status_code=503, content={"status": "degraded", "reason": "worker ownership recovering"})
     # Issue #14 #3: 检查outbox中是否有待重放的终态
     from src.fetcher import outbox_pending
-    pending = outbox_pending()
+    try:
+        pending = await asyncio.to_thread(outbox_pending)
+    except Exception:
+        return JSONResponse(status_code=503, content={"status": "degraded", "reason": "job outbox unavailable"})
     if pending:
         return JSONResponse(status_code=503, content={"status": "degraded",
             "reason": "job status write failed",
@@ -823,7 +872,7 @@ async def _execute_job(job_id, work):
             status, error = "failed", str(exc)[:1000]
 
         # Issue #14 #3: 先写入独立SQLite outbox，再尝试MySQL
-        saved = outbox_save(job_id, status, result, error)
+        saved = await asyncio.to_thread(outbox_save, job_id, status, result, error)
         if not saved:
             logger.warning(f"[execute_job] outbox保存失败: {job_id}")
 
@@ -833,11 +882,13 @@ async def _execute_job(job_id, work):
                 async with async_session() as session:
                     await fence(session)
                     job = await session.get(FetchJob, job_id)
+                    if job is None:
+                        raise RuntimeError("Task record is missing; terminal intent retained in outbox")
                     job.status, job.result, job.error_message = status, result, error
                     job.finished_at = _utcnow()
                     await session.commit()
                 # Issue #14 #3: MySQL写入成功，从outbox移除
-                outbox_pop(job_id)
+                await asyncio.to_thread(outbox_pop, job_id)
                 break
             except OwnershipLost:
                 # Persisted outbox intent can be replayed by the next legitimate owner.
@@ -856,10 +907,10 @@ async def _execute_job(job_id, work):
                         cancelled_exc = ce
                         break
                 else:
-                    # Issue #14 #3: MySQL最终失败，outbox已保存，启动时会重放
+                    # The owner periodically retries this persisted terminal intent.
                     logger.error(f"[execute_job] 状态提交最终失败: {job_id}, 已持久化到outbox (DEGRADED)")
     except OwnershipLost:
-        outbox_save(job_id, "interrupted", None, "Execution ownership lost")
+        await asyncio.to_thread(outbox_save, job_id, "interrupted", None, "Execution ownership lost")
         raise
     finally:
         _job_lock.release()

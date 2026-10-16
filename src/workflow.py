@@ -14,6 +14,8 @@ from src.lifecycle import (HARD_SINCE, STAGES, WorkflowError, automatic_floor,
 from src.models import (WorkBatch, VideoWork, WorkStage, TranscriptCheckpoint,
     ASRSegment, DailyUsage, Blogger, Video, Transcript, Summary)
 
+PAID_ANALYSIS_STAGES = frozenset({"analysis", "interaction_analysis"})
+
 
 async def recover_abandoned_work(sessions):
     """Called only by the exclusive job holder, before it starts any pipeline."""
@@ -114,7 +116,9 @@ async def admit(sessions, batch_id, mid, payload, *, allow_legacy=False):
             rows = (await session.execute(select(WorkStage).where(WorkStage.bvid == bvid))).scalars().all()
             for row in rows:
                 if row.state not in ("complete", "no_track", "skipped"):
-                    row.state, row.attempts, row.reason, row.next_attempt_at = "pending", 0, None, None
+                    row.state, row.reason, row.next_attempt_at = "pending", None, None
+                    if row.stage not in PAID_ANALYSIS_STAGES:
+                        row.attempts = 0
         if old is None:
             session.add(Video(bvid=bvid, mid=mid, title=str(payload.get("title") or "")[:500],
                 publish_time=published, fetch_status="pending", analysis_status="pending", retry_count=0))
@@ -222,7 +226,11 @@ class WorkContext:
             row = WorkStage(bvid=self.bvid, stage=name, attempts=0, state="pending")
             session.add(row)
         if input_version and row.input_version and input_version != row.input_version:
-            row.attempts, row.result = 0, None
+            # A new comment/body version invalidates its cache, not its spending
+            # limit. Manual re-admission must preserve these counters as well.
+            if name not in PAID_ANALYSIS_STAGES:
+                row.attempts = 0
+            row.result = None
         if state == "running":
             if (row.attempts or 0) >= max_retries_for(row.reason or "unknown"):
                 raise WorkflowError("retry_exhausted", name)

@@ -223,7 +223,8 @@ async def manual_backfill(sessions, client, mid, since, process, *, cap=20, page
             page += 1
     except Exception as exc:
         error = getattr(exc, "reason", type(exc).__name__)
-    await freeze_batch(sessions, batch_id, complete=True, spent_pages=initial_pages - budget["remaining"])
+    await freeze_batch(sessions, batch_id, complete=error is None and reached,
+                       spent_pages=initial_pages - budget["remaining"])
     jobs = await due_work(sessions, limit=cap, batch_id=batch_id)
     result = await _process_selected(sessions, client, jobs, process)
     result = {**result, "mid": mid, "name": blogger.name, "batch_id": batch_id,

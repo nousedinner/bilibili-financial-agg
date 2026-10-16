@@ -23,6 +23,8 @@ from src import login_checkpoint
 
 _login_locks = weakref.WeakValueDictionary()
 _login_create_lock = asyncio.Lock()
+LOGIN_TTL_SECONDS = 180
+LOGIN_CREATE_INTERVAL_SECONDS = 10
 
 
 async def prune_login_sessions(sessions):
@@ -194,9 +196,11 @@ def build_router(api_dependency, sessions_getter, guard_getter, job_lock_getter=
                 active = (await session.execute(select(func.count()).select_from(LoginSession).where(
                     LoginSession.expires_at > now(), LoginSession.state == "pending"))).scalar()
                 recent = (await session.execute(select(func.count()).select_from(LoginSession).where(
-                    LoginSession.expires_at > now() + timedelta(seconds=170)))).scalar()
+                    LoginSession.expires_at > now() + timedelta(
+                        seconds=LOGIN_TTL_SECONDS - LOGIN_CREATE_INTERVAL_SECONDS)))).scalar()
                 if active >= 3 or recent:
-                    raise HTTPException(429, "授权会话创建过于频繁，请稍后重试", headers={"Retry-After": "10"})
+                    raise HTTPException(429, "授权会话创建过于频繁，请稍后重试",
+                                        headers={"Retry-After": str(LOGIN_CREATE_INTERVAL_SECONDS)})
                 await session.commit()
             async with _login_client() as client:
                 result = await client._get("https://passport.bilibili.com/x/passport-login/web/qrcode/generate", signed=False)
@@ -207,9 +211,10 @@ def build_router(api_dependency, sessions_getter, guard_getter, job_lock_getter=
                 await fence(session)
                 session.add(LoginSession(id=session_id, nonce_hash=hashlib.sha256(nonce.encode()).hexdigest(),
                     qrcode_key=qr_key, credential_version=credential_store().current().version,
-                    state="pending", expires_at=now() + timedelta(minutes=3)))
+                    state="pending", expires_at=now() + timedelta(seconds=LOGIN_TTL_SECONDS)))
                 await session.commit()
-        return {"code": 0, "data": {"id": session_id, "nonce": nonce, "qr_url": qr_url, "expires_in": 180}}
+        return {"code": 0, "data": {"id": session_id, "nonce": nonce, "qr_url": qr_url,
+                                    "expires_in": LOGIN_TTL_SECONDS}}
 
     @router.post("/api/bili/auth/sessions/{session_id}/poll")
     async def poll_login(session_id: str, req: LoginPoll):

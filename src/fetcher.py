@@ -5,7 +5,9 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
+from functools import wraps
 from datetime import datetime, date, timezone, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 from typing import Optional
@@ -49,6 +51,15 @@ logger = logging.getLogger(__name__)
 
 # ── Issue #14 #3: 独立SQLite outbox — 任务终态持久化，MySQL不可写时保结果 ──
 _outbox_conn: Optional[sqlite3.Connection] = None
+_outbox_lock = threading.RLock()
+
+
+def _outbox_serialized(function):
+    @wraps(function)
+    def call(*args, **kwargs):
+        with _outbox_lock:
+            return function(*args, **kwargs)
+    return call
 
 def _outbox_path() -> str:
     return get_config().get("data", {}).get("outbox_path",
@@ -70,7 +81,8 @@ def _get_outbox_conn() -> sqlite3.Connection:
         logger.warning(f"[outbox] 目录 {os.path.dirname(path)} 不可写，fallback 到 /tmp")
         path = os.path.join("/tmp", "job_outbox.db")
         os.makedirs("/tmp", exist_ok=True)
-    _outbox_conn = sqlite3.connect(path, timeout=5)
+    # Operations run in worker threads; the lock serializes connection access.
+    _outbox_conn = sqlite3.connect(path, timeout=5, check_same_thread=False)
     _outbox_conn.execute("PRAGMA journal_mode=WAL")
     _outbox_conn.execute("""CREATE TABLE IF NOT EXISTS job_outbox (
         job_id TEXT PRIMARY KEY,
@@ -84,6 +96,7 @@ def _get_outbox_conn() -> sqlite3.Connection:
     _outbox_conn.commit()
     return _outbox_conn
 
+@_outbox_serialized
 def outbox_save(job_id: str, status: str, result: Optional[dict] = None, error: Optional[str] = None) -> bool:
     """保存任务终态到独立SQLite文件。返回是否成功。"""
     try:
@@ -98,6 +111,7 @@ def outbox_save(job_id: str, status: str, result: Optional[dict] = None, error: 
         logger.error(f"[outbox] save failed for {job_id}: {e}")
         return False
 
+@_outbox_serialized
 def outbox_pop(job_id: str):
     """MySQL终态写入成功后，从outbox移除。"""
     try:
@@ -107,6 +121,7 @@ def outbox_pop(job_id: str):
     except Exception as e:
         logger.error(f"[outbox] pop failed for {job_id}: {e}")
 
+@_outbox_serialized
 def outbox_pending() -> list:
     """获取所有待重放的outbox条目。"""
     try:
@@ -116,11 +131,19 @@ def outbox_pending() -> list:
                  "result": json.loads(r[2]) if r[2] else None, "error": r[3]} for r in rows]
     except Exception as e:
         logger.error(f"[outbox] load failed: {e}")
-        return []
+        raise
+
+
+@_outbox_serialized
+def _outbox_record_retry(job_id):
+    conn = _get_outbox_conn()
+    conn.execute("UPDATE job_outbox SET retry_count = retry_count + 1, last_retry_at = ? WHERE job_id = ?",
+                 (_utcnow().isoformat(), job_id))
+    conn.commit()
 
 async def outbox_replay_on_startup():
-    """启动时重放outbox：将MySQL中仍为running的job更新为outbox中的终态。"""
-    pending = outbox_pending()
+    """Replay persisted terminal intents under the current ownership ticket."""
+    pending = await asyncio.to_thread(outbox_pending)
     if not pending:
         return
     logger.info(f"[outbox] replaying {len(pending)} pending job states")
@@ -130,27 +153,27 @@ async def outbox_replay_on_startup():
             async with async_session() as session:
                 await fence(session)
                 job = await session.get(FetchJob, entry["job_id"])
-                if job and job.status in ("running", "queued"):
+                if job is None:
+                    raise RuntimeError("Task record missing; keep its terminal intent for recovery")
+                if (job.status in ("running", "queued") or
+                        (job.status == "interrupted" and job.error_message == "Service restarted")):
                     job.status = entry["status"]
                     job.result = entry["result"]
                     job.error_message = entry["error"]
                     job.finished_at = _utcnow()
                     await session.commit()
-                outbox_pop(entry["job_id"])
+                await asyncio.to_thread(outbox_pop, entry["job_id"])
                 logger.info(f"[outbox] replayed {entry['job_id']}: {entry['status']}")
         except OwnershipLost:
             raise
         except Exception as e:
             logger.error(f"[outbox] replay failed for {entry['job_id']}: {e}")
             try:
-                conn = _get_outbox_conn()
-                conn.execute(
-                    "UPDATE job_outbox SET retry_count = retry_count + 1, last_retry_at = ? WHERE job_id = ?",
-                    (_utcnow().isoformat(), entry["job_id"]))
-                conn.commit()
+                await asyncio.to_thread(_outbox_record_retry, entry["job_id"])
             except Exception:
                 pass
 
+@_outbox_serialized
 def outbox_close():
     """关闭SQLite连接。"""
     global _outbox_conn
@@ -217,9 +240,7 @@ async def run_fetch_only() -> dict:
         await record_auth_check(async_session, getattr(client, "credential_version", 1),
             cookie_status.get("state", "valid" if cookie_status.get("valid") else "unknown"), cookie_status.get("reason"))
         if cookie_status.get("state") == "invalid":
-            client._sessdata, client._cookie_extra = "", ""
-            if hasattr(client, "_transport"):
-                client._transport.cookies.clear()
+            client.discard_invalid_credentials()
             logger.warning("[fetcher] B站授权无效，已记录告警并停止使用该会话进行普通请求")
 
         for blogger in bloggers:
@@ -261,7 +282,7 @@ async def run_daily_fetch() -> dict:
     """兼容旧接口：抓取 + 汇总。"""
     results = await run_fetch_only()
     bloggers = await _get_enabled_bloggers()
-    await _generate_digest(bloggers, results)
+    await _generate_digest(bloggers)
     return results
 
 
@@ -374,7 +395,7 @@ async def _process_dynamic_core(client: BiliClient, mid: int, dyn_data: dict):
     logger.info(f"[fetcher] dynamic {dyn_id} -- {analysis.get('sentiment', 'neutral')}")
 
 
-async def _generate_digest(bloggers: list, results: dict, target_date: date = None):
+async def _generate_digest(bloggers: list, target_date: date = None):
     target_date = target_date or _latest_closed_date()
     end = datetime.combine(target_date, dt_time(_cutoff_hour()))
     start = end - timedelta(days=1)
@@ -509,7 +530,7 @@ async def regenerate_dirty_digests(include_latest=False):
     result = {"generated": 0, "failed": 0, "has_more": has_more_digests}
     for day in dates[:max_per_round]:
         try:
-            await _generate_digest(bloggers, {}, day)
+            await _generate_digest(bloggers, day)
             result["generated"] += 1
         except OwnershipLost:
             raise

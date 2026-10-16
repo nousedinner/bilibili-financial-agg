@@ -5,6 +5,32 @@ from src.models import Base
 VERSION = 8
 
 
+def _add_nullable_columns(connection):
+    """Only synthesize additive columns that need no data/constraint semantics."""
+    from sqlalchemy.schema import CreateColumn
+    inspector = inspect(connection)
+    additions = []
+    for table_name, table in Base.metadata.tables.items():
+        present = {column["name"] for column in inspector.get_columns(table_name)}
+        for column in table.columns:
+            if column.name in present:
+                continue
+            constrained = (column.primary_key or column.foreign_keys
+                or any(index.columns.contains_column(column) for index in table.indexes)
+                or any(constraint.columns.contains_column(column) for constraint in table.constraints))
+            if (not column.nullable or constrained or column.default is not None
+                    or column.server_default is not None or column.onupdate is not None
+                    or column.server_onupdate is not None or column.computed is not None
+                    or column.identity is not None):
+                raise RuntimeError(f"Explicit migration required for {table_name}.{column.name}; "
+                                   "add its data/constraint migration in src/migrations.py before upgrading")
+            additions.append((table, column))
+    quote = connection.dialect.identifier_preparer.quote
+    for table, column in additions:
+        ddl = str(CreateColumn(column).compile(dialect=connection.dialect))
+        connection.execute(text(f"ALTER TABLE {quote(table.name)} ADD COLUMN {ddl}"))
+
+
 def upgrade(connection):
     current_ver = 0
     # #7: 拒绝高版本数据库被旧程序覆盖
@@ -107,6 +133,8 @@ def upgrade(connection):
                 connection.execute(text("UPDATE api_users SET api_key=:digest WHERE id=:id"),
                                    {"digest": key_digest(old_key), "id": user_id})
 
+    _add_nullable_columns(connection)
+
     # ── schema_version ──
     connection.execute(text("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)"))
     connection.execute(text("DELETE FROM schema_version"))
@@ -136,7 +164,9 @@ def verify(connection):
         actual = {column["name"]: column for column in inspector.get_columns(table_name)}
         absent = set(table.columns.keys()) - set(actual)
         if absent:
-            raise RuntimeError(f"Unsupported schema: {table_name} missing {sorted(absent)}")
+            raise RuntimeError(f"Unsupported schema: {table_name} missing {sorted(absent)}; "
+                               "run python -m scripts.manage_db upgrade with a migration account. "
+                               "Columns with data/constraint semantics require an explicit migration")
         for column in table.columns:
             expected = column.type.dialect_impl(connection.dialect)
             observed = actual[column.name]["type"]

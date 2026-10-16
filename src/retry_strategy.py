@@ -3,6 +3,7 @@
 # 不同错误类型的最大重试次数
 MAX_RETRIES_BY_ERROR = {
     "permanent": 0,      # 视频已删除/404，永不重试
+    "retry_exhausted": 0,
     "incomplete_info": 3, # Align with the admitted stage's existing attempt cap.
     "llm_failed": 3,
     "transcript": 3,      # 字幕获取失败，正常重试

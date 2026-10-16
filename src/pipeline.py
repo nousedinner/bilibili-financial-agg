@@ -137,8 +137,10 @@ async def process(sessions, client, bvid, *, fetch_transcript, analyze_video,
                 except OwnershipLost:
                     raise
                 except Exception as exc:
-                    await context.stage("interaction_analysis", "failed", reason=failure_reason(exc))
-                    raise WorkflowError("llm_failed", "interaction_analysis") from exc
+                    reason = failure_reason(exc)
+                    await context.stage("interaction_analysis", "failed", reason=reason)
+                    raise WorkflowError(reason if reason == "retry_exhausted" else "llm_failed",
+                                        "interaction_analysis") from exc
             else:
                 analysis.update(interaction_stage.result or {})
         else:
@@ -227,7 +229,7 @@ async def process(sessions, client, bvid, *, fetch_transcript, analyze_video,
                 work.next_attempt_at = stage.next_attempt_at
                 video = await session.get(Video, bvid)
                 public_summary, public_transcript = await session.get(Summary, bvid), await session.get(Transcript, bvid)
-                if not (public_summary and public_transcript):
+                if video is not None and not (public_summary and public_transcript):
                     video.fetch_status = "failed"
                     video.analysis_status = "failed" if stage_name.startswith("analysis") else "pending"
                     video.error_type = reason[:20]

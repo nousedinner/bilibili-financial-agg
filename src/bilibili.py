@@ -156,6 +156,12 @@ class BiliClient:
         await self._client.aclose()
         await self._transport.close()
 
+    def discard_invalid_credentials(self):
+        """Continue public requests without sending a confirmed invalid login."""
+        self._sessdata, self._cookie_extra = "", ""
+        self._transport.cookies.clear()
+        self._client.cookies.clear()
+
     def _args(self, url, *, authenticated=True, extra=""):
         cookies = "; ".join(value for value in (self._cookie_extra if authenticated else "", extra) if value)
         return _bili_curl_args(url, self._sessdata if authenticated else "", cookie_extra=cookies)

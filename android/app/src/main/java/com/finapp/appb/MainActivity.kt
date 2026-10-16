@@ -1,6 +1,7 @@
 package com.finapp.appb
 
 import android.os.Bundle
+import android.content.Intent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -38,19 +39,26 @@ import com.finapp.appb.ui.theme.FinAppTheme
 import com.finapp.appb.viewmodel.*
 
 class MainActivity : ComponentActivity() {
+    private var alertEventId by mutableStateOf<String?>(null)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        if(intent?.getStringExtra("route") == "bili_auth") alertEventId=intent.getStringExtra("event_id")
         setContent {
             FinAppTheme {
-                FinAppRoot()
+                FinAppRoot(alertEventId)
             }
         }
+    }
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if(intent.getStringExtra("route") == "bili_auth") alertEventId=intent.getStringExtra("event_id")
     }
 }
 
 @Composable
-fun FinAppRoot() {
+fun FinAppRoot(alertEventId: String? = null) {
     val context = LocalContext.current
     val app = context.applicationContext as FinApp
     val navController = rememberNavController()
@@ -76,6 +84,12 @@ fun FinAppRoot() {
     val currentRoute = navBackStackEntry?.destination?.route
 
     val showBottomBar = currentRoute in listOf(Screen.FEED.route, Screen.BLOGGERS.route, Screen.DAILY.route)
+    LaunchedEffect(alertEventId,isConfigured) {
+        if(alertEventId != null && isConfigured) {
+            app.repository.acknowledgeAlert(alertEventId)
+            navController.navigate(Screen.AUTHORIZATION.route) { launchSingleTop=true }
+        }
+    }
 
     // 【修复关键】把 NavHost 移到 Scaffold 外面
     // 原因：Scaffold 重组时（showBottomBar 变化触发）会连带重建内部的 NavHost，
@@ -164,12 +178,17 @@ fun FinAppRoot() {
                 val settingsVm: SettingsViewModel = viewModel()
                 SettingsScreen(
                     viewModel = settingsVm,
+                    onAuthorization = { navController.navigate(Screen.AUTHORIZATION.route) },
                     onLogout = {
                         navController.navigate(Screen.SETUP.route) {
                             popUpTo(0) { inclusive = true }
                         }
                     }
                 )
+            }
+            composable(Screen.AUTHORIZATION.route) {
+                val authorizationVm: AuthorizationViewModel = viewModel()
+                AuthorizationScreen(authorizationVm) { navController.popBackStack() }
             }
         }
 

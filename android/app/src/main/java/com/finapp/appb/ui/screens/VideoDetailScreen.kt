@@ -167,10 +167,12 @@ fun VideoDetailScreen(
                         }
                     } else {
                         // 根据 analysisStatus 显示不同提示
-                        val (tipTitle, tipText) = when (status) {
-                            "pending" -> "⏳ 等待分析" to "该视频已采集，等待后端分析流水线处理"
-                            "processing" -> "🔄 分析中" to "该视频正在被AI分析，请稍后再来查看"
-                            "failed" -> "❌ 分析失败" to "该视频AI分析失败，将自动重试"
+                        val (tipTitle, tipText) = when {
+                            d.workStatus == "blocked_auth" -> "⏳ 等待重新授权" to "服务器 B 站授权需要恢复，可前往设置处理"
+                            d.workStatus == "skipped" -> "暂未分析" to "该视频暂未满足自动处理条件，需要时可手动恢复"
+                            status == "pending" -> "⏳ 等待分析" to "该视频已采集，等待后端分析流水线处理"
+                            status == "processing" -> "🔄 分析中" to "该视频正在被AI分析，请稍后再来查看"
+                            status == "failed" -> "❌ 分析失败" to "该视频分析未完成，需要时可手动恢复"
                             else -> "🤖 AI 分析" to "该视频尚未完成AI分析"
                         }
                         SectionCard(title = tipTitle) {
@@ -179,7 +181,8 @@ fun VideoDetailScreen(
                     }
 
                     // Comment Analysis
-                    d.comments?.let { ca ->
+                    if(d.commentsStatus !in listOf(null,"legacy","complete")) SectionCard(title="💬 评论分析") { Text("评论暂未获取，正文分析已保留",fontSize=13.sp,color=TextSecondary) }
+                    d.comments?.takeIf { d.commentsStatus in listOf(null,"legacy","complete") }?.let { ca ->
                         SectionCard(title = "💬 评论分析") {
                             val sent = ca.sentiment
                             if (sent != null) {
@@ -221,7 +224,8 @@ fun VideoDetailScreen(
                     }
 
                     // Danmaku Analysis
-                    d.danmaku?.let { da ->
+                    if(d.danmakuStatus !in listOf(null,"legacy","complete")) SectionCard(title="🎯 弹幕分析") { Text("弹幕暂未获取，正文分析已保留",fontSize=13.sp,color=TextSecondary) }
+                    d.danmaku?.takeIf { d.danmakuStatus in listOf(null,"legacy","complete") }?.let { da ->
                         SectionCard(title = "🎯 弹幕分析") {
                             val sent = da.sentiment
                             if (sent != null) {

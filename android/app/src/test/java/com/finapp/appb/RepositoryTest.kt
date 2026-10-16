@@ -26,6 +26,22 @@ private class MemoryPreferences : ConnectionStore {
 private class MemoryCache : ContentCache {
     val feeds = linkedMapOf<String, FeedCacheEntity>()
     val videos = linkedMapOf<String, VideoDetailCacheEntity>()
+    private val bloggerRows = linkedMapOf<Long, BloggerCacheEntity>()
+    private val dailyRows = linkedMapOf<String, DailyCacheEntity>()
+    override val bloggers = object : BloggerCacheDao {
+        override suspend fun getAll() = bloggerRows.values.sortedByDescending { it.cachedAt }
+        override suspend fun insertAll(items: List<BloggerCacheEntity>) { items.forEach { bloggerRows[it.mid] = it } }
+        override suspend fun clear() { bloggerRows.clear() }
+        override suspend fun deleteOlderThan(before: Long) { bloggerRows.entries.removeAll { it.value.cachedAt < before } }
+    }
+    override val daily = object : DailyCacheDao {
+        override suspend fun getAll() = dailyRows.values.sortedByDescending { it.date }
+        override suspend fun getByDate(date: String) = dailyRows[date]
+        override suspend fun insertAll(items: List<DailyCacheEntity>) { items.forEach { dailyRows[it.date] = it } }
+        override suspend fun insert(item: DailyCacheEntity) { dailyRows[item.date] = item }
+        override suspend fun clear() { dailyRows.clear() }
+        override suspend fun deleteOlderThan(before: Long) { dailyRows.entries.removeAll { it.value.cachedAt < before } }
+    }
     override val feed = object : FeedCacheDao {
         override suspend fun getAll() = feeds.values.sortedByDescending { it.publishTime }
         override suspend fun insertAll(items: List<FeedCacheEntity>) { items.forEach { feeds[it.bvid] = it } }
@@ -61,6 +77,27 @@ class RepositoryTest {
         server.enqueue(response("""{"code":0,"data":[]}"""))
         repo.connect(server.url("/").toString(), "test-key", "test-user").getOrThrow()
         assertEquals("test-key", server.takeRequest(5, TimeUnit.SECONDS)!!.getHeader("X-API-Key"))
+    }
+
+    @Test fun readingAuthorizationDoesNotTransmitManagementKey() = runBlocking {
+        connect()
+        server.enqueue(response("""{"code":0,"data":{"state":"unknown","last_confirmed":"invalid","credential_version":2,"push":{"configured":false,"verified":false}}}"""))
+        val status=repo.authorizationStatus().getOrThrow()
+        assertEquals("unknown",status.state)
+        assertFalse(status.push.verified)
+        assertNull(server.takeRequest(5,TimeUnit.SECONDS)!!.getHeader("X-Management-Key"))
+    }
+
+    @Test fun wrongManagementKeyDoesNotInvalidateReadingConnection() = runBlocking {
+        connect()
+        server.enqueue(MockResponse().setResponseCode(403))
+        val result=repo.startBiliLogin("separate-management-secret",server.url("/").toString())
+        assertTrue(result.exceptionOrNull() is ManagementException)
+        val request=server.takeRequest(5,TimeUnit.SECONDS)!!
+        assertEquals("separate-management-secret",request.getHeader("X-Management-Key"))
+        assertFalse(request.path!!.contains("separate-management-secret"))
+        server.enqueue(response("""{"code":0,"data":{"state":"valid"}}"""))
+        assertEquals("valid",repo.authorizationStatus().getOrThrow().state)
     }
 
     @Test fun compoundCursorRoundTripsAndDynamicCacheKeepsId() = runBlocking {

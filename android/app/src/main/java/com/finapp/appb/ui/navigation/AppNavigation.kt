@@ -7,5 +7,6 @@ enum class Screen(val route: String) {
     BLOGGERS("bloggers"),
     DAILY("daily"),
     DAILY_DETAIL("daily/{date}"),
-    SETTINGS("settings")
+    SETTINGS("settings"),
+    AUTHORIZATION("bili_auth")
 }

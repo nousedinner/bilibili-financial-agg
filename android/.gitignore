@@ -50,7 +50,8 @@ captures/
 .cxx/
 
 # Google Services (Uncomment if using Firebase and want to keep config private)
-#google-services.json
+google-services.json
+firebase.properties
 
 # Freeline
 freeline.py

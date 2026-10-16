@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -6,16 +8,30 @@ plugins {
     id("com.google.devtools.ksp")
 }
 
+val pushProperties = Properties().apply {
+    val source = file("firebase.properties")
+    if (source.exists()) source.inputStream().use { load(it) }
+}
+fun pushValue(key: String) = "\"" + pushProperties.getProperty(key, "").replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+val authorizationPoc = providers.gradleProperty("authorizationPoc").getOrElse("false") == "true"
+
 android {
     namespace = "com.finapp.appb"
-    compileSdk = 34
+    compileSdk = 35
+    buildToolsVersion = "34.0.0"
 
     defaultConfig {
-        applicationId = "com.finapp.appb"
+        applicationId = if (authorizationPoc) "com.finapp.appb.poc" else "com.finapp.appb"
+        manifestPlaceholders["appLabel"] = if (authorizationPoc) "财经聚合验证" else "财经聚合"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
+        buildConfigField("boolean", "AUTHORIZATION_POC", authorizationPoc.toString())
+        buildConfigField("String", "FIREBASE_APP_ID", pushValue("appId"))
+        buildConfigField("String", "FIREBASE_API_KEY", pushValue("apiKey"))
+        buildConfigField("String", "FIREBASE_PROJECT_ID", pushValue("projectId"))
+        buildConfigField("String", "FIREBASE_SENDER_ID", pushValue("senderId"))
     }
 
     buildTypes {
@@ -36,10 +52,14 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 
 dependencies {
+    implementation("com.google.firebase:firebase-messaging:25.1.3")
+    implementation("androidx.work:work-runtime-ktx:2.10.1")
+    implementation("com.google.zxing:core:3.5.3")
     testImplementation("junit:junit:4.13.2")
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
 

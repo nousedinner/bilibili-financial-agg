@@ -18,6 +18,7 @@ class FinApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        com.finapp.appb.notifications.AuthorizationNotifications.start(this)
         // Only initialize session; data loading is handled by ViewModels (cache-first)
     }
 }

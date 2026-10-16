@@ -20,7 +20,8 @@ import com.finapp.appb.viewmodel.SettingsViewModel
 @Composable
 fun SettingsScreen(
     viewModel: SettingsViewModel,
-    onLogout: () -> Unit
+    onLogout: () -> Unit,
+    onAuthorization: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val status by viewModel.status.collectAsState()
@@ -79,7 +80,8 @@ fun SettingsScreen(
                             StatItem("失败", s.failed)
                         }
                         Spacer(modifier = Modifier.height(6.dp))
-                        Text("Cookie: ${if (s.cookieValid) "✅ 有效" else "❌ 无效"}", fontSize = 13.sp, color = TextSecondary)
+                        Text("B站授权: ${when(s.authorization?.state) { "valid" -> "有效"; "invalid" -> "需重新授权"; else -> "暂时无法确认" }}", fontSize = 13.sp, color = TextSecondary)
+                        TextButton(onClick=onAuthorization) { Text("授权与通知") }
                         Text("上次完成: ${(s.lastFetch ?: "尚未完成").take(16)}", fontSize = 13.sp, color = TextSecondary)
                         s.lastJob?.let { job ->
                             val label = when (job.status) {
@@ -124,7 +126,7 @@ fun SettingsScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
             Text(
-                "财经聚合 v1.0.0",
+                "财经聚合 v${com.finapp.appb.BuildConfig.VERSION_NAME}",
                 fontSize = 12.sp,
                 color = TextSecondary,
                 modifier = Modifier.align(Alignment.CenterHorizontally)

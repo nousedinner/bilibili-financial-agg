@@ -28,7 +28,8 @@ data class SystemStatus(
     @SerializedName("task_running") val taskRunning: Boolean = false,
     @SerializedName("cookie_valid") val cookieValid: Boolean,
     @SerializedName("cookie_expire") val cookieExpire: String,
-    @SerializedName("last_job") val lastJob: TaskStatus? = null
+    @SerializedName("last_job") val lastJob: TaskStatus? = null,
+    val authorization: AuthorizationStatus? = null
 )
 
 // ── Blogger ──
@@ -101,8 +102,29 @@ data class VideoDetail(
     val danmaku: DanmakuAnalysis?,
     @SerializedName("fetch_status") val fetchStatus: String? = null,
     @SerializedName("analysis_status") val analysisStatus: String? = null,
+    @SerializedName("work_status") val workStatus: String? = null,
+    @SerializedName("comments_status") val commentsStatus: String? = null,
+    @SerializedName("danmaku_status") val danmakuStatus: String? = null,
     @Transient val fromCache: Boolean = false
 )
+
+data class PushStatus(val configured: Boolean = false, val registered: Boolean = false,
+    @SerializedName("notification_enabled") val notificationEnabled: Boolean = false,
+    val verified: Boolean = false, val pending: Int = 0)
+data class AuthorizationStatus(val state: String = "unknown",
+    @SerializedName("last_confirmed") val lastConfirmed: String? = null,
+    @SerializedName("credential_version") val credentialVersion: Int = 1,
+    @SerializedName("checked_at") val checkedAt: String? = null,
+    @SerializedName("recovered_at") val recoveredAt: String? = null,
+    val reason: String? = null, val push: PushStatus = PushStatus())
+data class PushDeviceRequest(val token: String, @SerializedName("notification_enabled") val notificationEnabled: Boolean)
+data class ServerAlert(val id: String, val kind: String, val state: String,
+    @SerializedName("credential_version") val credentialVersion: Int,
+    @SerializedName("created_at") val createdAt: String, val acknowledged: Boolean = false)
+data class LoginStart(val id: String, val nonce: String,
+    @SerializedName("qr_url") val qrUrl: String, @SerializedName("expires_in") val expiresIn: Int)
+data class LoginPollRequest(val nonce: String)
+data class LoginState(val state: String, @SerializedName("credential_version") val credentialVersion: Int? = null)
 
 data class VideoSummary(
     val text: String?,

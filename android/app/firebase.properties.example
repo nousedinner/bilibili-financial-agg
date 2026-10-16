@@ -1,0 +1,6 @@
+# Public client configuration from your Firebase Android app. Never put a service
+# account/private key here. Copy to firebase.properties only when a real project exists.
+appId=
+apiKey=
+projectId=
+senderId=

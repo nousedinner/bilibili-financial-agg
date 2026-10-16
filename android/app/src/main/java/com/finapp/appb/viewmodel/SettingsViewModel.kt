@@ -46,7 +46,11 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     fun logout(onComplete: () -> Unit) {
         viewModelScope.launch {
-            try { repo.logout(); onComplete() }
+            try {
+                com.finapp.appb.notifications.AuthorizationNotifications.disable(app)
+                com.finapp.appb.data.local.ManagementKeyStore(app).clear()
+                repo.logout(); onComplete()
+            }
             catch (e: kotlinx.coroutines.CancellationException) { throw e }
             catch (e: Exception) { _toast.value = "退出失败: ${e.message}" }
         }

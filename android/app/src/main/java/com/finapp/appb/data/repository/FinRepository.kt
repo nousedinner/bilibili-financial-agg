@@ -16,6 +16,7 @@ import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
 class ApiException(val status: Int, message: String) : IOException(message)
+class ManagementException(message: String) : IOException(message)
 class SessionChangedException : CancellationException("Session switched")
 fun Throwable.isAuthError() = this is ApiException && status in listOf(401, 403)
 fun Throwable.canUseCache() = this is IOException && (this !is ApiException || status >= 500)
@@ -30,7 +31,7 @@ fun mergeFeedItems(old: List<FeedItem>, next: List<FeedItem>): List<FeedItem> =
 
 class FinRepository(private val prefs: ConnectionStore, private val cache: ContentCache) {
     constructor(prefs: UserPreferences, database: AppDatabase) : this(prefs, RoomContentCache(database))
-    private data class Session(val scope: String, val client: OkHttpClient, val api: FinApiService)
+    private data class Session(val scope: String, val client: OkHttpClient, val api: FinApiService, val baseUrl: String)
     private val mutex = Mutex()
     private var current: Session? = null
     private var cachedBloggers: List<Blogger>? = null
@@ -55,7 +56,7 @@ class FinRepository(private val prefs: ConnectionStore, private val cache: Conte
             .build()
         val api = Retrofit.Builder().baseUrl(normalized).client(client)
             .addConverterFactory(GsonConverterFactory.create()).build().create(FinApiService::class.java)
-        return Session(scope, client, api)
+        return Session(scope, client, api, normalized)
     }
 
     private suspend fun clearCache() {
@@ -124,7 +125,14 @@ class FinRepository(private val prefs: ConnectionStore, private val cache: Conte
         if (current !== session) throw SessionChangedException()
     }
 
-    private fun <T> payload(response: Response<ApiResponse<T>>): T {
+    private fun <T> payload(response: Response<ApiResponse<T>>, management: Boolean = false): T {
+        if (management && response.code() in listOf(403,409,410,429,503)) throw ManagementException(when(response.code()) {
+            403 -> "独立管理密钥不正确，阅读连接保持不变"
+            409 -> "授权会话或版本已变化，请刷新状态后重新开始"
+            410 -> "二维码已过期，请重新发起授权"
+            429 -> "请稍后检查授权结果"
+            else -> "服务器尚未配置授权管理服务"
+        })
         if (!response.isSuccessful) throw ApiException(response.code(), when (response.code()) {
             401, 403 -> "认证已失效，请重新配置"
             409 -> "已有任务正在运行，请稍后查看状态"
@@ -138,13 +146,14 @@ class FinRepository(private val prefs: ConnectionStore, private val cache: Conte
     private suspend fun <T> request(
         call: suspend (FinApiService) -> Response<ApiResponse<T>>,
         save: suspend (T) -> Unit = {},
-        fallback: (suspend () -> T?)? = null
+        fallback: (suspend () -> T?)? = null,
+        management: Boolean = false
     ): Result<T> {
         var session: Session? = null
         return try {
             val active = mutex.withLock { initialized() ?: throw ApiException(401, "请先配置连接") }
             session = active
-            val data = payload(call(active.api))
+            val data = payload(call(active.api), management)
             mutex.withLock { checkSession(active); save(data) }
             Result.success(data)
         } catch (e: CancellationException) { throw e } catch (e: Exception) {
@@ -155,7 +164,8 @@ class FinRepository(private val prefs: ConnectionStore, private val cache: Conte
                     current = null
                     clearCache()
                 }
-                val cached = if (session != null && e.canUseCache()) fallback?.invoke() else null
+                val cached = if (session != null && e.canUseCache()) try { fallback?.invoke() }
+                    catch (cancelled: CancellationException) { throw cancelled } catch (_: Exception) { null } else null
                 if (cached != null) Result.success(cached) else Result.failure(e)
             }
         }
@@ -197,6 +207,10 @@ class FinRepository(private val prefs: ConnectionStore, private val cache: Conte
                 feedDao.deleteOlderThan(System.currentTimeMillis() - maxAge)
                 feedDao.trim()
             }
+        }, fallback = {
+            if (before == null) getCachedFeed().takeIf { it.isNotEmpty() }?.let {
+                FeedPageData(it, it.size, false, null, fromCache = true)
+            } else null
         })
 
     // ── Bloggers: Cache-First + Room persistence ──
@@ -303,6 +317,17 @@ class FinRepository(private val prefs: ConnectionStore, private val cache: Conte
     suspend fun batchAddBloggers(bloggers: List<BloggerInput>) = request({ it.batchAddBloggers(bloggers) }, save = { invalidateContent() })
     suspend fun syncBloggers() = request({ it.syncBloggers() })
     suspend fun getStatus() = request({ it.status() })
+    suspend fun authorizationStatus() = request({ it.authorizationStatus() })
+    suspend fun registerPush(token: String, enabled: Boolean) = request({ it.registerPush(PushDeviceRequest(token, enabled)) })
+    suspend fun serverAlerts() = request({ it.alerts() })
+    suspend fun testPush() = request({ it.testPush() })
+    suspend fun acknowledgeAlert(id: String) = request({ it.acknowledgeAlert(id) })
+    private fun verifyManagementDestination(api: FinApiService, server: String) {
+        require(server.startsWith("https://") || (com.finapp.appb.BuildConfig.DEBUG && java.net.URI(server).host in listOf("localhost","127.0.0.1"))) { "管理授权需要 HTTPS" }
+        if (current?.api !== api || current?.baseUrl != server.trim().trimEnd('/') + "/") throw SessionChangedException()
+    }
+    suspend fun startBiliLogin(key: String, server: String) = request({ verifyManagementDestination(it, server); it.startBiliLogin(key) }, management=true)
+    suspend fun pollBiliLogin(id: String, nonce: String, key: String, server: String) = request({ verifyManagementDestination(it, server); it.pollBiliLogin(id, LoginPollRequest(nonce), key) }, management=true)
     suspend fun triggerFetch(): Result<String> = request({ it.triggerFetch() }).map { it.message }
 
     // ── Video Detail: Cache-First ──

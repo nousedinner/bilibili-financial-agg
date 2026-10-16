@@ -4,6 +4,14 @@ import retrofit2.Response
 import retrofit2.http.*
 
 interface FinApiService {
+    @GET("api/bili/auth/status") suspend fun authorizationStatus(): Response<ApiResponse<AuthorizationStatus>>
+    @POST("api/notifications/device") suspend fun registerPush(@Body req: PushDeviceRequest): Response<ApiResponse<Map<String, Any>>>
+    @GET("api/notifications/events") suspend fun alerts(): Response<ApiResponse<List<ServerAlert>>>
+    @POST("api/notifications/test") suspend fun testPush(): Response<ApiResponse<Map<String, Any>>>
+    @POST("api/notifications/events/{id}/ack") suspend fun acknowledgeAlert(@Path("id") id: String): Response<ApiResponse<Map<String, Any>>>
+    @POST("api/bili/auth/sessions") suspend fun startBiliLogin(@Header("X-Management-Key") key: String): Response<ApiResponse<LoginStart>>
+    @POST("api/bili/auth/sessions/{id}/poll") suspend fun pollBiliLogin(@Path("id") id: String, @Body req: LoginPollRequest,
+        @Header("X-Management-Key") key: String): Response<ApiResponse<LoginState>>
 
     // ── System ──
     @GET("api/health")

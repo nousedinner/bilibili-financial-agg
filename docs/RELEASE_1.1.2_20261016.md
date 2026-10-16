@@ -1,6 +1,6 @@
-# 1.1.2 实施与验收结果（2026-10-16 15:08）
+# 1.1.2 实施与验收结果（2026-10-16 18:43 完成）
 
-后端已部署并通过本轮有限生产验收，正式 APP 已覆盖安装。最后仍需用户解锁手机，完成正式 APP 的管理密钥、通知权限及界面确认；不能把当前状态记为整体验收全部结束。FCM 与熄屏专项已按用户决定移出本轮必做范围。
+本轮约定的修复与验收已完成。后端通过自动回归、隔离验证及有限生产验收，正式 APP 已覆盖安装并完成管理密钥、普通通知权限、通知点击、冷启动及真实视频详情验证。当前没有需要用户继续完成的操作。FCM 与熄屏专项按用户决定不在本轮必做范围，后续长期稳定性随正常运行观察。
 
 ## 本轮完成
 
@@ -29,14 +29,18 @@
 
 安装包：[finapp-v1.1.2.apk](../../AppB/implementation-20261016/finapp-v1.1.2.apk)。VPS 同步位置 `/home/zzy/HermesShare/finapp-v1.1.2.apk`，两端 SHA-256 均为 `e325ed306145858361b7a81aaeed5ade08071599ecf417905bd161504806146f`。
 
-## 仅剩的手机步骤
+## 正式手机验收已完成
 
-手机目前锁屏，系统报告 `showing=true / inputRestricted=true`。正式包启动成功、未处于 stopped 状态，但其通知权限尚未授予，独立管理密钥尚未保存，正式界面尚未完成实际操作验收。这两项配置属于应用私有设置，不能直接复制验证包受 Android KeyStore 保护的密文来冒充迁移成功。
+用户 18:32 恢复解锁后，通过正式 APP 的正常页面保存管理密钥，确认本地为 Android KeyStore 保护的密文；启用告警后，系统 POST_NOTIFICATIONS 权限已获准，普通应用 UID 10425 的 `AuthorizationRefreshWorker` 周期任务已登记。没有通过直接复制验证包密文或 ROOT 设置完成配置。
 
-“财经聚合验证”仍保留原来的通知开关、权限和管理配置，没有卸载。用户休息后只需解锁并保持 ADB 连接，助手即可通过正常界面完成正式包配置、检查新视频详情和授权页面；无需再注册 Firebase 或重新扫码。ADB shell 本身有 ROOT，但应用功能和已执行步骤均不依赖 ROOT，也未越过锁屏。
+正式包实际展示了由检查事件生成的“服务器 B 站授权已恢复”系统通知，从通知栏点击后正确进入授权页，服务器于 18:36:52 记录确认。这是启动/周期检查链路，不是 FCM 送达测试。授权页显示有效、管理密钥已保存、重新授权入口可用，未配置的可选即时推送测试入口隐藏。
+
+随后执行正式 APP 冷启动，确认管理密钥和通知开关仍保留。通过信息流分别进入两条当天视频的详情，摘要文本与后端摘要逐字节哈希匹配，页面没有离线缓存提示；实际滚动确认评论、弹幕区块可见，授权页布局也已视觉检查。原服务器连接配置保留，方向锁定仍为 0 / 0。没有重新扫码或替换版本 2 的有效会话，也没有触发新视频任务或额外模型请求。
+
+18:43 后端仍为授权版本 2 / valid、两条工作任务 complete、LLM 计数 2、ASR 音频 0。验证包的安装和配置继续保留，但已停止其后台运行，避免与正式版重复提醒。日常直接使用“财经聚合”即可。ADB shell 本身有 ROOT，但产品功能和上述操作均不依赖 ROOT。
 
 ## 备份与证据
 
 VPS `/home/zzy/bilibili-financial-agg/backups/20261016-implementation/production-before-1.1.2-final` 包含最终更新前的完整 SQL 压缩备份（600）、旧源码及业务状态校验。兼容 schema 7 和新版凭据文件的回滚镜像为 `fin-agg-before-1.1.2-final:20261016`。有新增业务结果时不能直接全库覆盖恢复旧 SQL。
 
-本地旧 APK 和连接备份位于 `D:/re/work/finagg-20261016/formal-upgrade-backup`，目录权限限定为当前账号与 SYSTEM。证据位于相邻 AppB 的 `implementation-20261016`：`release-1.1.2-verification.json`、`backend-1.1.2-final-linux.log`、`post-auth-discovery-all-first-pages.json`、`live-bounded-job-complete.json`、`post-restart-idempotency.json`、`release-1.1.2-live-final.json`、`release-1.1.2-history-final.json`、`formal-1.1.2-build.json`、`formal-1.1.2-device-upgrade.json` 及相应 Android 测试、lint 报告。
+本地旧 APK 和连接备份位于 `D:/re/work/finagg-20261016/formal-upgrade-backup`，目录权限限定为当前账号与 SYSTEM。证据位于相邻 AppB 的 `implementation-20261016`：`release-1.1.2-verification.json`、`backend-1.1.2-final-linux.log`、`post-auth-discovery-all-first-pages.json`、`live-bounded-job-complete.json`、`post-restart-idempotency.json`、`release-1.1.2-live-final.json`、`release-1.1.2-history-final.json`、`formal-1.1.2-build.json`、`formal-device-acceptance-complete.json`、`formal-device-server-final.json`、`formal-notification-visible.json`、`formal-authorization-ui-verified.json`、`formal-authorized-complete.png` 及两条详情的 UI 记录、Android 测试和 lint 报告。较早的 `formal-1.1.2-device-upgrade.json` 保留 15:06 尚未配置时的历史状态，不代表最新验收结果。

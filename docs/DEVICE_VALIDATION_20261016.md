@@ -1,6 +1,6 @@
 # 2026-10-16 小米手机验证
 
-**15:06 最新：** 正式包 `com.finapp.appb` 已按匹配签名从 1.0.0 覆盖升级至 1.1.2，连接配置逐字节一致，普通应用 UID 10425，冷启动成功、stopped=false，方向锁定保持 0 / 0。手机锁屏，正式界面操作、管理密钥保存和正式包通知权限仍待解锁后完成；没有越过锁屏。验证包及其已有告警开关仍保留。证据：`formal-1.1.2-device-upgrade.json`，详见 [1.1.2 最终结果](RELEASE_1.1.2_20261016.md)。
+**18:43 最新：正式包验收完成。** `com.finapp.appb` 1.1.2 的管理密钥通过正常页面保存并验证密文存储，普通通知权限与周期任务已启用。实际显示授权恢复通知，从通知栏点击进入授权页，服务器记录确认时间 18:36:52；没有冒充 FCM。随后冷启动，密钥和通知开关仍保留，重新授权按钮可用。两条当天视频详情的摘要与后端内容哈希匹配，评论和弹幕区块可见，授权页已视觉检查。普通应用 UID 10425、方向锁定仍为 0 / 0，未依赖 ROOT。验证包安装和配置保留、后台已停止。当前无需用户再操作。证据：`formal-device-acceptance-complete.json`、`formal-device-server-final.json`、`formal-authorization-ui-verified.json`、`formal-notification-visible.json` 和 `formal-authorized-complete.png`，详见 [1.1.2 最终结果](RELEASE_1.1.2_20261016.md)。
 
 本轮在用户恢复无线 ADB 后，使用独立包 `com.finapp.appb.poc`（财经聚合验证）进行验证。原 `com.finapp.appb` 保持安装和配置。手机实际报告 API 37。调试和产品功能均未使用 ROOT，未读取官方 B 站 APP 私有数据；没有使用 monkey。调试前方向锁定值为 0 / 0，10:10 再次检查仍为 0 / 0。用户出门后不再执行手机操作。
 

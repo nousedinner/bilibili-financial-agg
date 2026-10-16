@@ -36,4 +36,14 @@
 
 Firebase Android 公共配置和服务器服务账号尚未提供，所以 FCM 的真实后台/熄屏送达、冷启动点击、日常网络连通性仍未通过。上述系统通知来自检查补漏，不是 FCM 验收。生产继续使用有预算上限的 ASR 降级策略，不启用未经推送确认的长期授权等待。
 
+## 13:29 最新范围调整与运行检查
+
+用户说明白天手机亮屏占比超过 80%，决定取消熄屏专项测试。现有启动检查和 15 分钟周期检查继续使用，FCM 暂不接入；本节取代此前将 Firebase 配置和熄屏送达列为当前必做事项的要求。
+
+ADB 读到验证包此前为 `stopped=true`，原因未知。通过普通 `am start` 冷启动后恢复为 `stopped=false`，通知权限和应用告警开关均开启；系统已登记 `AuthorizationRefreshWorker` 周期任务，下一次最小延迟约 15 分钟。应用进程 UID 为 10479。检查完成后返回桌面，没有熄屏、修改全局设置、调整省电白名单、强制执行后台任务或伪造电池状态。
+
+此时 ADB 调试 shell 本身为 ROOT，但产品代码与上述操作均不依赖 ROOT；不能将这台设备的调试记录称为未 ROOT 真机验证。只确认普通应用进程、通知设置和任务登记，不声称已证明定时送达、进程回收或长期闲置后的通知可靠性。
+
+熄屏测试专用的未提交改动单独归档后撤回，未部署或安装，未创建测试事件。13:29 线上健康检查为 `ok / db connected / 1.1.1`，手机仍为 1.1.1，方向锁定仍为 0 / 0。证据为 `notification-scope-decision-20261016.json`。生产继续使用有预算上限的 ASR 降级。
+
 证据目录为相邻 AppB 的 `implementation-20261016`：`backend-login-poc-fix.log`、`android-login-poc-fix.log`、`login-fix-deployment.json`、`android-jvm-results.xml`、`android-lint-results.xml` 和 `device-auth-configured.png`。凭据、二维码密钥和管理密钥不写入此报告。

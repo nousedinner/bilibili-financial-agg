@@ -32,6 +32,8 @@
 
 最终无需手机的验证已完成：Linux 候选镜像 96 项测试通过；Android 19 项测试、构建及 lint 通过；新 APK 签名与手机已装验证包一致。10:51 线上仍为版本 1 / invalid、无新增任务，原视频/转写/摘要校验一致。没有将模拟的票据交换或补漏通知记为真实授权/FCM 成功。
 
+12:54 用户完成新版安装及再次确认后，后端实测版本 2 / valid、凭据文件 600、最新登录会话 complete，原失效告警在 12:48:20 解除，恢复时间一致，新任务数仍为 0。这次完整授权链路已通过。12:56 额外只读抽查两条近期视频：一条没有字幕轨道，一条正常下载 AI 中文字幕 190 段 / 1730 字。未调用收费 ASR/LLM，也未把已有 ASR 视频重新入队。证据为 `user-authorized-live-verification.json`、`authorized-subtitle-probe.json`。
+
 Firebase Android 公共配置和服务器服务账号尚未提供，所以 FCM 的真实后台/熄屏送达、冷启动点击、日常网络连通性仍未通过。上述系统通知来自检查补漏，不是 FCM 验收。生产继续使用有预算上限的 ASR 降级策略，不启用未经推送确认的长期授权等待。
 
 证据目录为相邻 AppB 的 `implementation-20261016`：`backend-login-poc-fix.log`、`android-login-poc-fix.log`、`login-fix-deployment.json`、`android-jvm-results.xml`、`android-lint-results.xml` 和 `device-auth-configured.png`。凭据、二维码密钥和管理密钥不写入此报告。

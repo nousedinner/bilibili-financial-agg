@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 from uuid import uuid4
+from uuid import UUID
 from typing import Literal
 from fastapi.responses import JSONResponse
 from typing import Optional
@@ -186,7 +187,7 @@ async def _scheduled_digest():
 
 app = FastAPI(
     title="B站财经博主聚合服务",
-    version="1.1.5",
+    version="1.1.7",
     lifespan=lifespan,
 )
 
@@ -783,6 +784,32 @@ async def retry_failed():
     return await _submit_job("retry_failed", _retry_failed_work)
 
 
+class PaidResetRequest(BaseModel):
+    request_id: UUID
+    bvid: str = Field(pattern=r"^BV[A-Za-z0-9]{10}$")
+    stage: str = Field(pattern=r"^(analysis|interaction_analysis|analysis_part_[0-9]+)$", max_length=40)
+    reason: str = Field(min_length=1, max_length=300)
+
+
+@app.post("/api/retry/reset-paid", dependencies=[Depends(require_api_key)])
+async def reset_paid_retry(body: PaidResetRequest):
+    from src.workflow import reset_paid_stage
+    from src.lifecycle import owner_context
+    if not body.reason.strip():
+        raise HTTPException(422, "请填写恢复原因")
+    await _reserve_job("reset_paid")
+    token = None
+    try:
+        token = owner_context.set(_owner_guard.ticket() if _owner_guard is not None else None)
+        result = await reset_paid_stage(async_session, request_id=str(body.request_id),
+            bvid=body.bvid, stage=body.stage, reason=body.reason.strip())
+        return {"data": result}
+    finally:
+        if token is not None:
+            owner_context.reset(token)
+        _job_lock.release()
+
+
 async def _retry_failed_work():
     return await run_retry_failed()
 
@@ -1086,5 +1113,5 @@ app.include_router(build_router(require_api_key, lambda: async_session, lambda: 
 from src.lifecycle import WorkflowError
 @app.exception_handler(WorkflowError)
 async def workflow_error(request, exc):
-    status = 409 if exc.reason in ("ownership_lost", "task_running", "scope_frozen") else 400
+    status = 409 if exc.reason in ("ownership_lost", "task_running", "scope_frozen", "reset_request_conflict", "paid_stage_not_exhausted") else 400
     return JSONResponse(status_code=status, content={"detail": str(exc), "reason": exc.reason})

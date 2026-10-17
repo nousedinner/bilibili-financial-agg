@@ -6,6 +6,9 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import DeclarativeBase, validates
+from sqlalchemy import event
+from sqlalchemy.schema import Table
+from src.schema_policy import CHARSET, COLLATION
 from datetime import datetime
 
 
@@ -17,6 +20,13 @@ def _localnow():
 
 class Base(DeclarativeBase):
     pass
+
+
+@event.listens_for(Table, "after_parent_attach")
+def _mysql_defaults(table, metadata):
+    if metadata is Base.metadata:
+        table.dialect_options["mysql"]["charset"] = CHARSET
+        table.dialect_options["mysql"]["collate"] = COLLATION
 
 
 class Blogger(Base):
@@ -342,3 +352,13 @@ class LoginSession(Base):
     state = Column(String(24), nullable=False, default="pending")
     expires_at = Column(DateTime, nullable=False)
     last_polled_at = Column(DateTime)
+
+
+class PaidRetryReset(Base):
+    __tablename__ = "paid_retry_resets"
+    request_id = Column(String(36), primary_key=True)
+    bvid = Column(String(20), nullable=False, index=True)
+    stage = Column(String(40), nullable=False)
+    reason = Column(String(300), nullable=False)
+    previous = Column(JSON, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=_localnow)

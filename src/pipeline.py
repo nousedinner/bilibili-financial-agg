@@ -130,8 +130,9 @@ async def process(sessions, client, bvid, *, fetch_transcript, analyze_video,
                     await context.stage("interaction_analysis", "running", input_version=interaction_version)
                     await before_expensive_call()
                     updated = await analyze_interactions(comments, danmakus)
-                    if updated is None:
-                        raise WorkflowError("llm_failed", "interaction_analysis")
+                    if updated is None or updated.get("analysis_failed"):
+                        raise WorkflowError("llm_failed", "interaction_analysis",
+                                            detail=(updated or {}).get("_failure"))
                     analysis.update(updated)
                     await context.stage("interaction_analysis", "complete", result=updated, input_version=interaction_version)
                 except OwnershipLost:
@@ -140,7 +141,7 @@ async def process(sessions, client, bvid, *, fetch_transcript, analyze_video,
                     reason = failure_reason(exc)
                     await context.stage("interaction_analysis", "failed", reason=reason)
                     raise WorkflowError(reason if reason == "retry_exhausted" else "llm_failed",
-                                        "interaction_analysis") from exc
+                                        "interaction_analysis", detail=getattr(exc, "detail", None)) from exc
             else:
                 analysis.update(interaction_stage.result or {})
         else:
@@ -149,7 +150,7 @@ async def process(sessions, client, bvid, *, fetch_transcript, analyze_video,
             analysis = await analyze_video(str(payload.get("title") or ""), revision.full_text, comments, danmakus, duration)
             if analysis.get("analysis_failed") or not validate_analysis(analysis,
                     comment_samples=len(comments), danmaku_samples=len(danmakus)):
-                raise WorkflowError("llm_failed", "analysis")
+                raise WorkflowError("llm_failed", "analysis", detail=analysis.get("_failure"))
             await context.stage("analysis", "complete", input_version=body_version,
                                 result={"analysis": analysis, "transcript_version": version})
             await context.stage("interaction_analysis", "complete", input_version=interaction_version,
@@ -158,7 +159,7 @@ async def process(sessions, client, bvid, *, fetch_transcript, analyze_video,
 
         if analysis.get("analysis_failed") or not validate_analysis(analysis,
                 comment_samples=len(comments), danmaku_samples=len(danmakus)):
-            raise WorkflowError("llm_failed", "analysis")
+            raise WorkflowError("llm_failed", "analysis", detail=analysis.get("_failure"))
 
         async with sessions() as session:
             work = await context.check_scope(session)
@@ -218,7 +219,8 @@ async def process(sessions, client, bvid, *, fetch_transcript, analyze_video,
                     reason, state = context.terminal_reason, "skipped"
                 if reason in ("scope_expired", "outside_scope", "blogger_disabled", "not_admitted"):
                     state = "skipped"
-                stage = await context.update_stage(session, work, stage_name, state, reason=reason)
+                stage = await context.update_stage(session, work, stage_name, state, reason=reason,
+                    result={"failure": getattr(exc, "detail", None)} if getattr(exc, "detail", None) else None)
                 work.reason, work.credential_version, work.updated_at = reason, context.credential_version, now()
                 if state in ("blocked_auth", "skipped"):
                     work.state = state

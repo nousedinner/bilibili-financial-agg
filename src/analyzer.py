@@ -2,6 +2,7 @@
 
 import json
 import math
+from contextvars import ContextVar
 from typing import Optional
 
 import httpx
@@ -10,6 +11,16 @@ from src.config import get_config, get_env
 from src.lifecycle import work_context, owner_context, before_expensive_call, content_version, WorkflowError
 
 VIDEO_PROMPT_VERSION = "video-v3"
+_call_diagnostic = ContextVar("llm_call_diagnostic", default=None)
+
+
+async def _invoke_llm(prompt):
+    token = _call_diagnostic.set(None)
+    try:
+        response = await _call_llm(prompt)
+        return response, dict(_call_diagnostic.get() or {})
+    finally:
+        _call_diagnostic.reset(token)
 
 
 async def analyze_video(
@@ -88,7 +99,7 @@ async def analyze_video(
     "danmaku_keywords": ["弹幕关键词1", "..."]
 }}"""
 
-    result = await _call_llm(prompt)
+    result, diagnostic = await _invoke_llm(prompt)
     if result:
         parsed = _try_parse_json(result)
         if parsed is not None:
@@ -99,8 +110,17 @@ async def analyze_video(
                 parsed["_prompt_version"] = VIDEO_PROMPT_VERSION
                 return parsed
             # JSON合法但字段缺失 → 记录警告，返回empty标记
-            print(f"[analyzer] LLM返回了不完整的JSON结构，视为分析失败")
-    return _empty_analysis(analysis_failed=True)
+            detail = _failure_detail("validation_failed", result,
+                checks=_failing_checks(parsed, comment_samples=len(comments), danmaku_samples=len(danmakus)))
+            print(f"[analyzer] LLM返回了不完整的JSON结构，视为分析失败 checks={detail.get('checks')}")
+        else:
+            detail = _failure_detail("json_parse_failed", result)
+            print("[analyzer] LLM输出不是合法JSON，视为分析失败")
+    else:
+        detail = _failure_detail("llm_call_failed")
+        print("[analyzer] LLM调用无返回（API错误/超时/未设密钥），视为分析失败")
+    detail.update(diagnostic)
+    return _empty_analysis(analysis_failed=True, failure=detail)
 
 
 async def _analyze_long_video(title, text, comments, danmakus, duration):
@@ -119,7 +139,7 @@ async def _analyze_long_video(title, text, comments, danmakus, duration):
                 await context.stage(name, "running", input_version=version)
             data = await analyze_video(f"{title}（第{index + 1}段）", chunk, [], [], duration)
             if data.get("analysis_failed"):
-                raise WorkflowError("llm_failed", name)
+                raise WorkflowError("llm_failed", name, detail=data.get("_failure"))
             if context:
                 await context.stage(name, "complete", result=data, input_version=version)
         # Bounded intermediate summaries preserve coverage without re-sending all
@@ -144,13 +164,16 @@ async def analyze_interactions(comments, danmakus):
 评论：{comment_text[:3000]}
 弹幕：{danmaku_text[:3000]}
 输出JSON，仅包含 comment_sentiment、danmaku_sentiment（各为bullish/bearish/neutral概率，总和1）、comment_keywords、danmaku_keywords（字符串数组）。"""
-    response = await _call_llm(prompt)
+    response, diagnostic = await _invoke_llm(prompt)
     data = _try_parse_json(response) if response else None
     if data is None:
-        return None
+        return {"analysis_failed": True, "_failure": {
+            **_failure_detail("json_parse_failed" if response else "llm_call_failed", response), **diagnostic}}
     original_fields = sorted(data)
     if not _validate_interactions(data, comment_samples=len(comments), danmaku_samples=len(danmakus)):
-        return None
+        return {"analysis_failed": True, "_failure": {
+            **_failure_detail("validation_failed", response, checks=_interaction_checks(data,
+                comment_samples=len(comments), danmaku_samples=len(danmakus))), **diagnostic}}
     return {**{key: data[key] for key in ("comment_sentiment", "danmaku_sentiment", "comment_keywords", "danmaku_keywords")},
             "_model_fields": original_fields, "_output_schema": ANALYSIS_SCHEMA}
 
@@ -263,6 +286,7 @@ async def _call_llm(prompt: str) -> Optional[str]:
     api_key = get_env("XIAOMI_API_KEY")
 
     if not api_key:
+        _call_diagnostic.set({"cause": "missing_api_key"})
         print("[analyzer] XIAOMI_API_KEY not set")
         return None
     await before_expensive_call()
@@ -295,13 +319,28 @@ async def _call_llm(prompt: str) -> Optional[str]:
             result = resp.json()
             choices = result.get("choices", [])
             if choices:
-                return choices[0].get("message", {}).get("content", "").strip()
+                finish_reason = choices[0].get("finish_reason")
+                _call_diagnostic.set({"finish_reason": finish_reason} if finish_reason else {})
+                content = choices[0].get("message", {}).get("content")
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+            _call_diagnostic.set({"cause": "empty_response", **(_call_diagnostic.get() or {})})
+        except httpx.TimeoutException:
+            _call_diagnostic.set({"cause": "http_timeout"})
+        except httpx.HTTPStatusError as e:
+            _call_diagnostic.set({"cause": f"http_{e.response.status_code}", "http_status": e.response.status_code})
+        except httpx.RequestError:
+            _call_diagnostic.set({"cause": "network_error"})
+        except (json.JSONDecodeError, TypeError, AttributeError, IndexError):
+            _call_diagnostic.set({"cause": "invalid_api_response"})
         except Exception as e:
-            print(f"[analyzer] LLM API error: {e}")
+            _call_diagnostic.set({"cause": "unexpected_error", "exception_type": type(e).__name__})
+    if _call_diagnostic.get():
+        print(f"[analyzer] LLM call diagnostic: {_call_diagnostic.get()}")
     return None
 
 
-def _empty_analysis(analysis_failed: bool = False) -> dict:
+def _empty_analysis(analysis_failed: bool = False, failure: Optional[dict] = None) -> dict:
     d = {
         "summary": "",
         "key_points": [],
@@ -317,6 +356,8 @@ def _empty_analysis(analysis_failed: bool = False) -> dict:
     }
     if analysis_failed:
         d["analysis_failed"] = True
+    if failure:
+        d["_failure"] = failure
     return d
 
 
@@ -341,6 +382,62 @@ def _try_parse_json(text: str) -> Optional[dict]:
 
 ANALYSIS_SCHEMA = 2
 _REQUIRED_ANALYSIS_FIELDS = {"summary", "key_points", "sentiment", "sentiment_score"}
+
+
+def _now_iso():
+    from src.lifecycle import now
+    return now().isoformat(sep=" ", timespec="seconds")
+
+
+def _failure_detail(kind, raw=None, *, checks=None):
+    """失败归因快照：让 llm_failed 不再只剩一个词（写入 work_stages.result['failure']）。"""
+    detail = {"kind": kind, "prompt_version": VIDEO_PROMPT_VERSION, "at": _now_iso()}
+    if checks:
+        detail["checks"] = checks
+    if isinstance(raw, str):
+        detail["raw_head"] = raw[:1200]
+    return detail
+
+
+def _failing_checks(parsed, *, comment_samples=None, danmaku_samples=None):
+    """逐条复刻 _validate_analysis/_validate_interactions，返回不通过的规则名列表。"""
+    if not isinstance(parsed, dict):
+        return ["not_a_dict"]
+    checks = []
+    missing = _REQUIRED_ANALYSIS_FIELDS - set(parsed)
+    if missing:
+        checks.append("missing_required:" + ",".join(sorted(missing)))
+    if not isinstance(parsed.get("summary"), str) or not parsed["summary"].strip():
+        checks.append("summary_empty")
+    if not _valid_score(parsed.get("sentiment_score")):
+        checks.append(f"sentiment_score_invalid:{parsed.get('sentiment_score')!r}")
+    sentiment = parsed.get("sentiment")
+    if not isinstance(sentiment, str) or sentiment.strip().lower() not in _VALID_SENTIMENTS:
+        checks.append(f"sentiment_invalid:{sentiment!r}")
+    for key in ("key_points", "risk_warnings", "data_citations", "tags", "comment_keywords", "danmaku_keywords"):
+        if not _string_list(parsed.get(key, [])):
+            checks.append(f"{key}_not_string_list")
+    checks.extend(_interaction_checks(parsed, comment_samples=comment_samples, danmaku_samples=danmaku_samples))
+    return checks
+
+
+def _interaction_checks(parsed, *, comment_samples=None, danmaku_samples=None):
+    checks = []
+    for prefix, count in (("comment", comment_samples), ("danmaku", danmaku_samples)):
+        key, keywords = prefix + "_sentiment", prefix + "_keywords"
+        if count == 0:
+            continue
+        value = parsed.get(key)
+        if not isinstance(value, dict) or set(value) != _VALID_SENTIMENTS:
+            checks.append(f"{key}_structure_invalid")
+            continue
+        if not all(_valid_score(v) and v >= 0 for v in value.values()):
+            checks.append(f"{key}_score_invalid")
+        elif abs(sum(value.values()) - 1) > 0.02:
+            checks.append(f"{key}_sum={sum(value.values()):.3f}")
+        if keywords not in parsed or not _string_list(parsed[keywords]):
+            checks.append(f"{keywords}_missing_or_invalid")
+    return checks
 
 
 def _validate_interactions(parsed, *, comment_samples=None, danmaku_samples=None):

@@ -12,9 +12,43 @@ from src.retry_strategy import max_retries_for
 from src.lifecycle import (HARD_SINCE, STAGES, WorkflowError, automatic_floor,
     validate_publication, now, fence, content_version)
 from src.models import (WorkBatch, VideoWork, WorkStage, TranscriptCheckpoint,
-    ASRSegment, DailyUsage, Blogger, Video, Transcript, Summary)
+    ASRSegment, DailyUsage, Blogger, Video, Transcript, Summary, PaidRetryReset)
 
 PAID_ANALYSIS_STAGES = frozenset({"analysis", "interaction_analysis"})
+
+
+def is_paid_analysis_stage(name):
+    return name in PAID_ANALYSIS_STAGES or (name.startswith("analysis_part_") and name[14:].isdigit())
+
+
+async def reset_paid_stage(sessions, *, request_id, bvid, stage, reason):
+    """Explicit one-stage grant; durable receipts make HTTP retries idempotent."""
+    if not is_paid_analysis_stage(stage):
+        raise WorkflowError("invalid_paid_stage", "reset")
+    async with sessions() as session:
+        await fence(session)
+        receipt = await session.get(PaidRetryReset, request_id)
+        if receipt:
+            if (receipt.bvid, receipt.stage, receipt.reason) != (bvid, stage, reason):
+                raise WorkflowError("reset_request_conflict", "reset")
+            return {"bvid": bvid, "stage": stage, "request_id": request_id, "replayed": True}
+        context = WorkContext(sessions, bvid, credential_store().current().version)
+        work = await context.check_scope(session)
+        if work.state == "running":
+            raise WorkflowError("task_running", "reset")
+        row = (await session.execute(select(WorkStage).where(WorkStage.bvid == bvid,
+            WorkStage.stage == stage).with_for_update())).scalar_one_or_none()
+        if (row is None or row.state != "failed" or (row.attempts or 0) < 3
+                or row.reason not in ("llm_failed", "retry_exhausted")):
+            raise WorkflowError("paid_stage_not_exhausted", "reset")
+        session.add(PaidRetryReset(request_id=request_id, bvid=bvid, stage=stage, reason=reason,
+            previous={"attempts": row.attempts, "state": row.state, "reason": row.reason,
+                "input_version": row.input_version, "result": row.result, "work_state": work.state}, created_at=now()))
+        row.attempts, row.state, row.reason, row.next_attempt_at = 0, "pending", None, None
+        row.updated_at = now()
+        work.state, work.reason, work.next_attempt_at, work.updated_at = "pending", None, None, now()
+        await session.commit()
+    return {"bvid": bvid, "stage": stage, "request_id": request_id, "replayed": False}
 
 
 async def recover_abandoned_work(sessions):
@@ -117,7 +151,7 @@ async def admit(sessions, batch_id, mid, payload, *, allow_legacy=False):
             for row in rows:
                 if row.state not in ("complete", "no_track", "skipped"):
                     row.state, row.reason, row.next_attempt_at = "pending", None, None
-                    if row.stage not in PAID_ANALYSIS_STAGES:
+                    if not is_paid_analysis_stage(row.stage):
                         row.attempts = 0
         if old is None:
             session.add(Video(bvid=bvid, mid=mid, title=str(payload.get("title") or "")[:500],
@@ -228,7 +262,7 @@ class WorkContext:
         if input_version and row.input_version and input_version != row.input_version:
             # A new comment/body version invalidates its cache, not its spending
             # limit. Manual re-admission must preserve these counters as well.
-            if name not in PAID_ANALYSIS_STAGES:
+            if not is_paid_analysis_stage(name):
                 row.attempts = 0
             row.result = None
         if state == "running":

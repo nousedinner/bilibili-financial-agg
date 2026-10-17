@@ -99,8 +99,16 @@ async def analyze_video(
                 parsed["_prompt_version"] = VIDEO_PROMPT_VERSION
                 return parsed
             # JSON合法但字段缺失 → 记录警告，返回empty标记
-            print(f"[analyzer] LLM返回了不完整的JSON结构，视为分析失败")
-    return _empty_analysis(analysis_failed=True)
+            detail = _failure_detail("validation_failed", result,
+                checks=_failing_checks(parsed, comment_samples=len(comments), danmaku_samples=len(danmakus)))
+            print(f"[analyzer] LLM返回了不完整的JSON结构，视为分析失败 checks={detail.get('checks')}")
+        else:
+            detail = _failure_detail("json_parse_failed", result)
+            print("[analyzer] LLM输出不是合法JSON，视为分析失败")
+    else:
+        detail = {"kind": "llm_call_failed", "prompt_version": VIDEO_PROMPT_VERSION, "at": _now_iso()}
+        print("[analyzer] LLM调用无返回（API错误/超时/未设密钥），视为分析失败")
+    return _empty_analysis(analysis_failed=True, failure=detail)
 
 
 async def _analyze_long_video(title, text, comments, danmakus, duration):
@@ -119,7 +127,7 @@ async def _analyze_long_video(title, text, comments, danmakus, duration):
                 await context.stage(name, "running", input_version=version)
             data = await analyze_video(f"{title}（第{index + 1}段）", chunk, [], [], duration)
             if data.get("analysis_failed"):
-                raise WorkflowError("llm_failed", name)
+                raise WorkflowError("llm_failed", name, detail=data.get("_failure"))
             if context:
                 await context.stage(name, "complete", result=data, input_version=version)
         # Bounded intermediate summaries preserve coverage without re-sending all
@@ -301,7 +309,7 @@ async def _call_llm(prompt: str) -> Optional[str]:
     return None
 
 
-def _empty_analysis(analysis_failed: bool = False) -> dict:
+def _empty_analysis(analysis_failed: bool = False, failure: Optional[dict] = None) -> dict:
     d = {
         "summary": "",
         "key_points": [],
@@ -317,6 +325,8 @@ def _empty_analysis(analysis_failed: bool = False) -> dict:
     }
     if analysis_failed:
         d["analysis_failed"] = True
+    if failure:
+        d["_failure"] = failure
     return d
 
 
@@ -341,6 +351,56 @@ def _try_parse_json(text: str) -> Optional[dict]:
 
 ANALYSIS_SCHEMA = 2
 _REQUIRED_ANALYSIS_FIELDS = {"summary", "key_points", "sentiment", "sentiment_score"}
+
+
+def _now_iso():
+    from src.lifecycle import now
+    return now().isoformat(sep=" ", timespec="seconds")
+
+
+def _failure_detail(kind, raw=None, *, checks=None):
+    """失败归因快照：让 llm_failed 不再只剩一个词（写入 work_stages.result['failure']）。"""
+    detail = {"kind": kind, "prompt_version": VIDEO_PROMPT_VERSION, "at": _now_iso()}
+    if checks:
+        detail["checks"] = checks
+    if isinstance(raw, str):
+        detail["raw_head"] = raw[:1200]
+    return detail
+
+
+def _failing_checks(parsed, *, comment_samples=None, danmaku_samples=None):
+    """逐条复刻 _validate_analysis/_validate_interactions，返回不通过的规则名列表。"""
+    if not isinstance(parsed, dict):
+        return ["not_a_dict"]
+    checks = []
+    missing = _REQUIRED_ANALYSIS_FIELDS - set(parsed)
+    if missing:
+        checks.append("missing_required:" + ",".join(sorted(missing)))
+    if not isinstance(parsed.get("summary"), str) or not parsed["summary"].strip():
+        checks.append("summary_empty")
+    if not _valid_score(parsed.get("sentiment_score")):
+        checks.append(f"sentiment_score_invalid:{parsed.get('sentiment_score')!r}")
+    sentiment = parsed.get("sentiment")
+    if not isinstance(sentiment, str) or sentiment.strip().lower() not in _VALID_SENTIMENTS:
+        checks.append(f"sentiment_invalid:{sentiment!r}")
+    for key in ("key_points", "risk_warnings", "data_citations", "tags", "comment_keywords", "danmaku_keywords"):
+        if not _string_list(parsed.get(key, [])):
+            checks.append(f"{key}_not_string_list")
+    for prefix, count in (("comment", comment_samples), ("danmaku", danmaku_samples)):
+        key, keywords = prefix + "_sentiment", prefix + "_keywords"
+        if count == 0:
+            continue
+        value = parsed.get(key)
+        if not isinstance(value, dict) or set(value) != _VALID_SENTIMENTS:
+            checks.append(f"{key}_structure_invalid")
+            continue
+        if not all(_valid_score(v) and v >= 0 for v in value.values()):
+            checks.append(f"{key}_score_invalid")
+        elif abs(sum(value.values()) - 1) > 0.02:
+            checks.append(f"{key}_sum={sum(value.values()):.3f}")
+        if keywords not in parsed or not _string_list(parsed[keywords]):
+            checks.append(f"{keywords}_missing_or_invalid")
+    return checks
 
 
 def _validate_interactions(parsed, *, comment_samples=None, danmaku_samples=None):

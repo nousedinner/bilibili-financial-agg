@@ -20,9 +20,10 @@ def content_version(*parts):
 
 
 class WorkflowError(ValueError):
-    def __init__(self, reason, stage, *, delay=0):
+    def __init__(self, reason, stage, *, delay=0, detail=None):
         super().__init__(f"{stage}: {reason}")
         self.reason, self.stage, self.delay = reason, stage, delay
+        self.detail = detail
 
 
 class OwnershipLost(WorkflowError):

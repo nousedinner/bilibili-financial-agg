@@ -11,6 +11,7 @@ from src.config import get_config, get_env
 from src.lifecycle import work_context, owner_context, before_expensive_call, content_version, WorkflowError
 
 VIDEO_PROMPT_VERSION = "video-v3"
+ANALYSIS_TEXT_LIMIT = 8000
 _call_diagnostic = ContextVar("llm_call_diagnostic", default=None)
 
 
@@ -47,7 +48,7 @@ async def analyze_video(
             "danmaku_keywords": [str],
         }
     """
-    if len(transcript_text) > 8000:
+    if len(transcript_text) > ANALYSIS_TEXT_LIMIT:
         return await _analyze_long_video(title, transcript_text, comments, danmakus, duration)
     # Prepare comment text
     comment_text = ""
@@ -76,7 +77,7 @@ async def analyze_video(
 时长: {duration}秒
 
 ## 视频转写文本
-{transcript_text[:8000]}
+{transcript_text[:ANALYSIS_TEXT_LIMIT]}
 
 ## 热门评论 (按热度排序)
 {comment_text[:3000]}
@@ -149,7 +150,14 @@ async def _analyze_long_video(title, text, comments, danmakus, duration):
                for key in ("key_points", "risk_warnings", "data_citations")}})
     combined = "以下为按原文顺序完整覆盖视频的各段分析，请综合全部段落：\n" + json.dumps(parts, ensure_ascii=False)
     if len(combined) >= len(text):
+        # A rejected merge must still terminate after the existing attempt cap.
+        if context:
+            await context.stage("analysis", "running")
         raise WorkflowError("analysis_intermediate_too_large", "analysis")
+    # Failed chunks spend only their own attempts. Count the final merge when
+    # the reduction is small enough to make that model request directly.
+    if context and len(combined) <= ANALYSIS_TEXT_LIMIT:
+        await context.stage("analysis", "running")
     return await analyze_video(title, combined, comments, danmakus, duration)
 
 

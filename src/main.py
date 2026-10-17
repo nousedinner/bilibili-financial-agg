@@ -187,7 +187,7 @@ async def _scheduled_digest():
 
 app = FastAPI(
     title="B站财经博主聚合服务",
-    version="1.1.7",
+    version="1.1.8",
     lifespan=lifespan,
 )
 

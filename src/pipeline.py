@@ -33,7 +33,7 @@ async def _interaction(context, name, fetch):
 
 async def process(sessions, client, bvid, *, fetch_transcript, analyze_video,
                   analyze_interactions, validate_analysis, mark_digest):
-    from src.analyzer import ANALYSIS_SCHEMA
+    from src.analyzer import ANALYSIS_SCHEMA, ANALYSIS_TEXT_LIMIT
     context = WorkContext(sessions, bvid, int(getattr(client, "credential_version", 1) or 1))
     token = work_context.set(context)
     published = False
@@ -145,7 +145,14 @@ async def process(sessions, client, bvid, *, fetch_transcript, analyze_video,
             else:
                 analysis.update(interaction_stage.result or {})
         else:
-            await context.stage("analysis", "running", input_version=body_version)
+            long_analysis = len(revision.full_text) > ANALYSIS_TEXT_LIMIT
+            if long_analysis and body_stage and not should_retry(body_stage.attempts or 0,
+                    body_stage.reason or "unknown"):
+                # Do not spend more on chunks when the final merge is exhausted.
+                raise WorkflowError("retry_exhausted", "analysis")
+            await context.stage("analysis", "pending" if long_analysis else "running",
+                                input_version=body_version)
+            context.current_stage = "analysis"
             await before_expensive_call()
             analysis = await analyze_video(str(payload.get("title") or ""), revision.full_text, comments, danmakus, duration)
             if analysis.get("analysis_failed") or not validate_analysis(analysis,

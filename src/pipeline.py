@@ -130,8 +130,9 @@ async def process(sessions, client, bvid, *, fetch_transcript, analyze_video,
                     await context.stage("interaction_analysis", "running", input_version=interaction_version)
                     await before_expensive_call()
                     updated = await analyze_interactions(comments, danmakus)
-                    if updated is None:
-                        raise WorkflowError("llm_failed", "interaction_analysis")
+                    if updated is None or updated.get("analysis_failed"):
+                        raise WorkflowError("llm_failed", "interaction_analysis",
+                                            detail=(updated or {}).get("_failure"))
                     analysis.update(updated)
                     await context.stage("interaction_analysis", "complete", result=updated, input_version=interaction_version)
                 except OwnershipLost:
@@ -140,7 +141,7 @@ async def process(sessions, client, bvid, *, fetch_transcript, analyze_video,
                     reason = failure_reason(exc)
                     await context.stage("interaction_analysis", "failed", reason=reason)
                     raise WorkflowError(reason if reason == "retry_exhausted" else "llm_failed",
-                                        "interaction_analysis") from exc
+                                        "interaction_analysis", detail=getattr(exc, "detail", None)) from exc
             else:
                 analysis.update(interaction_stage.result or {})
         else:

@@ -2,6 +2,7 @@
 
 import json
 import math
+from contextvars import ContextVar
 from typing import Optional
 
 import httpx
@@ -10,6 +11,16 @@ from src.config import get_config, get_env
 from src.lifecycle import work_context, owner_context, before_expensive_call, content_version, WorkflowError
 
 VIDEO_PROMPT_VERSION = "video-v3"
+_call_diagnostic = ContextVar("llm_call_diagnostic", default=None)
+
+
+async def _invoke_llm(prompt):
+    token = _call_diagnostic.set(None)
+    try:
+        response = await _call_llm(prompt)
+        return response, dict(_call_diagnostic.get() or {})
+    finally:
+        _call_diagnostic.reset(token)
 
 
 async def analyze_video(
@@ -88,7 +99,7 @@ async def analyze_video(
     "danmaku_keywords": ["弹幕关键词1", "..."]
 }}"""
 
-    result = await _call_llm(prompt)
+    result, diagnostic = await _invoke_llm(prompt)
     if result:
         parsed = _try_parse_json(result)
         if parsed is not None:
@@ -106,8 +117,9 @@ async def analyze_video(
             detail = _failure_detail("json_parse_failed", result)
             print("[analyzer] LLM输出不是合法JSON，视为分析失败")
     else:
-        detail = {"kind": "llm_call_failed", "prompt_version": VIDEO_PROMPT_VERSION, "at": _now_iso()}
+        detail = _failure_detail("llm_call_failed")
         print("[analyzer] LLM调用无返回（API错误/超时/未设密钥），视为分析失败")
+    detail.update(diagnostic)
     return _empty_analysis(analysis_failed=True, failure=detail)
 
 
@@ -152,13 +164,16 @@ async def analyze_interactions(comments, danmakus):
 评论：{comment_text[:3000]}
 弹幕：{danmaku_text[:3000]}
 输出JSON，仅包含 comment_sentiment、danmaku_sentiment（各为bullish/bearish/neutral概率，总和1）、comment_keywords、danmaku_keywords（字符串数组）。"""
-    response = await _call_llm(prompt)
+    response, diagnostic = await _invoke_llm(prompt)
     data = _try_parse_json(response) if response else None
     if data is None:
-        return None
+        return {"analysis_failed": True, "_failure": {
+            **_failure_detail("json_parse_failed" if response else "llm_call_failed", response), **diagnostic}}
     original_fields = sorted(data)
     if not _validate_interactions(data, comment_samples=len(comments), danmaku_samples=len(danmakus)):
-        return None
+        return {"analysis_failed": True, "_failure": {
+            **_failure_detail("validation_failed", response, checks=_interaction_checks(data,
+                comment_samples=len(comments), danmaku_samples=len(danmakus))), **diagnostic}}
     return {**{key: data[key] for key in ("comment_sentiment", "danmaku_sentiment", "comment_keywords", "danmaku_keywords")},
             "_model_fields": original_fields, "_output_schema": ANALYSIS_SCHEMA}
 
@@ -271,6 +286,7 @@ async def _call_llm(prompt: str) -> Optional[str]:
     api_key = get_env("XIAOMI_API_KEY")
 
     if not api_key:
+        _call_diagnostic.set({"cause": "missing_api_key"})
         print("[analyzer] XIAOMI_API_KEY not set")
         return None
     await before_expensive_call()
@@ -303,9 +319,24 @@ async def _call_llm(prompt: str) -> Optional[str]:
             result = resp.json()
             choices = result.get("choices", [])
             if choices:
-                return choices[0].get("message", {}).get("content", "").strip()
+                finish_reason = choices[0].get("finish_reason")
+                _call_diagnostic.set({"finish_reason": finish_reason} if finish_reason else {})
+                content = choices[0].get("message", {}).get("content")
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+            _call_diagnostic.set({"cause": "empty_response", **(_call_diagnostic.get() or {})})
+        except httpx.TimeoutException:
+            _call_diagnostic.set({"cause": "http_timeout"})
+        except httpx.HTTPStatusError as e:
+            _call_diagnostic.set({"cause": f"http_{e.response.status_code}", "http_status": e.response.status_code})
+        except httpx.RequestError:
+            _call_diagnostic.set({"cause": "network_error"})
+        except (json.JSONDecodeError, TypeError, AttributeError, IndexError):
+            _call_diagnostic.set({"cause": "invalid_api_response"})
         except Exception as e:
-            print(f"[analyzer] LLM API error: {e}")
+            _call_diagnostic.set({"cause": "unexpected_error", "exception_type": type(e).__name__})
+    if _call_diagnostic.get():
+        print(f"[analyzer] LLM call diagnostic: {_call_diagnostic.get()}")
     return None
 
 
@@ -386,6 +417,12 @@ def _failing_checks(parsed, *, comment_samples=None, danmaku_samples=None):
     for key in ("key_points", "risk_warnings", "data_citations", "tags", "comment_keywords", "danmaku_keywords"):
         if not _string_list(parsed.get(key, [])):
             checks.append(f"{key}_not_string_list")
+    checks.extend(_interaction_checks(parsed, comment_samples=comment_samples, danmaku_samples=danmaku_samples))
+    return checks
+
+
+def _interaction_checks(parsed, *, comment_samples=None, danmaku_samples=None):
+    checks = []
     for prefix, count in (("comment", comment_samples), ("danmaku", danmaku_samples)):
         key, keywords = prefix + "_sentiment", prefix + "_keywords"
         if count == 0:

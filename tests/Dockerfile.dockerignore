@@ -1,0 +1,13 @@
+**
+!requirements.txt
+!requirements-test.txt
+!src/
+!src/**
+!scripts/
+!scripts/manage_db.py
+!tests/
+!tests/**
+!config/
+!config/config.example.yaml
+**/__pycache__/
+**/*.pyc

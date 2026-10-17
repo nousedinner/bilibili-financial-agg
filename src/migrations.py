@@ -1,8 +1,49 @@
 """Idempotent schema upgrade for both the legacy database and fresh installs."""
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, text, String
 from src.models import Base
+from src.schema_policy import CHARSET, COLLATION
 
-VERSION = 8
+VERSION = 9
+
+
+def _collation_drift(connection):
+    tables = set(Base.metadata.tables) | {"schema_version"}
+    defaults = connection.execute(text("SELECT TABLE_NAME, TABLE_COLLATION FROM information_schema.TABLES "
+        "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_TYPE='BASE TABLE'")).fetchall()
+    columns = connection.execute(text("SELECT TABLE_NAME, COLUMN_NAME, COLLATION_NAME FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA=DATABASE() AND COLLATION_NAME IS NOT NULL AND DATA_TYPE != 'json'")).fetchall()
+    bad = {name for name, collation in defaults if name in tables and collation != COLLATION}
+    bad.update(name for name, column, collation in columns if name in tables and collation != COLLATION)
+    return sorted(bad)
+
+
+def _unify_collation(connection):
+    if connection.dialect.name != "mysql":
+        return
+    quote = connection.dialect.identifier_preparer.quote
+    pending = _collation_drift(connection)
+    inspector = inspect(connection)
+    # Check all affected unique keys before the first implicitly committed DDL.
+    for name in pending:
+        columns = {c["name"]: c for c in inspector.get_columns(name)}
+        keys = [inspector.get_pk_constraint(name)] + [i for i in inspector.get_indexes(name) if i.get("unique")]
+        for key in keys:
+            names = key.get("constrained_columns") or key.get("column_names") or []
+            if not names:
+                continue
+            expressions = [f"{quote(c)} COLLATE {COLLATION}" if isinstance(columns[c]["type"], String)
+                           else quote(c) for c in names]
+            nonnull = " AND ".join(f"{quote(c)} IS NOT NULL" for c in names)
+            duplicate = connection.execute(text(f"SELECT 1 FROM {quote(name)} WHERE {nonnull} "
+                f"GROUP BY {', '.join(expressions)} HAVING COUNT(*) > 1 LIMIT 1")).first()
+            if duplicate:
+                raise RuntimeError(f"Collation migration unique-key conflict: {name}.{names}")
+    database = connection.execute(text("SELECT DATABASE()")).scalar_one()
+    connection.execute(text(f"ALTER DATABASE {quote(database)} CHARACTER SET {CHARSET} COLLATE {COLLATION}"))
+    for name in pending:
+        connection.execute(text(f"ALTER TABLE {quote(name)} CONVERT TO CHARACTER SET {CHARSET} COLLATE {COLLATION}"))
+    if _collation_drift(connection):
+        raise RuntimeError("Collation migration incomplete")
 
 
 def _add_nullable_columns(connection):
@@ -136,7 +177,9 @@ def upgrade(connection):
     _add_nullable_columns(connection)
 
     # ── schema_version ──
-    connection.execute(text("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)"))
+    suffix = f" CHARACTER SET {CHARSET} COLLATE {COLLATION}" if connection.dialect.name == "mysql" else ""
+    connection.execute(text("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)" + suffix))
+    _unify_collation(connection)
     connection.execute(text("DELETE FROM schema_version"))
     connection.execute(text("INSERT INTO schema_version (version) VALUES (:version)"), {"version": VERSION})
 
@@ -147,6 +190,11 @@ def verify(connection):
     if missing or "schema_version" not in inspector.get_table_names():
         raise RuntimeError("Database upgrade required: python -m scripts.manage_db upgrade")
     version = connection.execute(text("SELECT MAX(version) FROM schema_version")).scalar()
+    if connection.dialect.name == "mysql":
+        default = connection.execute(text("SELECT @@collation_database")).scalar_one()
+        drift = _collation_drift(connection)
+        if default != COLLATION or drift:
+            raise RuntimeError(f"Unsupported schema collation: database={default}, tables={drift}; run migration")
     videos_cols = {c["name"] for c in inspector.get_columns("videos")}
     dirty_cols = {c["name"] for c in inspector.get_columns("dirty_digests")} if "dirty_digests" in inspector.get_table_names() else set()
     if (version != VERSION

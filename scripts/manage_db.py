@@ -12,6 +12,8 @@ async def run(args):
     try:
         async with engine.begin() as connection:
             await connection.run_sync(upgrade if args.command == "upgrade" else verify)
+            if args.command == "upgrade":
+                await connection.run_sync(verify)
         if args.command == "create-user":
             username = args.username.strip()
             if not 1 <= len(username) <= 50:
@@ -24,7 +26,7 @@ async def run(args):
                 await session.commit()
                 print(f"Created {username}. Store this API key securely: {key}")
         else:
-            print("Database upgrade completed")
+            print("Database " + ("upgrade completed and verified" if args.command == "upgrade" else "verified"))
     finally:
         await engine.dispose()
 
@@ -33,6 +35,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("upgrade")
+    commands.add_parser("verify")
     user = commands.add_parser("create-user")
     user.add_argument("username")
     asyncio.run(run(parser.parse_args()))

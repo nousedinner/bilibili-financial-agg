@@ -27,6 +27,18 @@ enum class Sentiment(val label: String, val icon: String, val color: Color) {
             "bearish" -> BEARISH
             else -> NEUTRAL
         }
+
+        /**
+         * 徽章按情绪分数派生，口径与 docs/API_REFERENCE.md「情绪说明」一致：
+         * bullish = 0.3~1.0，neutral = -0.3~0.3，bearish = -1.0~-0.3。
+         * 分数缺失时回退到 LLM 文字判断（fallback），避免丢失唯一可用信息。
+         */
+        fun fromScore(score: Double?, fallback: String? = null): Sentiment = when {
+            score == null -> fromString(fallback)
+            score >= 0.3 -> BULLISH
+            score <= -0.3 -> BEARISH
+            else -> NEUTRAL
+        }
     }
 }
 

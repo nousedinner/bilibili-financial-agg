@@ -74,12 +74,12 @@ fun DailyDetailScreen(
                         .padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
-                    // 情绪标签 + 分数
+                    // 情绪标签 + 分数（徽章按分数派生，AI 文字判断单独展示）
                     Row(
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        val sentiment = com.finapp.appb.ui.components.Sentiment.fromString(d.overallSentiment)
+                        val sentiment = com.finapp.appb.ui.components.Sentiment.fromScore(d.sentimentScore, d.overallSentiment)
                         Surface(
                             shape = RoundedCornerShape(6.dp),
                             color = sentiment.color.copy(alpha = 0.15f)
@@ -100,6 +100,25 @@ fun DailyDetailScreen(
                             )
                         }
                     }
+
+                    // 多空比例：当日窗口内各情绪方向的视频条数
+                    val counts = d.sentimentCounts
+                    if (counts != null && counts.total > 0) Text(
+                        text = "多空比例: 多${counts.bullish} · 空${counts.bearish} · 中${counts.neutral}（共${counts.total}条）",
+                        fontSize = 13.sp,
+                        color = TextSecondary
+                    )
+
+                    // AI 综述判断（原样保留，与分数并列而非互相覆盖）
+                    val aiSentiment = d.overallSentiment?.let { com.finapp.appb.ui.components.Sentiment.fromString(it) }
+                    if (aiSentiment != null) Text(
+                        text = buildString {
+                            append("AI综述判断: ${aiSentiment.icon} ${aiSentiment.label}")
+                            d.overallSentimentDesc?.takeIf { it.isNotBlank() }?.let { append(" · $it") }
+                        },
+                        fontSize = 13.sp,
+                        color = TextSecondary
+                    )
 
                     // 摘要
                     val summary = d.summary ?: ""

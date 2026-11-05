@@ -207,6 +207,13 @@ data class DailyDatesResponse(
     }
 }
 
+data class SentimentCounts(
+    val bullish: Int = 0,
+    val bearish: Int = 0,
+    val neutral: Int = 0,
+    val total: Int = 0
+)
+
 data class DailyContent(
     val date: String? = null,
     val summary: String? = null,
@@ -215,7 +222,9 @@ data class DailyContent(
     @SerializedName("key_topics") val keyTopics: List<String>? = null,
     val differences: List<String>? = null,
     @SerializedName("overall_sentiment") val overallSentiment: String? = null,
-    @SerializedName("sentiment_score") val sentimentScore: Double? = null
+    @SerializedName("overall_sentiment_desc") val overallSentimentDesc: String? = null,
+    @SerializedName("sentiment_score") val sentimentScore: Double? = null,
+    @SerializedName("sentiment_counts") val sentimentCounts: SentimentCounts? = null
 )
 
 

@@ -94,7 +94,9 @@ private fun DailyCard(
     item: DailyContent,
     onClick: () -> Unit
 ) {
-    val sentiment = com.finapp.appb.ui.components.Sentiment.fromString(item.overallSentiment)
+    // 徽章按情绪分数派生（±0.3 口径），LLM 文字判断只作参考展示
+    val sentiment = com.finapp.appb.ui.components.Sentiment.fromScore(item.sentimentScore, item.overallSentiment)
+    val aiSentiment = item.overallSentiment?.let { com.finapp.appb.ui.components.Sentiment.fromString(it) }
     val score = item.sentimentScore ?: 0.0
     val summary = item.summary ?: ""
 
@@ -135,6 +137,14 @@ private fun DailyCard(
             if (item.sentimentScore != null) Text(
                 text = "情绪分数: ${String.format("%.2f", score)}",
                 fontSize = 12.sp,
+                color = TextSecondary,
+                modifier = Modifier.padding(top = 2.dp)
+            )
+
+            // AI 文字判断与分数结论不一致时保留展示，避免"看不出来为什么"
+            if (aiSentiment != null && aiSentiment != sentiment) Text(
+                text = "AI综述判断: ${aiSentiment.icon} ${aiSentiment.label}",
+                fontSize = 11.sp,
                 color = TextSecondary,
                 modifier = Modifier.padding(top = 2.dp)
             )

@@ -25,8 +25,8 @@ android {
         manifestPlaceholders["appLabel"] = if (authorizationPoc) "财经聚合验证" else "财经聚合"
         minSdk = 26
         targetSdk = 34
-        versionCode = 5
-        versionName = "1.1.3"
+        versionCode = 6
+        versionName = "1.1.4"
         buildConfigField("String", "FIREBASE_APP_ID", pushValue("appId"))
         buildConfigField("String", "FIREBASE_API_KEY", pushValue("apiKey"))
         buildConfigField("String", "FIREBASE_PROJECT_ID", pushValue("projectId"))
@@ -56,6 +56,7 @@ android {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
     implementation("com.google.firebase:firebase-messaging:25.1.3")
     implementation("androidx.work:work-runtime-ktx:2.10.1")
     implementation("com.google.zxing:core:3.5.3")

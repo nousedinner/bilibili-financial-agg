@@ -5,7 +5,7 @@ import logging
 import secrets
 import sys
 from contextlib import asynccontextmanager
-from datetime import datetime, date
+from datetime import datetime, date, time, timedelta
 from zoneinfo import ZoneInfo
 from uuid import uuid4
 from uuid import UUID
@@ -25,7 +25,7 @@ from src.models import (
     CommentAnalysis, DanmakuAnalysis, Dynamic,
     FetchWatermark, DailyDigest, ApiUser, FetchJob,
 )
-from src.fetcher import run_daily_fetch, run_fetch_only, run_backfill, run_retry_failed, _get_enabled_bloggers, _generate_digest, regenerate_dirty_digests, _process_video, _video_info, _utcnow, _HARD_SINCE
+from src.fetcher import run_daily_fetch, run_fetch_only, run_backfill, run_retry_failed, _get_enabled_bloggers, _generate_digest, regenerate_dirty_digests, _process_video, _video_info, _utcnow, _HARD_SINCE, _cutoff_hour
 
 logger = logging.getLogger(__name__)
 
@@ -634,6 +634,29 @@ async def get_feed(
             "has_more": has_more and cursor is not None, "next_cursor": cursor, "cursor": cursor}}
 
 
+async def _sentiment_counts(session: AsyncSession, target_date: date) -> Optional[dict]:
+    """按汇总窗口现算当日视频多/空/中条数（口径与 _generate_digest 一致：
+    [target_date-1 cutoff, target_date cutoff)、fetch_status=ok、仅启用博主）。"""
+    end = datetime.combine(target_date, time(_cutoff_hour()))
+    start = end - timedelta(days=1)
+    enabled_mids = select(Blogger.mid).where(Blogger.enabled == True)
+    rows = (await session.execute(
+        select(Summary.sentiment, func.count())
+        .join(Video, Video.bvid == Summary.bvid)
+        .where(Video.fetch_status == "ok",
+               Video.publish_time >= start,
+               Video.publish_time < end,
+               Video.publish_time >= _HARD_SINCE,
+               Video.mid.in_(enabled_mids))
+        .group_by(Summary.sentiment))).all()
+    counts = {"bullish": 0, "bearish": 0, "neutral": 0}
+    for sentiment, n in rows:
+        key = sentiment if sentiment in counts else "neutral"
+        counts[key] += n
+    counts["total"] = counts["bullish"] + counts["bearish"] + counts["neutral"]
+    return counts if counts["total"] else None
+
+
 @app.get("/api/daily", dependencies=[Depends(require_api_key)])
 async def list_daily_dates():
     """可用日期列表（附摘要预览）。"""
@@ -658,6 +681,9 @@ async def list_daily_dates():
                 detail["sentiment_score"] = float(r.sentiment_score)
             if r.summary:
                 detail["summary"] = r.summary
+            counts = await _sentiment_counts(session, r.digest_date)
+            if counts:
+                detail["sentiment_counts"] = counts
             if detail:
                 date_details[ds] = detail
         return {"code": 0, "data": {"dates": date_strings, "details": date_details}}
@@ -675,8 +701,11 @@ async def get_daily_digest(date_str: str):
         digest = await session.get(DailyDigest, target_date)
         if not digest:
             raise HTTPException(404, "该日期无汇总数据")
-
-        return {"code": 0, "data": {"date": date_str, **(digest.content or {})}}
+        counts = await _sentiment_counts(session, target_date)
+        data = {"date": date_str, **(digest.content or {})}
+        if counts:
+            data["sentiment_counts"] = counts
+        return {"code": 0, "data": data}
 
 
 # ------------------------------------------------------------------

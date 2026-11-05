@@ -295,7 +295,11 @@ class FinRepository(private val prefs: ConnectionStore, private val cache: Conte
         for (date in dates) {
             try {
                 val existing = dailyDao.getByDate(date)
-                if (existing == null) refreshDailyDetail(date)
+                val cached = existing?.let {
+                    try { gson.fromJson(it.json, DailyContent::class.java) } catch (_: Exception) { null }
+                }
+                // 旧缓存缺 sentiment_counts / 多空比例 → 重新拉一次，避免新字段一直为空
+                if (cached == null || cached.sentimentCounts == null) refreshDailyDetail(date)
             } catch (_: Exception) {}
         }
     }
